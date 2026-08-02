@@ -28,10 +28,27 @@ def get_multi_dataloader(opt, accelerator):
     train_datasets, test_datasets = get_datasets(opt, accelerator)
     train_dataset = RNGConcatDataset(train_datasets)
 
+    overfit_single_batch = getattr(opt, "prompt_overfit_single_batch", False)
+    train_sampler = None
+    if overfit_single_batch:
+        sample_index = int(opt.prompt_overfit_sample_index)
+        if sample_index >= len(train_dataset):
+            raise IndexError(
+                f"prompt_overfit_sample_index={sample_index} is outside "
+                f"the training dataset of size {len(train_dataset)}"
+            )
+        # A one-element sampler pins the scene while set_rng_epoch(0) pins all
+        # frame, class, text, and cross-scene query choices inside that scene.
+        train_sampler = [sample_index]
+        accelerator.print(
+            f"[prompt-overfit] fixed training sample index: {sample_index}"
+        )
+
     train_dataloader = torch.utils.data.DataLoader(
         train_dataset,
         batch_size=opt.batch_size,
-        shuffle=True,
+        shuffle=not overfit_single_batch,
+        sampler=train_sampler,
         num_workers=opt.num_workers,
         pin_memory=True,
         drop_last=True,

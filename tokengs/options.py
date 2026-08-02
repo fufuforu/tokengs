@@ -77,6 +77,36 @@ class Options:
     pointmap_trim_hi: float = 1.0
     num_workers: int = 16
     dataset_kwargs: dict[str, str] | None = None
+    prompt_mode: Literal[
+        "text_only", "image_only", "text_image_mixed", "manifest"
+    ] = "text_image_mixed"
+    query_image_size: tuple[int, int] = (224, 224)
+    prompt_image_probability: float = 0.5
+    prompt_min_target_pixels: int = 64
+
+    # --- prompt-conditioned token matching
+    prompt_training: bool = False
+    prompt_tokengs_checkpoint: str = "/space0/mawb/tokengs/workspace/tokengs_re10k/model.safetensors"
+    prompt_clip_model_path: str = "/space0/mawb/tokengs/checkpoints/clip-vit-base-patch32"
+    prompt_hidden_dim: int = 128
+    prompt_attention_heads: int = 4
+    prompt_mixed_text_weight: float = 0.5
+    prompt_image_pooling: Literal["masked_patch", "masked_input_cls"] = "masked_patch"
+    prompt_lambda_bce: float = 1.0
+    prompt_lambda_dice: float = 1.0
+    prompt_threshold: float = 0.5
+    prompt_valid_alpha_threshold: float = 1e-3
+    prompt_overfit_single_batch: bool = False
+    prompt_overfit_sample_index: int = 0
+    prompt_visualization_steps: tuple[int, ...] = (0, 10, 50, 100, 200, 500)
+    prompt_save_validation_checkpoints: bool = False
+    prompt_tune_last_cross_attention: bool = False
+    semantic_v2_dim: int = 256
+    semantic_v2_temperature_init: float = 14.285714
+    semantic_v2_balanced_bce: bool = False
+    semantic_v2_score_mode: Literal["sigmoid", "softmax"] = "sigmoid"
+    semantic_v2_tune_last_cross_attention: bool = False
+    conditional_v3_tune_last_cross_attention: bool = True
 
     # --- training
     batch_size: int = 8
@@ -84,6 +114,8 @@ class Options:
     num_epochs: int = 30
     max_iters_per_epoch: int = 1_000_000
     lr: float = 4e-4
+    lr_scheduler: Literal["onecycle", "constant"] = "onecycle"
+    weight_decay: float = 0.05
     pct_start_steps: int = 1000
     final_div_factor: float = 1000.0
     gradient_clip: float = 1.0
@@ -114,6 +146,8 @@ class Options:
 
     # --- evaluation
     eval_n_media_dumps: int = 0
+    max_eval_iters: int = 0
+    eval_before_training: bool = True
     strict_checkpoint_loading: bool = True
 
     # --- test-time training (eval)
@@ -153,6 +187,44 @@ class Options:
             raise ValueError("mean_of_grads_scene_chunk_size must be positive")
         if self.mean_of_grads_view_chunk_size is not None and self.mean_of_grads_view_chunk_size <= 0:
             raise ValueError("mean_of_grads_view_chunk_size must be positive")
+        if self.prompt_training:
+            if self.model_type not in (
+                "prompt_tokengs",
+                "semantic_tokengs_v2",
+                "conditional_prompt_tokengs",
+            ):
+                raise ValueError(
+                    "prompt_training=True requires a prompt or semantic model"
+                )
+            if self.num_gs_tokens != 1024:
+                raise ValueError("Prompt training requires num_gs_tokens=1024")
+            if self.dec_patch_size != 8:
+                raise ValueError("Prompt training requires dec_patch_size=8")
+            if self.deferred_bp:
+                raise ValueError("Prompt training requires deferred_bp=False")
+            if self.use_ttt_for_eval:
+                raise ValueError("Prompt training does not support TTT")
+            if not 0.0 <= self.prompt_threshold <= 1.0:
+                raise ValueError("prompt_threshold must be in [0, 1]")
+            if not 0.0 <= self.prompt_mixed_text_weight <= 1.0:
+                raise ValueError("prompt_mixed_text_weight must be in [0, 1]")
+            if self.semantic_v2_dim <= 0:
+                raise ValueError("semantic_v2_dim must be positive")
+            if self.semantic_v2_temperature_init <= 0:
+                raise ValueError("semantic_v2_temperature_init must be positive")
+            if self.semantic_v2_score_mode not in ("sigmoid", "softmax"):
+                raise ValueError("semantic_v2_score_mode must be sigmoid or softmax")
+        if self.prompt_overfit_sample_index < 0:
+            raise ValueError("prompt_overfit_sample_index must be non-negative")
+        if (
+            self.prompt_tune_last_cross_attention
+            and self.model_type != "prompt_tokengs"
+        ):
+            raise ValueError(
+                "prompt_tune_last_cross_attention requires model_type=prompt_tokengs"
+            )
+        if any(step < 0 for step in self.prompt_visualization_steps):
+            raise ValueError("prompt_visualization_steps must be non-negative")
 
     def evolve(self, **changes: Any) -> Options:
         """Return a deep copy with the given fields replaced."""
@@ -421,5 +493,734 @@ config_doc["finetune_dl3dv_kubric_dyn_v3"] = (
     "Backward-compatible alias for finetune_dl3dv_kubric_dyn_release."
 )
 config_defaults["finetune_dl3dv_kubric_dyn_v3"] = _kubric_dyn_release
+
+# ----- ScanNet data-pipeline debug -----
+config_doc["debug_scannet_dataset"] = (
+    "Load one labeled ScanNet scene for data-pipeline and visualization checks."
+)
+config_defaults["debug_scannet_dataset"] = Options(
+    data_mode=(("scannet_scaled_0.15", 1),),
+    dataset_kwargs={
+        "subset": "scene0286_01",
+        "frame_stride": "10",
+        "label_mapping": "raw",
+    },
+    img_size=(256, 256),
+    num_input_views=2,
+    num_views=3,
+    batch_size=1,
+    num_workers=0,
+    evaluating=True,
+    random_reflect=False,
+    workspace="workspace/scannet_debug",
+)
+
+config_doc["eval_scannet_c3g8"] = (
+    "C3G/LSM manifest-driven ScanNet eight-class evaluation dataset."
+)
+config_defaults["eval_scannet_c3g8"] = Options(
+    data_mode=(("scannet_c3g8_eval", 1),),
+    img_size=(256, 256),
+    num_input_views=2,
+    num_views=3,
+    batch_size=1,
+    num_workers=0,
+    evaluating=True,
+    random_reflect=False,
+    workspace="workspace/scannet_c3g8_eval",
+)
+
+config_doc["debug_scannet_prompt"] = (
+    "Prompt-training ScanNet sample with a forced cross-scene image query."
+)
+config_defaults["debug_scannet_prompt"] = Options(
+    data_mode=(("scannet_prompt_train", 1),),
+    prompt_mode="image_only",
+    query_image_size=(224, 224),
+    img_size=(256, 256),
+    num_input_views=2,
+    num_views=3,
+    batch_size=1,
+    num_workers=0,
+    evaluating=True,
+    random_reflect=False,
+    workspace="workspace/scannet_prompt_debug",
+)
+
+
+_PROMPT_TRAINING_COMMON = {
+    "model_type": "prompt_tokengs",
+    "prompt_training": True,
+    "prompt_tokengs_checkpoint": "/space0/mawb/tokengs/workspace/tokengs_re10k/model.safetensors",
+    "prompt_clip_model_path": "/space0/mawb/tokengs/checkpoints/clip-vit-base-patch32",
+    "data_mode": (("scannet_prompt_train", 1),),
+    "prompt_mode": "text_image_mixed",
+    "prompt_image_probability": 0.5,
+    "prompt_hidden_dim": 128,
+    "prompt_attention_heads": 4,
+    "prompt_mixed_text_weight": 0.5,
+    "prompt_lambda_bce": 1.0,
+    "prompt_lambda_dice": 1.0,
+    "prompt_threshold": 0.5,
+    "num_gs_tokens": 1024,
+    "dec_patch_size": 8,
+    "num_input_views": 2,
+    "num_views": 3,
+    "img_size": (256, 256),
+    "batch_size": 1,
+    "lr": 1e-4,
+    "weight_decay": 0.05,
+    "lambda_rgb": 0.0,
+    "lambda_ssim": 0.0,
+    "lambda_lpips": 0.0,
+    "lambda_visibility": 0.0,
+    "lambda_opacity": 0.0,
+    "random_reflect": False,
+    "deferred_bp": False,
+    "use_wandb": False,
+}
+
+config_doc["prompt_scannet_smoke"] = "One-batch prompt TokenGS training smoke test."
+config_defaults["prompt_scannet_smoke"] = Options(
+    **{**_PROMPT_TRAINING_COMMON, "prompt_image_probability": 1.0},
+    num_workers=0,
+    num_epochs=1,
+    max_iters_per_epoch=1,
+    max_eval_iters=1,
+    print_freq=1,
+    log_image_freq=1,
+    mixed_precision="no",
+    workspace="workspace/prompt_scannet_smoke",
+    experiment_name="prompt_scannet_smoke",
+)
+
+config_doc["prompt_scannet_overfit"] = "Repeat one fixed ScanNet batch for prompt-mask overfitting."
+config_defaults["prompt_scannet_overfit"] = Options(
+    **{**_PROMPT_TRAINING_COMMON, "prompt_image_probability": 1.0},
+    prompt_overfit_single_batch=True,
+    prompt_overfit_sample_index=12,
+    prompt_visualization_steps=(0, 10, 50, 100, 200, 500),
+    num_workers=0,
+    num_epochs=500,
+    max_iters_per_epoch=1,
+    max_eval_iters=1,
+    print_freq=10,
+    log_image_freq=10,
+    lr_scheduler="constant",
+    mixed_precision="no",
+    workspace="workspace/prompt_scannet_overfit_500",
+    experiment_name="prompt_scannet_overfit_500",
+)
+
+config_doc["prompt_scannet_train"] = "First full ScanNet prompt-conditioned TokenGS training preset."
+config_defaults["prompt_scannet_train"] = Options(
+    **_PROMPT_TRAINING_COMMON,
+    num_workers=4,
+    num_epochs=30,
+    max_iters_per_epoch=500,
+    max_eval_iters=16,
+    print_freq=10,
+    log_image_freq=100,
+    mixed_precision="bf16",
+    workspace="workspace/prompt_scannet_train",
+    experiment_name="prompt_scannet_train",
+)
+
+
+_PROMPT_SMALL_COMMON = {
+    **_PROMPT_TRAINING_COMMON,
+    "data_mode": (("scannet_prompt_small", 1),),
+    "prompt_mode": "manifest",
+    "batch_size": 1,
+    "num_workers": 0,
+    "lr": 1e-4,
+    "lr_scheduler": "constant",
+    "max_eval_iters": 24,
+    "eval_n_media_dumps": 6,
+    "eval_before_training": False,
+}
+
+config_doc["prompt_scannet_small_smoke"] = (
+    "Twenty-step balanced 64/8-scene prompt training smoke test."
+)
+config_defaults["prompt_scannet_small_smoke"] = Options(
+    **_PROMPT_SMALL_COMMON,
+    num_epochs=1,
+    max_iters_per_epoch=20,
+    print_freq=1,
+    log_image_freq=10,
+    mixed_precision="no",
+    workspace="workspace/prompt_scannet_small_smoke_20",
+    experiment_name="prompt_scannet_small_smoke_20",
+)
+
+config_doc["prompt_scannet_small_train"] = (
+    "Two-thousand-step balanced multi-scene prompt training with fixed validation."
+)
+config_defaults["prompt_scannet_small_train"] = Options(
+    **_PROMPT_SMALL_COMMON,
+    num_epochs=10,
+    max_iters_per_epoch=200,
+    print_freq=10,
+    log_image_freq=100,
+    mixed_precision="bf16",
+    workspace="workspace/prompt_scannet_small_train_2000",
+    experiment_name="prompt_scannet_small_train_2000",
+)
+
+config_doc["prompt_scannet_small_eval"] = (
+    "Evaluate a prompt matching checkpoint on the fixed 8-scene validation split."
+)
+config_defaults["prompt_scannet_small_eval"] = Options(
+    **_PROMPT_SMALL_COMMON,
+    evaluating=True,
+    resume="workspace/prompt_scannet_small_train_2000/model.safetensors",
+    num_epochs=0,
+    print_freq=10,
+    log_image_freq=100,
+    mixed_precision="bf16",
+    workspace="workspace/prompt_scannet_small_validation",
+    experiment_name="prompt_scannet_small_validation",
+)
+
+
+_PROMPT_QUERY_DIVERSE_MANIFEST = (
+    "/space0/mawb/tokengs/data/scannet_prompt/"
+    "scannet_prompt_small_64_8_query_diverse.json"
+)
+_PROMPT_QUERY_DIVERSE_COMMON = {
+    **_PROMPT_SMALL_COMMON,
+    "dataset_kwargs": {"small_manifest_path": _PROMPT_QUERY_DIVERSE_MANIFEST},
+}
+
+_PROMPT_TARGET_DIVERSE_MANIFEST = (
+    "/space0/mawb/tokengs/data/scannet_prompt/"
+    "scannet_prompt_target_diverse_64_8.json"
+)
+_PROMPT_TARGET_DIVERSE_COMMON = {
+    **_PROMPT_SMALL_COMMON,
+    "dataset_kwargs": {"small_manifest_path": _PROMPT_TARGET_DIVERSE_MANIFEST},
+    "prompt_save_validation_checkpoints": True,
+    "eval_n_media_dumps": 16,
+    "max_eval_iters": 24,
+}
+
+_PROMPT_TARGET_DIVERSE_LAST_CROSS_COMMON = {
+    **_PROMPT_TARGET_DIVERSE_COMMON,
+    "prompt_tune_last_cross_attention": True,
+    "eval_n_media_dumps": 24,
+}
+
+config_doc["prompt_scannet_target_diverse_smoke"] = (
+    "Twenty-step smoke test using independent dense target-frame sampling."
+)
+config_defaults["prompt_scannet_target_diverse_smoke"] = Options(
+    **{**_PROMPT_TARGET_DIVERSE_COMMON, "max_eval_iters": 8},
+    num_epochs=1,
+    max_iters_per_epoch=20,
+    print_freq=1,
+    log_image_freq=10,
+    mixed_precision="no",
+    workspace="workspace/prompt_scannet_target_diverse_smoke_20",
+    experiment_name="prompt_scannet_target_diverse_smoke_20",
+)
+
+config_doc["prompt_scannet_target_diverse_train"] = (
+    "Two-thousand-step baseline matcher training with independent target-frame diversity."
+)
+config_defaults["prompt_scannet_target_diverse_train"] = Options(
+    **_PROMPT_TARGET_DIVERSE_COMMON,
+    num_epochs=10,
+    max_iters_per_epoch=200,
+    print_freq=10,
+    log_image_freq=100,
+    mixed_precision="bf16",
+    workspace="workspace/prompt_scannet_target_diverse_train_2000",
+    experiment_name="prompt_scannet_target_diverse_train_2000",
+)
+
+config_doc["prompt_scannet_target_diverse_eval"] = (
+    "Evaluate the best independent target-frame diversity checkpoint."
+)
+config_defaults["prompt_scannet_target_diverse_eval"] = Options(
+    **_PROMPT_TARGET_DIVERSE_COMMON,
+    evaluating=True,
+    resume=(
+        "/space0/mawb/tokengs/workspace/"
+        "prompt_scannet_target_diverse_train_2000/model_best.safetensors"
+    ),
+    num_epochs=0,
+    print_freq=10,
+    log_image_freq=100,
+    mixed_precision="bf16",
+    workspace="workspace/prompt_scannet_target_diverse_validation_best",
+    experiment_name="prompt_scannet_target_diverse_validation_best",
+)
+
+config_doc["prompt_scannet_target_diverse_last_cross_smoke"] = (
+    "Twenty-step target-diverse smoke test with a semantic final cross-attention fork."
+)
+config_defaults["prompt_scannet_target_diverse_last_cross_smoke"] = Options(
+    **{**_PROMPT_TARGET_DIVERSE_LAST_CROSS_COMMON, "max_eval_iters": 8},
+    num_epochs=1,
+    max_iters_per_epoch=20,
+    print_freq=1,
+    log_image_freq=10,
+    mixed_precision="no",
+    workspace="workspace/prompt_scannet_target_diverse_last_cross_smoke_20",
+    experiment_name="prompt_scannet_target_diverse_last_cross_smoke_20",
+)
+
+config_doc["prompt_scannet_target_diverse_last_cross_train"] = (
+    "Two-thousand-step target-diverse semantic final cross-attention adaptation."
+)
+config_defaults["prompt_scannet_target_diverse_last_cross_train"] = Options(
+    **_PROMPT_TARGET_DIVERSE_LAST_CROSS_COMMON,
+    num_epochs=10,
+    max_iters_per_epoch=200,
+    print_freq=10,
+    log_image_freq=100,
+    mixed_precision="bf16",
+    workspace="workspace/prompt_scannet_target_diverse_last_cross_train_2000",
+    experiment_name="prompt_scannet_target_diverse_last_cross_train_2000",
+)
+
+config_doc["prompt_scannet_target_diverse_last_cross_eval"] = (
+    "Evaluate the best target-diverse semantic final cross-attention checkpoint."
+)
+config_defaults["prompt_scannet_target_diverse_last_cross_eval"] = Options(
+    **_PROMPT_TARGET_DIVERSE_LAST_CROSS_COMMON,
+    evaluating=True,
+    resume=(
+        "/space0/mawb/tokengs/workspace/"
+        "prompt_scannet_target_diverse_last_cross_train_2000/model_best.safetensors"
+    ),
+    num_epochs=0,
+    print_freq=10,
+    log_image_freq=100,
+    mixed_precision="bf16",
+    workspace="workspace/prompt_scannet_target_diverse_last_cross_validation_best",
+    experiment_name="prompt_scannet_target_diverse_last_cross_validation_best",
+)
+
+config_doc["prompt_scannet_query_diverse_smoke"] = (
+    "Twenty-step smoke test with diverse cross-scene image queries."
+)
+config_defaults["prompt_scannet_query_diverse_smoke"] = Options(
+    **_PROMPT_QUERY_DIVERSE_COMMON,
+    num_epochs=1,
+    max_iters_per_epoch=20,
+    print_freq=1,
+    log_image_freq=10,
+    mixed_precision="no",
+    workspace="workspace/prompt_scannet_query_diverse_smoke_20",
+    experiment_name="prompt_scannet_query_diverse_smoke_20",
+)
+
+config_doc["prompt_scannet_query_diverse_train"] = (
+    "Two-thousand-step query-diversity ablation on the fixed 64/8-scene split."
+)
+config_defaults["prompt_scannet_query_diverse_train"] = Options(
+    **_PROMPT_QUERY_DIVERSE_COMMON,
+    num_epochs=10,
+    max_iters_per_epoch=200,
+    print_freq=10,
+    log_image_freq=100,
+    mixed_precision="bf16",
+    workspace="workspace/prompt_scannet_query_diverse_train_2000",
+    experiment_name="prompt_scannet_query_diverse_train_2000",
+)
+
+config_doc["prompt_scannet_query_diverse_eval"] = (
+    "Evaluate the query-diversity ablation on its fixed validation samples."
+)
+config_defaults["prompt_scannet_query_diverse_eval"] = Options(
+    **{**_PROMPT_QUERY_DIVERSE_COMMON, "eval_n_media_dumps": 24},
+    evaluating=True,
+    resume="workspace/prompt_scannet_query_diverse_train_2000/model.safetensors",
+    num_epochs=0,
+    print_freq=10,
+    log_image_freq=100,
+    mixed_precision="bf16",
+    workspace="workspace/prompt_scannet_query_diverse_validation",
+    experiment_name="prompt_scannet_query_diverse_validation",
+)
+
+
+_PROMPT_MASKED_CLS_COMMON = {
+    **_PROMPT_QUERY_DIVERSE_COMMON,
+    "prompt_image_pooling": "masked_input_cls",
+    "prompt_save_validation_checkpoints": True,
+}
+
+config_doc["prompt_scannet_masked_cls_smoke"] = (
+    "Twenty-step mask-neutralized CLIP CLS image-query smoke test."
+)
+config_defaults["prompt_scannet_masked_cls_smoke"] = Options(
+    **_PROMPT_MASKED_CLS_COMMON,
+    num_epochs=1,
+    max_iters_per_epoch=20,
+    print_freq=1,
+    log_image_freq=10,
+    mixed_precision="no",
+    workspace="workspace/prompt_scannet_masked_cls_smoke_20",
+    experiment_name="prompt_scannet_masked_cls_smoke_20",
+)
+
+config_doc["prompt_scannet_masked_cls_train"] = (
+    "Two-thousand-step mask-neutralized CLIP CLS pooling ablation."
+)
+config_defaults["prompt_scannet_masked_cls_train"] = Options(
+    **_PROMPT_MASKED_CLS_COMMON,
+    num_epochs=10,
+    max_iters_per_epoch=200,
+    print_freq=10,
+    log_image_freq=100,
+    mixed_precision="bf16",
+    workspace="workspace/prompt_scannet_masked_cls_train_2000",
+    experiment_name="prompt_scannet_masked_cls_train_2000",
+)
+
+config_doc["prompt_scannet_masked_cls_eval"] = (
+    "Evaluate the best mask-neutralized CLIP CLS prompt checkpoint."
+)
+config_defaults["prompt_scannet_masked_cls_eval"] = Options(
+    **{**_PROMPT_MASKED_CLS_COMMON, "eval_n_media_dumps": 24},
+    evaluating=True,
+    resume=(
+        "/space0/mawb/tokengs/workspace/"
+        "prompt_scannet_masked_cls_train_2000/model_best.safetensors"
+    ),
+    num_epochs=0,
+    print_freq=10,
+    log_image_freq=100,
+    mixed_precision="bf16",
+    workspace="workspace/prompt_scannet_masked_cls_validation_best",
+    experiment_name="prompt_scannet_masked_cls_validation_best",
+)
+
+
+_SEMANTIC_V2_COMMON = {
+    **_PROMPT_SMALL_COMMON,
+    "model_type": "semantic_tokengs_v2",
+    "data_mode": (("scannet_semantic_small", 1),),
+    "dataset_kwargs": {"small_manifest_path": _PROMPT_QUERY_DIVERSE_MANIFEST},
+    "prompt_mode": "text_only",
+    "prompt_image_probability": 0.0,
+    "semantic_v2_dim": 256,
+    "semantic_v2_temperature_init": 14.285714,
+    "semantic_v2_balanced_bce": False,
+    "semantic_v2_score_mode": "sigmoid",
+    "prompt_save_validation_checkpoints": True,
+    "eval_n_media_dumps": 1,
+}
+
+config_doc["semantic_v2_scannet_smoke"] = (
+    "Twenty-step eight-class Semantic Token Adapter V2 smoke test."
+)
+config_defaults["semantic_v2_scannet_smoke"] = Options(
+    **{**_SEMANTIC_V2_COMMON, "max_eval_iters": 2},
+    num_epochs=1,
+    max_iters_per_epoch=20,
+    print_freq=1,
+    log_image_freq=10,
+    mixed_precision="no",
+    workspace="workspace/semantic_v2_scannet_smoke_20",
+    experiment_name="semantic_v2_scannet_smoke_20",
+)
+
+config_doc["semantic_v2_scannet_train"] = (
+    "Two-thousand-step Semantic Token Adapter V2 structural diagnostic."
+)
+config_defaults["semantic_v2_scannet_train"] = Options(
+    **_SEMANTIC_V2_COMMON,
+    num_epochs=10,
+    max_iters_per_epoch=200,
+    print_freq=10,
+    log_image_freq=100,
+    mixed_precision="bf16",
+    workspace="workspace/semantic_v2_scannet_train_2000",
+    experiment_name="semantic_v2_scannet_train_2000",
+)
+
+config_doc["semantic_v2_scannet_eval"] = (
+    "Evaluate the best Semantic Token Adapter V2 checkpoint."
+)
+config_defaults["semantic_v2_scannet_eval"] = Options(
+    **_SEMANTIC_V2_COMMON,
+    evaluating=True,
+    resume=(
+        "/space0/mawb/tokengs/workspace/"
+        "semantic_v2_scannet_train_2000/model_best.safetensors"
+    ),
+    num_epochs=0,
+    print_freq=10,
+    log_image_freq=100,
+    mixed_precision="bf16",
+    workspace="workspace/semantic_v2_scannet_validation_best",
+    experiment_name="semantic_v2_scannet_validation_best",
+)
+
+
+_SEMANTIC_V2_BALANCED_BCE_COMMON = {
+    **_SEMANTIC_V2_COMMON,
+    "semantic_v2_balanced_bce": True,
+}
+
+config_doc["semantic_v2_balanced_bce_scannet_smoke"] = (
+    "Twenty-step V2 per-class positive/negative balanced BCE smoke test."
+)
+config_defaults["semantic_v2_balanced_bce_scannet_smoke"] = Options(
+    **{**_SEMANTIC_V2_BALANCED_BCE_COMMON, "max_eval_iters": 2},
+    num_epochs=1,
+    max_iters_per_epoch=20,
+    print_freq=1,
+    log_image_freq=10,
+    mixed_precision="no",
+    workspace="workspace/semantic_v2_balanced_bce_scannet_smoke_20",
+    experiment_name="semantic_v2_balanced_bce_scannet_smoke_20",
+)
+
+config_doc["semantic_v2_balanced_bce_scannet_train"] = (
+    "Two-thousand-step V2 per-class positive/negative balanced BCE experiment."
+)
+config_defaults["semantic_v2_balanced_bce_scannet_train"] = Options(
+    **_SEMANTIC_V2_BALANCED_BCE_COMMON,
+    num_epochs=10,
+    max_iters_per_epoch=200,
+    print_freq=10,
+    log_image_freq=100,
+    mixed_precision="bf16",
+    workspace="workspace/semantic_v2_balanced_bce_scannet_train_2000",
+    experiment_name="semantic_v2_balanced_bce_scannet_train_2000",
+)
+
+config_doc["semantic_v2_balanced_bce_scannet_eval"] = (
+    "Evaluate the best V2 per-class positive/negative balanced BCE checkpoint."
+)
+config_defaults["semantic_v2_balanced_bce_scannet_eval"] = Options(
+    **_SEMANTIC_V2_BALANCED_BCE_COMMON,
+    evaluating=True,
+    resume=(
+        "/space0/mawb/tokengs/workspace/"
+        "semantic_v2_balanced_bce_scannet_train_2000/model_best.safetensors"
+    ),
+    num_epochs=0,
+    print_freq=10,
+    log_image_freq=100,
+    mixed_precision="bf16",
+    workspace="workspace/semantic_v2_balanced_bce_scannet_validation_best",
+    experiment_name="semantic_v2_balanced_bce_scannet_validation_best",
+)
+
+
+_SEMANTIC_V2_BALANCED_SOFTMAX_COMMON = {
+    **_SEMANTIC_V2_BALANCED_BCE_COMMON,
+    "semantic_v2_score_mode": "softmax",
+}
+
+config_doc["semantic_v2_balanced_softmax_scannet_smoke"] = (
+    "Twenty-step V2 balanced-BCE token-class softmax smoke test."
+)
+config_defaults["semantic_v2_balanced_softmax_scannet_smoke"] = Options(
+    **{**_SEMANTIC_V2_BALANCED_SOFTMAX_COMMON, "max_eval_iters": 2},
+    num_epochs=1,
+    max_iters_per_epoch=20,
+    print_freq=1,
+    log_image_freq=10,
+    mixed_precision="no",
+    workspace="workspace/semantic_v2_balanced_softmax_scannet_smoke_20",
+    experiment_name="semantic_v2_balanced_softmax_scannet_smoke_20",
+)
+
+config_doc["semantic_v2_balanced_softmax_scannet_train"] = (
+    "Two-thousand-step V2 balanced-BCE token-class softmax experiment."
+)
+config_defaults["semantic_v2_balanced_softmax_scannet_train"] = Options(
+    **_SEMANTIC_V2_BALANCED_SOFTMAX_COMMON,
+    num_epochs=10,
+    max_iters_per_epoch=200,
+    print_freq=10,
+    log_image_freq=100,
+    mixed_precision="bf16",
+    workspace="workspace/semantic_v2_balanced_softmax_scannet_train_2000",
+    experiment_name="semantic_v2_balanced_softmax_scannet_train_2000",
+)
+
+config_doc["semantic_v2_balanced_softmax_scannet_eval"] = (
+    "Evaluate the best V2 balanced-BCE token-class softmax checkpoint."
+)
+config_defaults["semantic_v2_balanced_softmax_scannet_eval"] = Options(
+    **_SEMANTIC_V2_BALANCED_SOFTMAX_COMMON,
+    evaluating=True,
+    resume=(
+        "/space0/mawb/tokengs/workspace/"
+        "semantic_v2_balanced_softmax_scannet_train_2000/model_best.safetensors"
+    ),
+    num_epochs=0,
+    print_freq=10,
+    log_image_freq=100,
+    mixed_precision="bf16",
+    workspace="workspace/semantic_v2_balanced_softmax_scannet_validation_best",
+    experiment_name="semantic_v2_balanced_softmax_scannet_validation_best",
+)
+
+
+_SEMANTIC_V2_LAST_CROSS_ATTN_COMMON = {
+    **_SEMANTIC_V2_BALANCED_SOFTMAX_COMMON,
+    "semantic_v2_tune_last_cross_attention": True,
+}
+
+config_doc["semantic_v2_last_cross_attn_scannet_smoke"] = (
+    "Twenty-step semantic-only tuning of the final TokenGS cross-attention."
+)
+config_defaults["semantic_v2_last_cross_attn_scannet_smoke"] = Options(
+    **{**_SEMANTIC_V2_LAST_CROSS_ATTN_COMMON, "max_eval_iters": 2},
+    num_epochs=1,
+    max_iters_per_epoch=20,
+    print_freq=1,
+    log_image_freq=10,
+    mixed_precision="no",
+    workspace="workspace/semantic_v2_last_cross_attn_scannet_smoke_20",
+    experiment_name="semantic_v2_last_cross_attn_scannet_smoke_20",
+)
+
+config_doc["semantic_v2_last_cross_attn_scannet_train"] = (
+    "Two-thousand-step semantic-only final TokenGS cross-attention experiment."
+)
+config_defaults["semantic_v2_last_cross_attn_scannet_train"] = Options(
+    **_SEMANTIC_V2_LAST_CROSS_ATTN_COMMON,
+    num_epochs=10,
+    max_iters_per_epoch=200,
+    print_freq=10,
+    log_image_freq=100,
+    mixed_precision="bf16",
+    workspace="workspace/semantic_v2_last_cross_attn_scannet_train_2000",
+    experiment_name="semantic_v2_last_cross_attn_scannet_train_2000",
+)
+
+config_doc["semantic_v2_last_cross_attn_scannet_eval"] = (
+    "Evaluate the best semantic-only final TokenGS cross-attention checkpoint."
+)
+config_defaults["semantic_v2_last_cross_attn_scannet_eval"] = Options(
+    **_SEMANTIC_V2_LAST_CROSS_ATTN_COMMON,
+    evaluating=True,
+    resume=(
+        "/space0/mawb/tokengs/workspace/"
+        "semantic_v2_last_cross_attn_scannet_train_2000/model_best.safetensors"
+    ),
+    num_epochs=0,
+    print_freq=10,
+    log_image_freq=100,
+    mixed_precision="bf16",
+    workspace="workspace/semantic_v2_last_cross_attn_scannet_validation_best",
+    experiment_name="semantic_v2_last_cross_attn_scannet_validation_best",
+)
+
+
+_CONDITIONAL_V3_COMMON = {
+    **_PROMPT_QUERY_DIVERSE_COMMON,
+    "model_type": "conditional_prompt_tokengs",
+    "prompt_mode": "manifest",
+    "prompt_save_validation_checkpoints": True,
+    "eval_n_media_dumps": 6,
+}
+
+_CONDITIONAL_V3_FROZEN_DECODER_COMMON = {
+    **_CONDITIONAL_V3_COMMON,
+    "conditional_v3_tune_last_cross_attention": False,
+}
+
+config_doc["conditional_v3_scannet_smoke"] = (
+    "Twenty-step OV-DETR-style text/image conditional query smoke test."
+)
+config_defaults["conditional_v3_scannet_smoke"] = Options(
+    **{**_CONDITIONAL_V3_COMMON, "max_eval_iters": 3},
+    num_epochs=1,
+    max_iters_per_epoch=20,
+    print_freq=1,
+    log_image_freq=10,
+    mixed_precision="no",
+    workspace="workspace/conditional_v3_scannet_smoke_20",
+    experiment_name="conditional_v3_scannet_smoke_20",
+)
+
+config_doc["conditional_v3_scannet_train"] = (
+    "Two-thousand-step shared text/image conditional query experiment."
+)
+config_defaults["conditional_v3_scannet_train"] = Options(
+    **_CONDITIONAL_V3_COMMON,
+    num_epochs=10,
+    max_iters_per_epoch=200,
+    print_freq=10,
+    log_image_freq=100,
+    mixed_precision="bf16",
+    workspace="workspace/conditional_v3_scannet_train_2000",
+    experiment_name="conditional_v3_scannet_train_2000",
+)
+
+config_doc["conditional_v3_scannet_eval"] = (
+    "Evaluate the best shared text/image conditional query checkpoint."
+)
+config_defaults["conditional_v3_scannet_eval"] = Options(
+    **{**_CONDITIONAL_V3_COMMON, "eval_n_media_dumps": 24},
+    evaluating=True,
+    resume=(
+        "/space0/mawb/tokengs/workspace/"
+        "conditional_v3_scannet_train_2000/model_best.safetensors"
+    ),
+    num_epochs=0,
+    print_freq=10,
+    log_image_freq=100,
+    mixed_precision="bf16",
+    workspace="workspace/conditional_v3_scannet_validation_best",
+    experiment_name="conditional_v3_scannet_validation_best",
+)
+
+config_doc["conditional_v3_frozen_decoder_scannet_smoke"] = (
+    "Twenty-step conditional-query smoke test with the copied decoder frozen."
+)
+config_defaults["conditional_v3_frozen_decoder_scannet_smoke"] = Options(
+    **{**_CONDITIONAL_V3_FROZEN_DECODER_COMMON, "max_eval_iters": 3},
+    num_epochs=1,
+    max_iters_per_epoch=20,
+    print_freq=1,
+    log_image_freq=10,
+    mixed_precision="no",
+    workspace="workspace/conditional_v3_frozen_decoder_scannet_smoke_20",
+    experiment_name="conditional_v3_frozen_decoder_scannet_smoke_20",
+)
+
+config_doc["conditional_v3_frozen_decoder_scannet_train"] = (
+    "Two-thousand-step conditional-query experiment with decoder frozen."
+)
+config_defaults["conditional_v3_frozen_decoder_scannet_train"] = Options(
+    **_CONDITIONAL_V3_FROZEN_DECODER_COMMON,
+    num_epochs=10,
+    max_iters_per_epoch=200,
+    print_freq=10,
+    log_image_freq=100,
+    mixed_precision="bf16",
+    workspace="workspace/conditional_v3_frozen_decoder_scannet_train_2000",
+    experiment_name="conditional_v3_frozen_decoder_scannet_train_2000",
+)
+
+config_doc["conditional_v3_frozen_decoder_scannet_eval"] = (
+    "Evaluate the best frozen-decoder conditional-query checkpoint."
+)
+config_defaults["conditional_v3_frozen_decoder_scannet_eval"] = Options(
+    **{**_CONDITIONAL_V3_FROZEN_DECODER_COMMON, "eval_n_media_dumps": 24},
+    evaluating=True,
+    resume=(
+        "/space0/mawb/tokengs/workspace/"
+        "conditional_v3_frozen_decoder_scannet_train_2000/model_best.safetensors"
+    ),
+    num_epochs=0,
+    print_freq=10,
+    log_image_freq=100,
+    mixed_precision="bf16",
+    workspace="workspace/conditional_v3_frozen_decoder_scannet_validation_best",
+    experiment_name="conditional_v3_frozen_decoder_scannet_validation_best",
+)
 
 AllConfigs = tyro.extras.subcommand_type_from_defaults(config_defaults, config_doc)

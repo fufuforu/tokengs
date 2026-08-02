@@ -30,6 +30,9 @@ from tokengs.data.datafield import (
     DF_IMAGE_RGB,
     DF_FOREGROUND_MASK,
     DF_DEPTH,
+    DF_FRAME_IDS,
+    DF_SCENE_NAME,
+    DF_SEMANTIC_LABEL,
 )
 
 
@@ -56,6 +59,17 @@ class Provider(Dataset):
             init_sig = inspect.signature(dataset_entry['cls'].__init__)
             if _accepts_kwarg(init_sig, "load_depth"):
                 dataset_kwargs['load_depth'] = True
+        if getattr(dataset_entry['cls'], "has_prompt_samples", False):
+            dataset_kwargs.update(
+                {
+                    "prompt_mode": opt.prompt_mode,
+                    "query_image_size": opt.query_image_size,
+                    "prompt_image_probability": opt.prompt_image_probability,
+                    "prompt_min_target_pixels": opt.prompt_min_target_pixels,
+                }
+            )
+        if getattr(dataset_entry['cls'], "has_explicit_split", False):
+            dataset_kwargs["split"] = "train" if training else "validation"
         if opt.dataset_kwargs is not None:
             dataset_kwargs.update(opt.dataset_kwargs)
         self.dataset = dataset_entry['cls'](**dataset_kwargs)
@@ -66,9 +80,12 @@ class Provider(Dataset):
         self.scene_scale = dataset_entry['scene_scale'] if override_scene_scale is None else override_scene_scale
         self.max_gap, self.min_gap = dataset_entry['max_gap'], dataset_entry['min_gap']
         self.training = training
+        self.random_reflect = self.opt.random_reflect and not getattr(
+            self.dataset, "disable_random_reflect", False
+        )
         self.dataset.sample_list *= num_repeat
 
-        if not opt.evaluating:
+        if not opt.evaluating and not getattr(self.dataset, "has_explicit_split", False):
             if training:
                 self.dataset.sample_list = self.dataset.sample_list[:-self.opt.batch_size]
             else:
@@ -86,6 +103,8 @@ class Provider(Dataset):
         self.data_fields = [DF_IMAGE_RGB, DF_CAMERA_C2W_TRANSFORM, DF_CAMERA_INTRINSICS, DF_FOREGROUND_MASK]
         if opt.camera_scale_method == 'pointmap':
             self.data_fields.append(DF_DEPTH)
+        if getattr(self.dataset, "has_semantic_labels", False):
+            self.data_fields.append(DF_SEMANTIC_LABEL)
 
     def set_rng_epoch(self, epoch: int) -> None:
         self.rng = np.random.default_rng(epoch + self.opt.seed)
@@ -156,12 +175,35 @@ class Provider(Dataset):
 
         return all_dists.mean().clamp(min=1e-6).item()
 
-    def _preprocess(self, rgbs, masks, depths, c2ws, intrinsics, timesteps, has_mask):
+    def _transform_index_labels(self, labels, output_size):
+        if labels is None:
+            return None
+        labels = labels[:, None].float()
+        labels = self.image_transform.crop_transform(labels)
+        labels = F.interpolate(labels, size=output_size, mode="nearest")
+        return labels[:, 0].long()
+
+    def _preprocess(
+        self,
+        rgbs,
+        masks,
+        depths,
+        c2ws,
+        intrinsics,
+        timesteps,
+        has_mask,
+        semantic_labels=None,
+        scene_name=None,
+        frame_ids=None,
+    ):
         if self.opt.camera_scale_method == 'pointmap':
             raw_depths = depths.clone()
             raw_intrinsics = intrinsics.clone()
 
         rgbs, shift, scale, flip_flag = self.image_transform.preprocess_images(rgbs)
+        semantic_labels = self._transform_index_labels(
+            semantic_labels, rgbs.shape[-2:]
+        )
         masks, _, _, _ = self.image_transform.preprocess_images(masks)
         depths, _, _, _ = self.image_transform.preprocess_images(depths)
         intrinsics = torch.stack(
@@ -200,7 +242,7 @@ class Provider(Dataset):
         else:
             raise ValueError(f"Invalid camera scale method: {self.opt.camera_scale_method}")
 
-        if self.training and self.opt.random_reflect:
+        if self.training and self.random_reflect:
             rgbs, c2ws = random_reflect(rgbs, c2ws, generator=self.generator)
 
         c2ws[:, :3, 3] = c2ws[:, :3, 3] * final_scene_scale
@@ -222,7 +264,7 @@ class Provider(Dataset):
         )
         final_input = torch.cat([images_input, plucker_embedding], dim=1)
 
-        return {
+        output = {
             'input': final_input,
             'rays_os': rays_os,
             'rays_ds': rays_ds,
@@ -240,6 +282,15 @@ class Provider(Dataset):
             'cam_to_world_input': c2ws[:self.opt.num_input_views], # [V, 4, 4]
             'cam_view_input': torch.inverse(c2ws[:self.opt.num_input_views]).transpose(1, 2), # [V, 4, 4]
         }
+        if semantic_labels is not None:
+            output['semantic_label_all'] = semantic_labels
+            output['semantic_label_input'] = semantic_labels[:self.opt.num_input_views]
+            output['semantic_label_output'] = semantic_labels[self.opt.num_input_views:]
+        if scene_name is not None:
+            output['scene_name'] = scene_name
+        if frame_ids is not None:
+            output['frame_ids'] = frame_ids
+        return output
     
     def get_rng(self, idx: int) -> np.random.Generator:
         """
@@ -403,14 +454,43 @@ class Provider(Dataset):
             original_output_dict[DF_DEPTH] = torch.ones_like(original_output_dict[DF_IMAGE_RGB][:, 0:1, ...])
 
         all_rgbs, all_c2ws, all_intrinsics, all_masks, all_depths = original_output_dict[DF_IMAGE_RGB], original_output_dict[DF_CAMERA_C2W_TRANSFORM], original_output_dict[DF_CAMERA_INTRINSICS], original_output_dict[DF_FOREGROUND_MASK], original_output_dict[DF_DEPTH]
+        semantic_labels = original_output_dict.get(DF_SEMANTIC_LABEL)
+        scene_name = original_output_dict.get(DF_SCENE_NAME)
+        raw_frame_ids = original_output_dict.get(DF_FRAME_IDS)
 
         rgbs, masks, depths, c2ws, intrinsics, timesteps = _curate_batch_fn(all_rgbs, all_masks, all_depths, all_c2ws, all_intrinsics, torch.from_numpy(frame_indices).float())
 
-        return self._preprocess(rgbs, masks, depths, c2ws, intrinsics, timesteps, has_mask)
+        output = self._preprocess(
+            rgbs,
+            masks,
+            depths,
+            c2ws,
+            intrinsics,
+            timesteps,
+            has_mask,
+            semantic_labels=semantic_labels,
+            scene_name=scene_name,
+            frame_ids=raw_frame_ids,
+        )
+        if getattr(self.dataset, "has_prompt_samples", False):
+            output.update(
+                self.dataset.make_prompt_sample(
+                    semantic_label_output=output["semantic_label_output"],
+                    target_scene_name=scene_name,
+                    used_frame_ids=raw_frame_ids,
+                    rng=self.get_rng(idx),
+                )
+            )
+        return output
 
     def __getitem__(self, idx):
         while True:
             try:
                 return self.get_item(idx)
             except Exception:
+                if (
+                    getattr(self.opt, "prompt_overfit_single_batch", False)
+                    or getattr(self.dataset, "has_explicit_split", False)
+                ):
+                    raise
                 idx = self.rng.integers(0, len(self.dataset))

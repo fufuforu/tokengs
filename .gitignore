@@ -22,6 +22,9 @@ checkpoints/
 # Local dataset roots (tracked: data/DATA.md)
 data/dl3dv
 data/dl3dv_eval
+data/ScanNet
+data/scannet_prompt
+data/scannet2d_labels
 
 # Tooling
 .vscode/

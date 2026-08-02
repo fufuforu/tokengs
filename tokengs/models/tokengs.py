@@ -298,7 +298,8 @@ class TokenGS(nn.Module):
         encoder_latent: EncoderLatent,
         decoder_input: ModelInputDecoder,
         gs_tokens: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
+        return_gs_token_hidden: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         """
         Process latent representation (keys/values) to Gaussians using decoder with cross-attention.
         
@@ -306,9 +307,10 @@ class TokenGS(nn.Module):
             encoder_latent: EncoderLatent containing keys and values from the encoder
             decoder_input: ModelInputDecoder containing rendering parameters and target time
             gs_tokens: Optional precomputed GS tokens [B, num_gs_tokens, C]. If None, creates new ones.
+            return_gs_token_hidden: Return the final decoder tokens alongside Gaussians.
             
         Returns:
-            Gaussians tensor [B, N, 14] where N is the number of Gaussians
+            Gaussians [B, N, 14], optionally paired with final tokens [B, T, 1024].
         """
         B = encoder_latent.keys.shape[0]
         
@@ -333,9 +335,13 @@ class TokenGS(nn.Module):
         # give gaussians an offset to the z axis so it is visible when initialized
         gaussians[..., 2] = gaussians[..., 2] + self.opt.gaussian_z_offset
 
+        if return_gs_token_hidden:
+            return gaussians, gs_tokens
         return gaussians
 
-    def forward_reconstruction(self, model_input: ModelInput) -> Reconstruction:
+    def forward_reconstruction(
+        self, model_input: ModelInput, return_gs_token_hidden: bool = False
+    ) -> Reconstruction | tuple[Reconstruction, torch.Tensor]:
         """
         Generate a reconstruction from model input.
         This is a convenience method that combines encoding and decoding.
@@ -351,11 +357,19 @@ class TokenGS(nn.Module):
         encoder_latent = self.forward_encoder(model_input.encoder)
         
         # Decode to Gaussians (time conditioning is applied inside forward_decoder)
-        gaussians = self.forward_decoder(encoder_latent, model_input.decoder)
-        
-        return self._reconstruction_from_gaussians(gaussians)
+        decoder_output = self.forward_decoder(
+            encoder_latent,
+            model_input.decoder,
+            return_gs_token_hidden=return_gs_token_hidden,
+        )
+        if return_gs_token_hidden:
+            gaussians, gs_token_hidden = decoder_output
+            return self._reconstruction_from_gaussians(gaussians), gs_token_hidden
+        return self._reconstruction_from_gaussians(decoder_output)
 
-    def forward_gaussians(self, model_input: ModelInput) -> torch.Tensor:
+    def forward_gaussians(
+        self, model_input: ModelInput, return_gs_token_hidden: bool = False
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         """
         Generate Gaussians from model input.
         This compatibility method returns only the raw Gaussian tensor.
@@ -366,7 +380,13 @@ class TokenGS(nn.Module):
         Returns:
             Gaussians tensor [B, N, 14] where N is the number of Gaussians
         """
-        return self.forward_reconstruction(model_input).gaussians
+        reconstruction_output = self.forward_reconstruction(
+            model_input, return_gs_token_hidden=return_gs_token_hidden
+        )
+        if return_gs_token_hidden:
+            reconstruction, gs_token_hidden = reconstruction_output
+            return reconstruction.gaussians, gs_token_hidden
+        return reconstruction_output.gaussians
 
     def render_reconstruction(
         self,
@@ -605,13 +625,14 @@ class TokenGS(nn.Module):
         results["backward_loss"] = (gaussians * grad_accum.detach()).sum()
         return results
 
-    def forward(self, data, skip_loss=False):
+    def forward(self, data, skip_loss=False, return_gs_token_hidden: bool = False):
         """
         Forward pass of the TokenGS model.
         
         Args:
             data: Dictionary from dataloader
             skip_loss: If True, skip loss computation
+            return_gs_token_hidden: Include final decoder tokens in the result dictionary.
             
         Returns:
             Dictionary containing results including 'loss', 'gaussians', 'images_pred', etc.
@@ -621,12 +642,27 @@ class TokenGS(nn.Module):
 
         # Generate reconstruction from input
         if self.opt.use_ttt_for_eval:
+            if return_gs_token_hidden:
+                raise ValueError(
+                    "return_gs_token_hidden is not supported with test-time tuning"
+                )
             gaussians = self.forward_ttt(model_input, n_steps=self.opt.ttt_n_steps, lr=self.opt.ttt_lr)  # [B, N, 14]
             reconstruction = self._reconstruction_from_gaussians(gaussians)
+            gs_token_hidden = None
         else:
-            reconstruction = self.forward_reconstruction(model_input)
+            reconstruction_output = self.forward_reconstruction(
+                model_input,
+                return_gs_token_hidden=return_gs_token_hidden,
+            )
+            if return_gs_token_hidden:
+                reconstruction, gs_token_hidden = reconstruction_output
+            else:
+                reconstruction = reconstruction_output
+                gs_token_hidden = None
 
         results = {"gaussians": reconstruction.gaussians}
+        if gs_token_hidden is not None:
+            results["gs_token_hidden"] = gs_token_hidden
 
         # Compute loss or just render
         if skip_loss:

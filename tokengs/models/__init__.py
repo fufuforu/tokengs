@@ -23,10 +23,27 @@ from .input_types import (
     split_data,
 )
 from .tokengs import TokenGS
+from .prompt_matching import (
+    PromptConditionedTokenMatcher,
+    PromptEncoder,
+    PromptGaussianDecoder,
+)
+from .prompt_tokengs import PromptTokenGS
+from .semantic_adapter_v2 import (
+    C3G8_CLASS_NAMES,
+    PromptSemanticAdapter,
+    SemanticMatcherV2,
+    SemanticTokenAdapter,
+)
+from .semantic_tokengs_v2 import SemanticTokenGSv2
+from .conditional_prompt_tokengs import ConditionalPromptTokenGS
 
 # Model registry
 model_registry = {
     'tokengs': TokenGS,
+    'prompt_tokengs': PromptTokenGS,
+    'semantic_tokengs_v2': SemanticTokenGSv2,
+    'conditional_prompt_tokengs': ConditionalPromptTokenGS,
 }
 
 # Export for convenience
@@ -39,5 +56,15 @@ __all__ = [
     'ModelSupervision',
     'Reconstruction',
     'EncoderLatent',
+    'PromptEncoder',
+    'PromptGaussianDecoder',
+    'PromptConditionedTokenMatcher',
+    'PromptTokenGS',
+    'C3G8_CLASS_NAMES',
+    'SemanticTokenAdapter',
+    'PromptSemanticAdapter',
+    'SemanticMatcherV2',
+    'SemanticTokenGSv2',
+    'ConditionalPromptTokenGS',
     'model_registry',
 ]

@@ -23,3 +23,8 @@ DF_CAMERA_INTRINSICS = "camera_intrinsics"
 DF_FOREGROUND_MASK = "foreground_mask"
 # [B, H, W, 1], float32, depth map.
 DF_DEPTH = "depth"
+# [B, H, W], int64 semantic IDs (raw ScanNet IDs or configured mapping).
+DF_SEMANTIC_LABEL = "semantic_label"
+DF_SCENE_NAME = "scene_name"
+# [B], int64 raw frame IDs in the source scene.
+DF_FRAME_IDS = "frame_ids"

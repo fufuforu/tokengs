@@ -17,12 +17,24 @@ from pathlib import Path
 
 from tokengs.data.dynamic.kubric import Kubric
 from tokengs.data.static.dl3dv import DL3DV10K, DL3DVEval
+from tokengs.data.static.scannet import ScanNet, ScanNetC3G8Eval
+from tokengs.data.static.scannet_prompt import (
+    ScanNetPromptSmall,
+    ScanNetPromptTrain,
+    ScanNetSemanticSmall,
+)
 
 # Repository root (parent of the `tokengs` package)
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _DEFAULT_DL3DV_ROOT = _REPO_ROOT / "data" / "dl3dv"
 _DEFAULT_DL3DV_EVAL_ROOT = _REPO_ROOT / "data" / "dl3dv_eval"
 _DEFAULT_KUBRIC_ROOT = _REPO_ROOT / "data" / "kubric"
+_DEFAULT_SCANNET_ROOT = _REPO_ROOT / "data" / "ScanNet" / "scans"
+_DEFAULT_SCANNET_LABEL_ROOT = _REPO_ROOT / "data" / "scannet2d_labels"
+_DEFAULT_C3G8_PROTOCOL = _REPO_ROOT / "configs" / "semantic" / "scannet_c3g8.yaml"
+_DEFAULT_SCANNET_PROMPT_SMALL_MANIFEST = (
+    _REPO_ROOT / "data" / "scannet_prompt" / "scannet_prompt_small_64_8.json"
+)
 
 dataset_registry = {}
 
@@ -64,4 +76,70 @@ dataset_registry["kubric"] = {
     "scene_scale": 1.0,
     "max_gap": 23,
     "min_gap": 3,
+}
+
+dataset_registry["scannet"] = {
+    "cls": ScanNet,
+    "kwargs": {
+        "root_path": str(_DEFAULT_SCANNET_ROOT),
+        "label_root": str(_DEFAULT_SCANNET_LABEL_ROOT),
+        "frame_stride": 10,
+        "label_mapping": "raw",
+    },
+    "scene_scale": 1.0,
+    "max_gap": 40,
+    "min_gap": 3,
+}
+
+dataset_registry["scannet_c3g8_eval"] = {
+    "cls": ScanNetC3G8Eval,
+    "kwargs": {
+        "root_path": str(_DEFAULT_SCANNET_ROOT),
+        "label_root": str(_DEFAULT_SCANNET_LABEL_ROOT),
+        "semantic_protocol_path": str(_DEFAULT_C3G8_PROTOCOL),
+    },
+    "scene_scale": 0.15,
+    "max_gap": 0,
+    "min_gap": 0,
+}
+
+dataset_registry["scannet_prompt_train"] = {
+    "cls": ScanNetPromptTrain,
+    "kwargs": {
+        "root_path": str(_DEFAULT_SCANNET_ROOT),
+        "label_root": str(_DEFAULT_SCANNET_LABEL_ROOT),
+        "semantic_protocol_path": str(_DEFAULT_C3G8_PROTOCOL),
+        "frame_stride": 10,
+    },
+    "scene_scale": 0.15,
+    "max_gap": 40,
+    "min_gap": 3,
+}
+
+dataset_registry["scannet_prompt_small"] = {
+    "cls": ScanNetPromptSmall,
+    "kwargs": {
+        "root_path": str(_DEFAULT_SCANNET_ROOT),
+        "label_root": str(_DEFAULT_SCANNET_LABEL_ROOT),
+        "semantic_protocol_path": str(_DEFAULT_C3G8_PROTOCOL),
+        "small_manifest_path": str(_DEFAULT_SCANNET_PROMPT_SMALL_MANIFEST),
+        "frame_stride": 1,
+    },
+    "scene_scale": 0.15,
+    "max_gap": 0,
+    "min_gap": 0,
+}
+
+dataset_registry["scannet_semantic_small"] = {
+    "cls": ScanNetSemanticSmall,
+    "kwargs": {
+        "root_path": str(_DEFAULT_SCANNET_ROOT),
+        "label_root": str(_DEFAULT_SCANNET_LABEL_ROOT),
+        "semantic_protocol_path": str(_DEFAULT_C3G8_PROTOCOL),
+        "small_manifest_path": str(_DEFAULT_SCANNET_PROMPT_SMALL_MANIFEST),
+        "frame_stride": 1,
+    },
+    "scene_scale": 0.15,
+    "max_gap": 0,
+    "min_gap": 0,
 }

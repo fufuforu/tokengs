@@ -18,6 +18,7 @@ dependencies = [
     "lpips",
     "packaging",
     "Pillow",
+    "PyYAML",
     "safetensors",
     "scikit-image",
     "tqdm",
@@ -29,6 +30,7 @@ dependencies = [
     "gsplat==1.5.3",
     "fused-ssim",
     "matplotlib",
+    "transformers==4.49.0",
 ]
 
 [dependency-groups]

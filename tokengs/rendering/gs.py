@@ -125,6 +125,44 @@ class GaussianRenderer:
         else:
             return self.render_standard(means3D, opacity, scales, rotations, rgbs, viewmat, Ks, backgrounds, H, W, near_plane, far_plane)
 
+    def render_prompt_scores(self, gaussians, gaussian_scores, cam_view, intrinsics=None):
+        """Render per-Gaussian probabilities through the unchanged RGB rasterizer.
+
+        ``gaussian_scores`` is [B, Q, N]. Each query is copied to RGB feature
+        channels in a temporary tensor; the source Gaussian geometry, opacity,
+        and RGB tensor are never modified. The returned composite is therefore
+        the regular alpha-composited score, with a separately returned alpha.
+        """
+        if gaussian_scores.ndim != 3:
+            raise ValueError("gaussian_scores must have shape [B,Q,N]")
+        if gaussians.ndim != 3 or gaussians.shape[0] != gaussian_scores.shape[0]:
+            raise ValueError("gaussians and gaussian_scores batch dimensions disagree")
+        if gaussians.shape[1] != gaussian_scores.shape[2]:
+            raise ValueError("gaussians and gaussian_scores Gaussian counts disagree")
+        if getattr(self.opt, "deferred_bp", False):
+            raise ValueError("Prompt score rendering requires deferred_bp=False")
+
+        probabilities = []
+        alphas = []
+        zero_background = torch.zeros(3, dtype=gaussians.dtype, device=gaussians.device)
+        for query_index in range(gaussian_scores.shape[1]):
+            score_rgb = gaussian_scores[:, query_index, :, None].expand(-1, -1, 3)
+            # Keep geometry and opacity exactly as supplied. RGB is replaced only
+            # in this temporary feature tensor used by the existing rasterizer.
+            score_gaussians = torch.cat((gaussians[..., :11], score_rgb), dim=-1)
+            rendered = self.render(
+                score_gaussians,
+                cam_view,
+                bg_color=zero_background,
+                intrinsics=intrinsics,
+            )
+            probabilities.append(rendered["images_pred"][:, :, :1])
+            alphas.append(rendered["alphas_pred"])
+        return {
+            "rendered_prompt_probability": torch.stack(probabilities, dim=1),
+            "rendered_alpha": torch.stack(alphas, dim=1),
+        }
+
 
     def render_deferred(self, means3D, opacity, scales, rotations, rgbs, viewmat, Ks, backgrounds, H, W, near_plane, far_plane):
         images, alphas, depths, means2ds = DeferredBP.apply(means3D, rgbs, scales, rotations, opacity, viewmat, Ks, W, H, near_plane, far_plane, backgrounds)

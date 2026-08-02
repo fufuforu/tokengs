@@ -1,0 +1,84 @@
+name: scannet_c3g8
+source_label_space: scannet_raw_id
+ignore_index: 0
+unknown_nonzero_train_id: 8
+
+classes:
+  - train_id: 1
+    name: wall
+    nyu40_ids: [1]
+    raw_ids: [1, 128, 947, 1165, 1204, 1243]
+  - train_id: 2
+    name: floor
+    nyu40_ids: [2]
+    raw_ids: [3, 417, 1347]
+  - train_id: 3
+    name: ceiling
+    nyu40_ids: [22]
+    raw_ids: [41, 1225]
+  - train_id: 4
+    name: chair
+    nyu40_ids: [5]
+    raw_ids: [2, 10, 23, 74, 885, 1184, 1291, 1338]
+  - train_id: 5
+    name: table
+    nyu40_ids: [7]
+    raw_ids: [4, 24, 44, 45, 108, 222, 1193, 1355]
+  - train_id: 6
+    name: sofa
+    nyu40_ids: [6]
+    raw_ids: [6, 1313]
+  - train_id: 7
+    name: bed
+    nyu40_ids: [4]
+    raw_ids: [11, 494, 786, 1191, 1349]
+  - train_id: 8
+    name: other
+    nyu40_ids: [3, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40]
+    raw_rule: remaining_nonzero
+
+prompts: [wall, floor, ceiling, chair, table, sofa, bed, other]
+prompt_template: null
+
+evaluation:
+  manifest: /space0/mawb/C3G/datasets/scannet_test/selected_seqs_test.json
+  excluded_scenes: [scene0696_02]
+  llff_hold: 8
+  target_residues: [1, 4]
+  context_offsets: [-1, 1]
+
+training:
+  split_status: provisional
+  train_manifest: /space0/mawb/tokengs/data/scannet_prompt/scannet_c3g8_train_provisional.json
+  query_bank: /space0/mawb/tokengs/data/scannet_prompt/scannet_c3g8_query_bank.json
+  eval_manifest: /space0/mawb/C3G/datasets/scannet_test/selected_seqs_test.json
+  image_query_class_ids: [1, 2, 3, 4, 5, 6, 7]
+  text_prompt_class_ids: [1, 2, 3, 4, 5, 6, 7, 8]
+  instance_query_class_ids: [4, 5, 6, 7]
+  semantic_query_class_ids: [1, 2, 3]
+  query_image_size: [224, 224]
+  min_target_pixels: 64
+  image_query_probability: 0.5
+
+query_bank_filters:
+  max_frames_per_scene: 4
+  min_mask_area: 2048
+  min_bbox_side: 32
+  max_aspect_ratio: 4.0
+  min_foreground_ratio: 0.2
+  min_semantic_purity: 0.8
+  max_object_border_edges: 1
+  max_entries_per_class_per_scene: 8
+
+metrics:
+  num_classes: 9
+  miou:
+    average: macro
+    ignore_index: 0
+    zero_division: 0
+    per_sample: true
+  acc:
+    average: micro
+    ignore_index: 0
+    per_sample: true
+  epoch_reduction: arithmetic_mean
