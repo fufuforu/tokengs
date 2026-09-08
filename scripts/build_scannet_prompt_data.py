@@ -3,6 +3,7 @@
 
 import argparse
 import json
+import multiprocessing
 from collections import Counter, defaultdict
 from pathlib import Path
 
@@ -28,6 +29,20 @@ def _select_evenly(values: list[int], count: int) -> list[int]:
     return [values[index] for index in sorted(set(indices.tolist()))]
 
 
+# Large or wide objects (sofa/bed) often touch frame borders, and ceilings are
+# wide flat regions; keep the strict quality bar for independent small objects
+# (chair/table) while relaxing the class-agnostic filters for these classes.
+CLASS_QUERY_FILTER_OVERRIDES: dict[int, dict] = {
+    3: {"max_aspect_ratio": 4.0},
+    6: {"max_aspect_ratio": 3.5, "max_object_border_edges": 1},
+    7: {
+        "max_aspect_ratio": 3.5,
+        "max_object_border_edges": 1,
+        "min_mask_area": 2048,
+    },
+}
+
+
 def _bbox(mask: np.ndarray) -> tuple[int, int, int, int]:
     ys, xs = np.nonzero(mask)
     return int(xs.min()), int(ys.min()), int(xs.max()) + 1, int(ys.max()) + 1
@@ -42,21 +57,23 @@ def _candidate_metadata(
     source_type: str,
     filters: dict,
 ) -> dict | None:
+    effective = dict(filters)
+    effective.update(CLASS_QUERY_FILTER_OVERRIDES.get(class_id, {}))
     mask_area = int(mask.sum())
-    if mask_area < int(filters["min_mask_area"]):
+    if mask_area < int(effective["min_mask_area"]):
         return None
     x0, y0, x1, y1 = _bbox(mask)
     bbox_w, bbox_h = x1 - x0, y1 - y0
-    if min(bbox_w, bbox_h) < int(filters["min_bbox_side"]):
+    if min(bbox_w, bbox_h) < int(effective["min_bbox_side"]):
         return None
-    if max(bbox_w / bbox_h, bbox_h / bbox_w) > float(filters["max_aspect_ratio"]):
+    if max(bbox_w / bbox_h, bbox_h / bbox_w) > float(effective["max_aspect_ratio"]):
         return None
     foreground_ratio = mask_area / float(bbox_w * bbox_h)
-    if foreground_ratio < float(filters["min_foreground_ratio"]):
+    if foreground_ratio < float(effective["min_foreground_ratio"]):
         return None
     height, width = mask.shape
     border_edges = sum((x0 == 0, y0 == 0, x1 == width, y1 == height))
-    if source_type == "instance" and border_edges > int(filters["max_object_border_edges"]):
+    if source_type == "instance" and border_edges > int(effective["max_object_border_edges"]):
         return None
     return {
         "scene": scene,
@@ -130,6 +147,51 @@ def _load_eval_scenes(path: Path) -> list[str]:
     return list(json.loads(path.read_text(encoding="utf-8")))
 
 
+def _process_scene(args: tuple) -> tuple[str, list[dict], bool]:
+    (
+        scene,
+        scan_root,
+        label_root,
+        filters,
+        label_lut,
+        unknown_label_id,
+        max_per_class,
+    ) = args
+    scan_root = Path(scan_root)
+    label_root = Path(label_root)
+    semantic_paths = _numeric_pngs(label_root / scene / "label-filt")
+    instance_paths = _numeric_pngs(label_root / scene / "instance-filt")
+    common_frames = sorted(set(semantic_paths) & set(instance_paths))
+    if not common_frames:
+        return scene, [], True
+    selected_frames = _select_evenly(
+        common_frames, int(filters["max_frames_per_scene"])
+    )
+    per_class_counts: Counter = Counter()
+    entries: list[dict] = []
+    for raw_frame_id in selected_frames:
+        semantic_raw = np.asarray(Image.open(semantic_paths[raw_frame_id]))
+        instances = np.asarray(Image.open(instance_paths[raw_frame_id]))
+        if semantic_raw.shape != instances.shape:
+            continue
+        frame_entries = extract_frame_entries(
+            scene,
+            raw_frame_id,
+            semantic_raw,
+            instances,
+            label_lut,
+            unknown_label_id,
+            filters,
+        )
+        for entry in frame_entries:
+            class_id = entry["class_id"]
+            if per_class_counts[class_id] >= max_per_class:
+                continue
+            per_class_counts[class_id] += 1
+            entries.append(entry)
+    return scene, entries, False
+
+
 def build(args: argparse.Namespace) -> None:
     protocol_path = Path(args.protocol)
     with protocol_path.open(encoding="utf-8") as handle:
@@ -138,6 +200,10 @@ def build(args: argparse.Namespace) -> None:
     filters = protocol["query_bank_filters"]
     if args.max_frames_per_scene is not None:
         filters["max_frames_per_scene"] = args.max_frames_per_scene
+    if args.max_entries_per_class_per_scene is not None:
+        filters["max_entries_per_class_per_scene"] = (
+            args.max_entries_per_class_per_scene
+        )
 
     scan_root = Path(args.scan_root)
     label_root = Path(args.label_root)
@@ -192,46 +258,47 @@ def build(args: argparse.Namespace) -> None:
     )
 
     label_lut, unknown_label_id, _ = ScanNet._load_c3g8_protocol(protocol_path)
-    all_entries = []
-    skipped_missing = []
-    per_scene_class_counts: dict[str, Counter] = defaultdict(Counter)
     max_per_class = int(filters["max_entries_per_class_per_scene"])
-    for scene_index, scene in enumerate(train_scenes, start=1):
-        semantic_paths = _numeric_pngs(label_root / scene / "label-filt")
-        instance_paths = _numeric_pngs(label_root / scene / "instance-filt")
-        common_frames = sorted(set(semantic_paths) & set(instance_paths))
-        if not common_frames:
-            skipped_missing.append(scene)
-            continue
-        selected_frames = _select_evenly(
-            common_frames, int(filters["max_frames_per_scene"])
-        )
-        for raw_frame_id in selected_frames:
-            semantic_raw = np.asarray(Image.open(semantic_paths[raw_frame_id]))
-            instances = np.asarray(Image.open(instance_paths[raw_frame_id]))
-            if semantic_raw.shape != instances.shape:
-                continue
-            frame_entries = extract_frame_entries(
+    if args.workers > 1:
+        worker_args = [
+            (
                 scene,
-                raw_frame_id,
-                semantic_raw,
-                instances,
+                str(scan_root),
+                str(label_root),
+                filters,
                 label_lut,
                 unknown_label_id,
-                filters,
+                max_per_class,
             )
-            for entry in frame_entries:
-                class_id = entry["class_id"]
-                if per_scene_class_counts[scene][class_id] >= max_per_class:
-                    continue
-                per_scene_class_counts[scene][class_id] += 1
-                all_entries.append(entry)
-        if scene_index % 100 == 0 or scene_index == len(train_scenes):
-            print(
-                f"Processed {scene_index}/{len(train_scenes)} scenes, "
-                f"bank entries={len(all_entries)}",
-                flush=True,
+            for scene in train_scenes
+        ]
+        with multiprocessing.Pool(args.workers) as pool:
+            results = pool.map(_process_scene, worker_args)
+    else:
+        results = [
+            _process_scene(
+                (
+                    scene,
+                    str(scan_root),
+                    str(label_root),
+                    filters,
+                    label_lut,
+                    unknown_label_id,
+                    max_per_class,
+                )
             )
+            for scene in train_scenes
+        ]
+    all_entries = []
+    skipped_missing = []
+    for scene, entries, missing in results:
+        if missing:
+            skipped_missing.append(scene)
+        all_entries.extend(entries)
+    print(
+        f"Processed {len(train_scenes)} scenes, bank entries={len(all_entries)}",
+        flush=True,
+    )
 
     distribution = Counter(entry["class_id"] for entry in all_entries)
     bank = {
@@ -264,6 +331,8 @@ def main() -> None:
         default="/space0/mawb/tokengs/configs/semantic/scannet_c3g8.yaml",
     )
     parser.add_argument("--max-frames-per-scene", type=int)
+    parser.add_argument("--max-entries-per-class-per-scene", type=int)
+    parser.add_argument("--workers", type=int, default=1)
     build(parser.parse_args())
 
 

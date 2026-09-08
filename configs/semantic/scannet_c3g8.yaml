@@ -61,13 +61,13 @@ training:
   image_query_probability: 0.5
 
 query_bank_filters:
-  max_frames_per_scene: 4
-  min_mask_area: 2048
-  min_bbox_side: 32
-  max_aspect_ratio: 4.0
-  min_foreground_ratio: 0.2
+  max_frames_per_scene: 12
+  min_mask_area: 4096
+  min_bbox_side: 64
+  max_aspect_ratio: 2.5
+  min_foreground_ratio: 0.3
   min_semantic_purity: 0.8
-  max_object_border_edges: 1
+  max_object_border_edges: 0
   max_entries_per_class_per_scene: 8
 
 metrics:

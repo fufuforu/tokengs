@@ -17,12 +17,21 @@ from pathlib import Path
 
 from tokengs.data.dynamic.kubric import Kubric
 from tokengs.data.static.dl3dv import DL3DV10K, DL3DVEval
-from tokengs.data.static.scannet import ScanNet, ScanNetC3G8Eval
+from tokengs.data.static.scannet import (
+    ScanNet,
+    ScanNetC3G8Eval,
+    ScanNetC3G8PromptEval,
+)
 from tokengs.data.static.scannet_prompt import (
     ScanNetPromptSmall,
     ScanNetPromptTrain,
     ScanNetSemanticSmall,
 )
+from tokengs.data.static.scannet_c3g_semantic import ScanNetC3GSemanticEval
+from tokengs.data.static.scannet_lsm import ScanNetLSMInstanceEval
+from tokengs.data.static.scannet_lsm_train import ScanNetLSMStyleTrain
+from tokengs.data.static.scannetpp import ScanNetPPInstanceTrain
+from tokengs.data.static.re10k import RE10KTorchDL3DVStyle
 
 # Repository root (parent of the `tokengs` package)
 _REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -31,7 +40,9 @@ _DEFAULT_DL3DV_EVAL_ROOT = _REPO_ROOT / "data" / "dl3dv_eval"
 _DEFAULT_KUBRIC_ROOT = _REPO_ROOT / "data" / "kubric"
 _DEFAULT_SCANNET_ROOT = _REPO_ROOT / "data" / "ScanNet" / "scans"
 _DEFAULT_SCANNET_LABEL_ROOT = _REPO_ROOT / "data" / "scannet2d_labels"
+_DEFAULT_RE10K_ROOT = "/datasets2/mengxl/re10k"
 _DEFAULT_C3G8_PROTOCOL = _REPO_ROOT / "configs" / "semantic" / "scannet_c3g8.yaml"
+_DEFAULT_C3G_SCANNET_TEST_ROOT = "/space0/mawb/C3G/datasets/scannet_test"
 _DEFAULT_SCANNET_PROMPT_SMALL_MANIFEST = (
     _REPO_ROOT / "data" / "scannet_prompt" / "scannet_prompt_small_64_8.json"
 )
@@ -103,6 +114,50 @@ dataset_registry["scannet_c3g8_eval"] = {
     "min_gap": 0,
 }
 
+dataset_registry["scannet_c3g_semantic_eval"] = {
+    "cls": ScanNetC3GSemanticEval,
+    "kwargs": {
+        "root_path": str(_DEFAULT_C3G_SCANNET_TEST_ROOT),
+        "resolution": "256x256",
+        "selected_json": "selected_seqs_test.json",
+        "label_tsv": "scannetv2-labels.combined.tsv",
+        "llff_hold": 8,
+        "test_ids": (1, 4),
+        "ignored_scenes": ("scene0696_02",),
+        "require_labels": True,
+    },
+    "scene_scale": 1.0,
+    "max_gap": 1_000_000,
+    "min_gap": 0,
+}
+
+dataset_registry["re10k"] = {
+    "cls": RE10KTorchDL3DVStyle,
+    "kwargs": {
+        "root_path": _DEFAULT_RE10K_ROOT,
+        "split": "train",
+        "semantic_root": "/space0/mawb/TokenGS/data/re10k",
+        "resolution": "448x256",
+        "include_semantics": False,
+        "index_file": None,
+    },
+    "scene_scale": 0.15,
+    "max_gap": 120,
+    "min_gap": 40,
+}
+
+dataset_registry["scannet_c3g8_prompt_eval"] = {
+    "cls": ScanNetC3G8PromptEval,
+    "kwargs": {
+        "root_path": str(_DEFAULT_SCANNET_ROOT),
+        "label_root": str(_DEFAULT_SCANNET_LABEL_ROOT),
+        "semantic_protocol_path": str(_DEFAULT_C3G8_PROTOCOL),
+    },
+    "scene_scale": 0.15,
+    "max_gap": 0,
+    "min_gap": 0,
+}
+
 dataset_registry["scannet_prompt_train"] = {
     "cls": ScanNetPromptTrain,
     "kwargs": {
@@ -138,6 +193,57 @@ dataset_registry["scannet_semantic_small"] = {
         "semantic_protocol_path": str(_DEFAULT_C3G8_PROTOCOL),
         "small_manifest_path": str(_DEFAULT_SCANNET_PROMPT_SMALL_MANIFEST),
         "frame_stride": 1,
+    },
+    "scene_scale": 0.15,
+    "max_gap": 0,
+    "min_gap": 0,
+}
+
+dataset_registry["scannet_lsm_style_train"] = {
+    "cls": ScanNetLSMStyleTrain,
+    "kwargs": {
+        "root_path": str(_DEFAULT_SCANNET_ROOT),
+        "label_root": str(_DEFAULT_SCANNET_LABEL_ROOT),
+        "train_manifest_path": str(
+            _REPO_ROOT / "data" / "scannet_prompt" / "scannet_c3g8_train_provisional.json"
+        ),
+        "semantic_protocol_path": str(_DEFAULT_C3G8_PROTOCOL),
+        "windows_per_scene": 16,
+    },
+    "scene_scale": 0.15,
+    "max_gap": 0,
+    "min_gap": 0,
+}
+
+dataset_registry["scannetpp_instance_train"] = {
+    "cls": ScanNetPPInstanceTrain,
+    "kwargs": {
+        "root_path": str(
+            _REPO_ROOT / "data" / "scannetpp_processed"
+        ),
+        "scenes_file": str(
+            _REPO_ROOT / "data" / "scannetpp_processed" / "scenes_all.txt"
+        ),
+        "windows_per_scene": 8,
+        "frame_stride": 10,
+    },
+    "scene_scale": 0.15,
+    "max_gap": 0,
+    "min_gap": 0,
+}
+
+dataset_registry["scannet_lsm_instance_eval"] = {
+    "cls": ScanNetLSMInstanceEval,
+    "kwargs": {
+        "root_path": str(_DEFAULT_SCANNET_ROOT),
+        "label_root": str(_DEFAULT_SCANNET_LABEL_ROOT),
+        "lsm_manifest_path": str(
+            _REPO_ROOT
+            / "data"
+            / "scannet_prompt"
+            / "lsm_instance_eval_manifest.json"
+        ),
+        "semantic_protocol_path": str(_DEFAULT_C3G8_PROTOCOL),
     },
     "scene_scale": 0.15,
     "max_gap": 0,

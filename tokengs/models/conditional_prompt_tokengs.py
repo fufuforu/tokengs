@@ -82,7 +82,12 @@ class ConditionalPromptTokenGS(PromptTokenGS):
     def _frozen_reconstruction_context(self, model_input):
         with torch.no_grad():
             encoder_latent = TokenGS.forward_encoder(self, model_input.encoder)
-            hidden = TokenGS.get_gs_tokens(self, encoder_latent.keys.shape[0])
+            hidden = TokenGS.get_gs_tokens(
+                self,
+                encoder_latent.keys.shape[0],
+                encoder_latent=encoder_latent,
+                decoder_input=model_input.decoder,
+            )
             hidden = TokenGS._apply_time_embedding_to_gs_tokens(
                 self, hidden, model_input.decoder
             )
@@ -162,6 +167,8 @@ class ConditionalPromptTokenGS(PromptTokenGS):
             valid_mask,
             lambda_bce=self.opt.prompt_lambda_bce,
             lambda_dice=self.opt.prompt_lambda_dice,
+            balance_classes=bool(self.opt.prompt_balanced_bce),
+            pos_weight=self.opt.prompt_balanced_bce_pos_weight,
         )
         mask_metrics = compute_prompt_mask_metrics(
             rendered_probability,

@@ -163,6 +163,272 @@ class GaussianRenderer:
             "rendered_alpha": torch.stack(alphas, dim=1),
         }
 
+    def render_feature_channels(
+        self,
+        gaussians,
+        features,
+        cam_view,
+        intrinsics=None,
+        opacity_scale: float = 1.0,
+    ):
+        """Alpha-composite arbitrary per-Gaussian channels via gsplat N-D support.
+
+        ``features`` is [B, N, D]. Geometry and opacity come from the unchanged
+        Gaussian tensor; every feature channel is composited independently so
+        the output is a D-channel map [B, V, D, H, W] plus alpha. Requires
+        deferred_bp=False (same constraint as prompt score rendering).
+        """
+        if getattr(self.opt, "deferred_bp", False):
+            raise ValueError(
+                "Feature channel rendering requires deferred_bp=False"
+            )
+        if features.ndim != 3 or features.shape[1] != gaussians.shape[1]:
+            raise ValueError(
+                f"features must have shape [B,N,D], got {tuple(features.shape)} "
+                f"with {gaussians.shape[1]} Gaussians"
+            )
+        B, V = cam_view.shape[:2]
+        means3D = gaussians[..., 0:3].contiguous().float()
+        opacity = gaussians[..., 3:4].contiguous().float().squeeze(-1)
+        if opacity_scale != 1.0:
+            # Sharpened opacity: the front-most Gaussian becomes effectively
+            # opaque, so the alpha-composited per-pixel group channels are
+            # dominated by one Gaussian instead of a uniform mix of many.
+            # This keeps the rendered per-pixel group probabilities sharp
+            # (the token-level assignment is already ~0.92 confident) and
+            # makes both the training gradients and the eval confidence
+            # meaningful instead of near-uniform.
+            opacity = 1.0 - (1.0 - opacity).clamp(0.0, 1.0).pow(
+                float(opacity_scale)
+            )
+        scales = gaussians[..., 4:7].contiguous().float()
+        rotations = gaussians[..., 7:11].contiguous().float()
+        colors = features.contiguous().float()
+        feature_dim = colors.shape[-1]
+
+        viewmat = cam_view.float().transpose(3, 2)  # [B, V, 4, 4]
+        Ks = torch.tensor(
+            [
+                [
+                    [
+                        [view_intrinsic[0], 0.0, view_intrinsic[2]],
+                        [0.0, view_intrinsic[1], view_intrinsic[3]],
+                        [0.0, 0.0, 1.0],
+                    ]
+                    for view_intrinsic in batch_intrinsic
+                ]
+                for batch_intrinsic in intrinsics
+            ],
+            dtype=means3D.dtype,
+            device=means3D.device,
+        )
+        backgrounds = torch.zeros(
+            B, V, feature_dim, dtype=colors.dtype, device=colors.device
+        )
+        H, W = self.opt.img_size
+        near_plane, far_plane = self.opt.znear, self.opt.zfar
+
+        images, alphas = [], []
+        for b in range(B):
+            rendered_image_all, rendered_alpha_all, _ = rasterization(
+                means=means3D[b],
+                quats=rotations[b],
+                scales=scales[b],
+                opacities=opacity[b],
+                colors=colors[b],
+                viewmats=viewmat[b],
+                Ks=Ks[b],
+                width=W,
+                height=H,
+                near_plane=near_plane,
+                far_plane=far_plane,
+                backgrounds=backgrounds[b],
+                render_mode="RGB",
+                packed=False,
+            )
+            for rendered_image, rendered_alpha in zip(
+                rendered_image_all, rendered_alpha_all
+            ):
+                images.append(rendered_image.permute(2, 0, 1))  # [D, H, W]
+                alphas.append(rendered_alpha.permute(2, 0, 1))  # [1, H, W]
+        images = torch.stack(images).view(B, V, feature_dim, H, W)
+        alphas = torch.stack(alphas).view(B, V, 1, H, W)
+        return {"images_pred": images, "alphas_pred": alphas}
+
+    def render_token_features(
+        self,
+        gaussians: torch.Tensor,
+        token_features: torch.Tensor,
+        local_codes: torch.Tensor,
+        local_basis: torch.Tensor,
+        cam_view: torch.Tensor,
+        intrinsics: torch.Tensor,
+        local_residual_scale: float = 0.1,
+        feature_chunk_size: int = 32,
+        render_scale: float = 0.5,
+        detach_geometry: bool = True,
+    ) -> dict:
+        """Render a token-compressed semantic field without materializing N x C.
+
+        Args:
+            gaussians: [B, N_gaussian, 14]
+            token_features: [B, N_token, C]
+            local_codes: [B, N_token, G, R]
+            local_basis: [R, C]
+        """
+        if gaussians.ndim != 3:
+            raise ValueError(
+                f"gaussians must be [B,N,14], got {tuple(gaussians.shape)}"
+            )
+        if token_features.ndim != 3:
+            raise ValueError(
+                "token_features must be [B,N_token,C], "
+                f"got {tuple(token_features.shape)}"
+            )
+        if local_codes.ndim != 4:
+            raise ValueError(
+                "local_codes must be [B,N_token,G,R], "
+                f"got {tuple(local_codes.shape)}"
+            )
+        if local_basis.ndim != 2:
+            raise ValueError(
+                f"local_basis must be [R,C], got {tuple(local_basis.shape)}"
+            )
+
+        B, N_gaussian, _ = gaussians.shape
+        B_token, N_token, feature_dim = token_features.shape
+        B_code, N_token_code, gs_per_token, rank = local_codes.shape
+
+        if B != B_token or B != B_code:
+            raise ValueError(
+                f"Batch mismatch: gaussians={B}, tokens={B_token}, codes={B_code}"
+            )
+        if N_token != N_token_code:
+            raise ValueError(
+                f"Token count mismatch: {N_token} vs {N_token_code}"
+            )
+        if N_gaussian != N_token * gs_per_token:
+            raise ValueError(
+                f"N_gaussian={N_gaussian} != "
+                f"N_token({N_token}) * G({gs_per_token})"
+            )
+        if local_basis.shape != (rank, feature_dim):
+            raise ValueError(
+                "Basis shape mismatch: expected "
+                f"({rank}, {feature_dim}), got {tuple(local_basis.shape)}"
+            )
+
+        means3D = gaussians[..., 0:3].contiguous().float()
+        opacity = gaussians[..., 3:4].contiguous().float().squeeze(-1)
+        scales = gaussians[..., 4:7].contiguous().float()
+        rotations = gaussians[..., 7:11].contiguous().float()
+
+        if detach_geometry:
+            means3D = means3D.detach()
+            opacity = opacity.detach()
+            scales = scales.detach()
+            rotations = rotations.detach()
+
+        viewmat = cam_view.float().transpose(3, 2)
+
+        H_rgb, W_rgb = self.opt.img_size
+        H_feature = max(1, int(round(H_rgb * float(render_scale))))
+        W_feature = max(1, int(round(W_rgb * float(render_scale))))
+
+        scale_x = W_feature / float(W_rgb)
+        scale_y = H_feature / float(H_rgb)
+        intrinsics_scaled = intrinsics.float().clone()
+        intrinsics_scaled[..., 0] *= scale_x
+        intrinsics_scaled[..., 1] *= scale_y
+        intrinsics_scaled[..., 2] *= scale_x
+        intrinsics_scaled[..., 3] *= scale_y
+
+        B_camera, V = intrinsics_scaled.shape[:2]
+        if B_camera != B:
+            raise ValueError(
+                f"camera batch mismatch: {B_camera} vs {B}"
+            )
+
+        Ks = torch.zeros(
+            B,
+            V,
+            3,
+            3,
+            dtype=means3D.dtype,
+            device=means3D.device,
+        )
+        Ks[..., 0, 0] = intrinsics_scaled[..., 0]
+        Ks[..., 1, 1] = intrinsics_scaled[..., 1]
+        Ks[..., 0, 2] = intrinsics_scaled[..., 2]
+        Ks[..., 1, 2] = intrinsics_scaled[..., 3]
+        Ks[..., 2, 2] = 1.0
+
+        near_plane = float(self.opt.znear)
+        far_plane = float(self.opt.zfar)
+
+        batch_features = []
+        batch_alphas = []
+
+        for b in range(B):
+            rendered_chunks = []
+            alpha_b = None
+
+            token_features_b = token_features[b].float()
+            local_codes_b = local_codes[b].float()
+            local_basis_float = local_basis.float()
+
+            for start in range(0, feature_dim, int(feature_chunk_size)):
+                end = min(start + int(feature_chunk_size), feature_dim)
+
+                token_chunk = token_features_b[:, start:end]
+                residual_chunk = torch.einsum(
+                    "tgr,rc->tgc",
+                    local_codes_b,
+                    local_basis_float[:, start:end],
+                )
+                gaussian_chunk = (
+                    token_chunk[:, None, :]
+                    + float(local_residual_scale) * residual_chunk
+                ).reshape(N_gaussian, end - start).contiguous()
+
+                backgrounds = torch.zeros(
+                    V,
+                    end - start,
+                    dtype=gaussian_chunk.dtype,
+                    device=gaussian_chunk.device,
+                )
+
+                rendered_chunk, rendered_alpha, _ = rasterization(
+                    means=means3D[b],
+                    quats=rotations[b],
+                    scales=scales[b],
+                    opacities=opacity[b],
+                    colors=gaussian_chunk,
+                    viewmats=viewmat[b],
+                    Ks=Ks[b],
+                    width=W_feature,
+                    height=H_feature,
+                    near_plane=near_plane,
+                    far_plane=far_plane,
+                    packed=False,
+                    backgrounds=backgrounds,
+                    render_mode="RGB",
+                )
+
+                rendered_chunk = rendered_chunk.permute(0, 3, 1, 2)
+                rendered_chunks.append(rendered_chunk)
+
+                if alpha_b is None:
+                    alpha_b = rendered_alpha.permute(0, 3, 1, 2)
+
+            batch_features.append(torch.cat(rendered_chunks, dim=1))
+            batch_alphas.append(alpha_b)
+
+        return {
+            "semantic_features_pred": torch.stack(batch_features, dim=0),
+            "semantic_alphas_pred": torch.stack(batch_alphas, dim=0),
+        }
+
 
     def render_deferred(self, means3D, opacity, scales, rotations, rgbs, viewmat, Ks, backgrounds, H, W, near_plane, far_plane):
         images, alphas, depths, means2ds = DeferredBP.apply(means3D, rgbs, scales, rotations, opacity, viewmat, Ks, W, H, near_plane, far_plane, backgrounds)

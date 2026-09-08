@@ -1,0 +1,74 @@
+Loaded scannet_lsm_instance_eval, train size: 40, test size: 40, loading took 0.011312723159790039 seconds
+[PromptTokenGS] pretrained checkpoint: /space0/mawb/tokengs/workspace/tokengs_re10k/model.safetensors
+[PromptTokenGS] checkpoint GS token shape: (1024, 1024)
+[PromptTokenGS] configured GS token shape: (1024, 1024)
+[PromptTokenGS] missing keys: []
+[PromptTokenGS] unexpected keys: []
+[PromptTokenGS] shape-mismatched keys: []
+[SemanticTokenGSv4] trainable parameter groups: token_adapter=396,544, prompt_adapter=27,264, gaussian_feature_head=39,356, temperature=1
+[SemanticTokenGSv4] reconstruction TokenGS remains frozen: True
+[diag-3d] loaded 399 backbone keys from /space0/mawb/tokengs/workspace/semantic_v6_open_vocab_full_ce2_wide7l_train_8000/checkpoints/model_step_008000.safetensors
+huggingface/tokenizers: The current process just got forked, after parallelism has already been used. Disabling parallelism to avoid deadlocks...
+To disable this warning, you can either:
+	- Avoid using `tokenizers` before the fork if possible
+	- Explicitly set the environment variable TOKENIZERS_PARALLELISM=(true | false)
+huggingface/tokenizers: The current process just got forked, after parallelism has already been used. Disabling parallelism to avoid deadlocks...
+To disable this warning, you can either:
+	- Avoid using `tokenizers` before the fork if possible
+	- Explicitly set the environment variable TOKENIZERS_PARALLELISM=(true | false)
+/space0/mawb/anaconda3/envs/tokengs/lib/python3.11/site-packages/torch/utils/cpp_extension.py:1964: UserWarning: TORCH_CUDA_ARCH_LIST is not set, all archs for visible cards are included for compilation. 
+If this is not desired, please set os.environ['TORCH_CUDA_ARCH_LIST'].
+  warnings.warn(
+[diag-3d] scene0686_01: num_gaussians=65536.000 void_share=0.011 mean_gs_conf=0.658 knn3d_same_group=0.738 token_purity=1.000 rendered_gs_agreement=0.614 cross_view_agreement=0.864 gt_fragmentation=7.141 gt_purity=0.657 gt_merging=50.778 n_gt_instances_covered=9.000 (0.3s)
+[diag-3d] scene0686_02: num_gaussians=65536.000 void_share=0.054 mean_gs_conf=0.524 knn3d_same_group=0.635 token_purity=1.000 rendered_gs_agreement=0.413 cross_view_agreement=0.509 gt_fragmentation=8.375 gt_purity=0.462 gt_merging=48.727 n_gt_instances_covered=11.000 (0.1s)
+[diag-3d] scene0687_00: num_gaussians=65536.000 void_share=0.000 mean_gs_conf=0.761 knn3d_same_group=0.758 token_purity=1.000 rendered_gs_agreement=0.573 cross_view_agreement=0.661 gt_fragmentation=5.000 gt_purity=0.671 gt_merging=41.111 n_gt_instances_covered=9.000 (0.1s)
+[diag-3d] scene0688_00: num_gaussians=65536.000 void_share=0.000 mean_gs_conf=0.572 knn3d_same_group=0.579 token_purity=1.000 rendered_gs_agreement=0.479 cross_view_agreement=0.875 gt_fragmentation=7.020 gt_purity=0.553 gt_merging=47.267 n_gt_instances_covered=15.000 (0.1s)
+[diag-3d] scene0689_00: num_gaussians=65536.000 void_share=0.017 mean_gs_conf=0.590 knn3d_same_group=0.606 token_purity=1.000 rendered_gs_agreement=0.534 cross_view_agreement=0.680 gt_fragmentation=7.180 gt_purity=0.602 gt_merging=29.200 n_gt_instances_covered=15.000 (0.1s)
+[diag-3d] scene0691_00: num_gaussians=65536.000 void_share=0.008 mean_gs_conf=0.465 knn3d_same_group=0.548 token_purity=1.000 rendered_gs_agreement=0.597 cross_view_agreement=0.822 gt_fragmentation=6.405 gt_purity=0.614 gt_merging=48.909 n_gt_instances_covered=11.000 (0.1s)
+[diag-3d] scene0692_00: num_gaussians=65536.000 void_share=0.009 mean_gs_conf=0.360 knn3d_same_group=0.450 token_purity=1.000 rendered_gs_agreement=0.428 cross_view_agreement=0.750 gt_fragmentation=9.439 gt_purity=0.494 gt_merging=41.385 n_gt_instances_covered=13.000 (0.1s)
+[diag-3d] scene0692_01: num_gaussians=65536.000 void_share=0.003 mean_gs_conf=0.376 knn3d_same_group=0.534 token_purity=1.000 rendered_gs_agreement=0.379 cross_view_agreement=0.895 gt_fragmentation=9.500 gt_purity=0.563 gt_merging=96.267 n_gt_instances_covered=15.000 (0.1s)
+[diag-3d] scene0692_03: num_gaussians=65536.000 void_share=0.001 mean_gs_conf=0.486 knn3d_same_group=0.579 token_purity=1.000 rendered_gs_agreement=0.470 cross_view_agreement=0.920 gt_fragmentation=6.400 gt_purity=0.617 gt_merging=32.000 n_gt_instances_covered=10.000 (0.1s)
+[diag-3d] scene0693_00: num_gaussians=65536.000 void_share=0.000 mean_gs_conf=0.645 knn3d_same_group=0.629 token_purity=1.000 rendered_gs_agreement=0.467 cross_view_agreement=0.787 gt_fragmentation=7.356 gt_purity=0.498 gt_merging=43.400 n_gt_instances_covered=10.000 (0.1s)
+[diag-3d] scene0693_01: num_gaussians=65536.000 void_share=0.000 mean_gs_conf=0.819 knn3d_same_group=0.804 token_purity=1.000 rendered_gs_agreement=0.538 cross_view_agreement=0.933 gt_fragmentation=6.492 gt_purity=0.596 gt_merging=42.556 n_gt_instances_covered=9.000 (0.1s)
+[diag-3d] scene0693_02: num_gaussians=65536.000 void_share=0.000 mean_gs_conf=0.766 knn3d_same_group=0.793 token_purity=1.000 rendered_gs_agreement=0.698 cross_view_agreement=0.960 gt_fragmentation=5.952 gt_purity=0.681 gt_merging=41.667 n_gt_instances_covered=9.000 (0.1s)
+[diag-3d] scene0694_00: num_gaussians=65536.000 void_share=0.000 mean_gs_conf=0.728 knn3d_same_group=0.699 token_purity=1.000 rendered_gs_agreement=0.575 cross_view_agreement=0.933 gt_fragmentation=6.807 gt_purity=0.661 gt_merging=51.364 n_gt_instances_covered=11.000 (0.1s)
+[diag-3d] scene0694_01: num_gaussians=65536.000 void_share=0.000 mean_gs_conf=0.642 knn3d_same_group=0.628 token_purity=1.000 rendered_gs_agreement=0.497 cross_view_agreement=0.801 gt_fragmentation=10.100 gt_purity=0.503 gt_merging=62.154 n_gt_instances_covered=13.000 (0.1s)
+[diag-3d] scene0695_02: num_gaussians=65536.000 void_share=0.000 mean_gs_conf=0.572 knn3d_same_group=0.564 token_purity=1.000 rendered_gs_agreement=0.505 cross_view_agreement=0.852 gt_fragmentation=7.269 gt_purity=0.504 gt_merging=31.500 n_gt_instances_covered=12.000 (0.1s)
+[diag-3d] scene0695_03: num_gaussians=65536.000 void_share=0.009 mean_gs_conf=0.546 knn3d_same_group=0.582 token_purity=1.000 rendered_gs_agreement=0.415 cross_view_agreement=0.780 gt_fragmentation=7.990 gt_purity=0.595 gt_merging=71.182 n_gt_instances_covered=11.000 (0.1s)
+[diag-3d] scene0696_00: num_gaussians=65536.000 void_share=0.015 mean_gs_conf=0.633 knn3d_same_group=0.624 token_purity=1.000 rendered_gs_agreement=0.532 cross_view_agreement=0.802 gt_fragmentation=7.778 gt_purity=0.583 gt_merging=55.000 n_gt_instances_covered=14.000 (0.1s)
+[diag-3d] scene0696_01: num_gaussians=65536.000 void_share=0.000 mean_gs_conf=0.528 knn3d_same_group=0.575 token_purity=1.000 rendered_gs_agreement=0.411 cross_view_agreement=0.578 gt_fragmentation=9.150 gt_purity=0.466 gt_merging=69.929 n_gt_instances_covered=14.000 (0.1s)
+[diag-3d] scene0697_00: num_gaussians=65536.000 void_share=0.000 mean_gs_conf=0.707 knn3d_same_group=0.672 token_purity=1.000 rendered_gs_agreement=0.513 cross_view_agreement=0.960 gt_fragmentation=8.758 gt_purity=0.491 gt_merging=48.167 n_gt_instances_covered=12.000 (0.1s)
+[diag-3d] scene0697_01: num_gaussians=65536.000 void_share=0.000 mean_gs_conf=0.635 knn3d_same_group=0.621 token_purity=1.000 rendered_gs_agreement=0.475 cross_view_agreement=0.912 gt_fragmentation=9.200 gt_purity=0.440 gt_merging=38.333 n_gt_instances_covered=12.000 (0.1s)
+[diag-3d] scene0697_02: num_gaussians=65536.000 void_share=0.000 mean_gs_conf=0.751 knn3d_same_group=0.762 token_purity=1.000 rendered_gs_agreement=0.474 cross_view_agreement=0.922 gt_fragmentation=7.300 gt_purity=0.543 gt_merging=29.200 n_gt_instances_covered=10.000 (0.1s)
+[diag-3d] scene0697_03: num_gaussians=65536.000 void_share=0.000 mean_gs_conf=0.655 knn3d_same_group=0.709 token_purity=1.000 rendered_gs_agreement=0.791 cross_view_agreement=0.994 gt_fragmentation=7.400 gt_purity=0.614 gt_merging=30.273 n_gt_instances_covered=11.000 (0.1s)
+[diag-3d] scene0698_00: num_gaussians=65536.000 void_share=0.000 mean_gs_conf=0.591 knn3d_same_group=0.651 token_purity=1.000 rendered_gs_agreement=0.515 cross_view_agreement=0.845 gt_fragmentation=9.266 gt_purity=0.484 gt_merging=42.357 n_gt_instances_covered=14.000 (0.1s)
+[diag-3d] scene0698_01: num_gaussians=65536.000 void_share=0.000 mean_gs_conf=0.624 knn3d_same_group=0.589 token_purity=1.000 rendered_gs_agreement=0.417 cross_view_agreement=0.912 gt_fragmentation=7.982 gt_purity=0.537 gt_merging=68.154 n_gt_instances_covered=13.000 (0.1s)
+[diag-3d] scene0699_00: num_gaussians=65536.000 void_share=0.015 mean_gs_conf=0.538 knn3d_same_group=0.615 token_purity=1.000 rendered_gs_agreement=0.457 cross_view_agreement=0.893 gt_fragmentation=7.986 gt_purity=0.602 gt_merging=50.091 n_gt_instances_covered=11.000 (0.1s)
+[diag-3d] scene0700_00: num_gaussians=65536.000 void_share=0.016 mean_gs_conf=0.489 knn3d_same_group=0.537 token_purity=1.000 rendered_gs_agreement=0.450 cross_view_agreement=0.875 gt_fragmentation=7.130 gt_purity=0.612 gt_merging=27.500 n_gt_instances_covered=14.000 (0.1s)
+[diag-3d] scene0700_01: num_gaussians=65536.000 void_share=0.006 mean_gs_conf=0.524 knn3d_same_group=0.608 token_purity=1.000 rendered_gs_agreement=0.533 cross_view_agreement=0.889 gt_fragmentation=8.264 gt_purity=0.593 gt_merging=33.692 n_gt_instances_covered=13.000 (0.1s)
+[diag-3d] scene0700_02: num_gaussians=65536.000 void_share=0.000 mean_gs_conf=0.627 knn3d_same_group=0.618 token_purity=1.000 rendered_gs_agreement=0.528 cross_view_agreement=0.644 gt_fragmentation=6.115 gt_purity=0.614 gt_merging=48.917 n_gt_instances_covered=12.000 (0.1s)
+[diag-3d] scene0701_00: num_gaussians=65536.000 void_share=0.000 mean_gs_conf=0.703 knn3d_same_group=0.639 token_purity=1.000 rendered_gs_agreement=0.617 cross_view_agreement=0.854 gt_fragmentation=7.370 gt_purity=0.585 gt_merging=19.900 n_gt_instances_covered=10.000 (0.1s)
+[diag-3d] scene0701_01: num_gaussians=65536.000 void_share=0.000 mean_gs_conf=0.807 knn3d_same_group=0.761 token_purity=1.000 rendered_gs_agreement=0.480 cross_view_agreement=0.744 gt_fragmentation=8.522 gt_purity=0.524 gt_merging=19.600 n_gt_instances_covered=10.000 (0.1s)
+[diag-3d] scene0701_02: num_gaussians=65536.000 void_share=0.000 mean_gs_conf=0.441 knn3d_same_group=0.519 token_purity=1.000 rendered_gs_agreement=0.393 cross_view_agreement=0.766 gt_fragmentation=7.111 gt_purity=0.510 gt_merging=23.273 n_gt_instances_covered=11.000 (0.1s)
+[diag-3d] scene0702_02: num_gaussians=65536.000 void_share=0.000 mean_gs_conf=0.423 knn3d_same_group=0.536 token_purity=1.000 rendered_gs_agreement=0.424 cross_view_agreement=0.674 gt_fragmentation=7.541 gt_purity=0.474 gt_merging=38.333 n_gt_instances_covered=12.000 (0.1s)
+[diag-3d] scene0703_00: num_gaussians=65536.000 void_share=0.000 mean_gs_conf=0.762 knn3d_same_group=0.783 token_purity=1.000 rendered_gs_agreement=0.486 cross_view_agreement=0.946 gt_fragmentation=7.943 gt_purity=0.617 gt_merging=25.273 n_gt_instances_covered=11.000 (0.1s)
+[diag-3d] scene0703_01: num_gaussians=65536.000 void_share=0.023 mean_gs_conf=0.446 knn3d_same_group=0.531 token_purity=1.000 rendered_gs_agreement=0.494 cross_view_agreement=0.893 gt_fragmentation=9.186 gt_purity=0.586 gt_merging=26.333 n_gt_instances_covered=15.000 (0.1s)
+[diag-3d] scene0704_00: num_gaussians=65536.000 void_share=0.000 mean_gs_conf=0.800 knn3d_same_group=0.765 token_purity=1.000 rendered_gs_agreement=0.681 cross_view_agreement=0.967 gt_fragmentation=7.487 gt_purity=0.577 gt_merging=26.545 n_gt_instances_covered=11.000 (0.1s)
+[diag-3d] scene0704_01: num_gaussians=65536.000 void_share=0.001 mean_gs_conf=0.524 knn3d_same_group=0.511 token_purity=1.000 rendered_gs_agreement=0.497 cross_view_agreement=0.922 gt_fragmentation=6.624 gt_purity=0.559 gt_merging=48.133 n_gt_instances_covered=15.000 (0.1s)
+[diag-3d] scene0705_00: num_gaussians=65536.000 void_share=0.000 mean_gs_conf=0.521 knn3d_same_group=0.581 token_purity=1.000 rendered_gs_agreement=0.477 cross_view_agreement=0.888 gt_fragmentation=9.573 gt_purity=0.503 gt_merging=60.385 n_gt_instances_covered=13.000 (0.1s)
+[diag-3d] scene0705_01: num_gaussians=65536.000 void_share=0.020 mean_gs_conf=0.473 knn3d_same_group=0.590 token_purity=1.000 rendered_gs_agreement=0.669 cross_view_agreement=0.931 gt_fragmentation=5.061 gt_purity=0.617 gt_merging=27.556 n_gt_instances_covered=9.000 (0.1s)
+[diag-3d] scene0705_02: num_gaussians=65536.000 void_share=0.004 mean_gs_conf=0.679 knn3d_same_group=0.698 token_purity=1.000 rendered_gs_agreement=0.487 cross_view_agreement=0.623 gt_fragmentation=8.797 gt_purity=0.554 gt_merging=57.917 n_gt_instances_covered=12.000 (0.1s)
+[diag-3d] scene0706_00: num_gaussians=65536.000 void_share=0.002 mean_gs_conf=0.495 knn3d_same_group=0.538 token_purity=1.000 rendered_gs_agreement=0.469 cross_view_agreement=0.839 gt_fragmentation=8.240 gt_purity=0.552 gt_merging=53.562 n_gt_instances_covered=16.000 (0.1s)
+
+===== aggregate =====
+  void_share: {'mean': 0.0052734375, 'std': 0.01005859375}
+  mean_gs_conf: {'mean': 0.5972391813993454, 'std': 0.12121651708403954}
+  knn3d_same_group: {'mean': 0.6289691895246505, 'std': 0.08824623521042935}
+  token_purity: {'mean': 1.0, 'std': 0.0}
+  rendered_gs_agreement: {'mean': 0.5113126054406166, 'std': 0.08802743904112093}
+  cross_view_agreement: {'mean': 0.8323228952888329, 'std': 0.11524650005449376}
+  gt_fragmentation: {'mean': 7.705199014265458, 'std': 1.2038493474887566}
+  gt_purity: {'mean': 0.5626911781757584, 'std': 0.06129020725932514}
+  gt_merging: {'mean': 43.69717855061605, 'std': 15.983408415607306}
+
+[diag-3d] wrote workspace/diag_3d_group_token_full/diag_3d_consistency.json

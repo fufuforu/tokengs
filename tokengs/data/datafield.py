@@ -25,6 +25,8 @@ DF_FOREGROUND_MASK = "foreground_mask"
 DF_DEPTH = "depth"
 # [B, H, W], int64 semantic IDs (raw ScanNet IDs or configured mapping).
 DF_SEMANTIC_LABEL = "semantic_label"
+# [B, H, W], int64 raw ScanNet 2D instance IDs (0/255 are background/invalid).
+DF_INSTANCE_LABEL = "instance_label"
 DF_SCENE_NAME = "scene_name"
 # [B], int64 raw frame IDs in the source scene.
 DF_FRAME_IDS = "frame_ids"

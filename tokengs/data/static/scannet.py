@@ -23,6 +23,7 @@ from tokengs.data.datafield import (
     DF_IMAGE_RGB,
     DF_SCENE_NAME,
     DF_SEMANTIC_LABEL,
+    DF_INSTANCE_LABEL,
 )
 
 
@@ -173,6 +174,7 @@ class ScanNet:
 
     is_static = True
     has_semantic_labels = True
+    has_instance_labels = False
     disable_random_reflect = True
 
     def __init__(
@@ -340,6 +342,7 @@ class ScanNet:
         images = []
         c2ws = []
         semantic_labels = []
+        instance_labels = []
         for raw_frame_id in raw_frame_ids:
             image = np.asarray(reader.read_color(raw_frame_id), dtype=np.uint8).copy()
             label_path = (
@@ -357,6 +360,24 @@ class ScanNet:
                     f"RGB/label shape mismatch at {reader.scene_name}/{raw_frame_id}: "
                     f"{image.shape[:2]} vs {label.shape}"
                 )
+            if DF_INSTANCE_LABEL in data_fields:
+                instance_path = (
+                    self.label_root
+                    / reader.scene_name
+                    / "instance-filt"
+                    / f"{raw_frame_id}.png"
+                )
+                with Image.open(instance_path) as instance_image:
+                    instance = np.asarray(instance_image).copy()
+                if instance.ndim == 3:
+                    instance = instance[..., 0]
+                if instance.shape != image.shape[:2]:
+                    raise ValueError(
+                        f"RGB/instance shape mismatch at "
+                        f"{reader.scene_name}/{raw_frame_id}: "
+                        f"{image.shape[:2]} vs {instance.shape}"
+                    )
+                instance_labels.append(torch.from_numpy(instance).long())
             images.append(
                 torch.from_numpy(image).permute(2, 0, 1).contiguous().float() / 255.0
             )
@@ -378,6 +399,8 @@ class ScanNet:
             )
         if DF_SEMANTIC_LABEL in data_fields:
             output[DF_SEMANTIC_LABEL] = torch.stack(semantic_labels).contiguous()
+        if DF_INSTANCE_LABEL in data_fields:
+            output[DF_INSTANCE_LABEL] = torch.stack(instance_labels).contiguous()
         return output
 
 
@@ -569,4 +592,149 @@ class ScanNetC3G8Eval(ScanNet):
         return {
             "missing_labels": missing_labels,
             "invalid_or_missing_pose_frames": invalid_or_missing_pose_frames,
+        }
+
+
+@dataclass
+class C3GPromptEvalSample:
+    scene_name: str
+    context_raw_frame_ids: tuple[int, int]
+    target_raw_frame_id: int
+    class_id: int
+
+
+class ScanNetC3G8PromptEval(ScanNetC3G8Eval):
+    """Eight-class text-only prompt evaluation over the held-out C3G split.
+
+    Each (scene, target frame) from the C3G/LSM evaluation protocol is expanded
+    into eight text-only prompt samples, one per C3G8 class. Reconstruction,
+    masks, and per-class segmentation metrics are all evaluated at the target
+    frame with the frozen TokenGS reconstruction.
+    """
+
+    has_prompt_samples = True
+    has_explicit_split = True
+
+    def __init__(
+        self,
+        root_path: str,
+        label_root: str,
+        manifest_path: Optional[str] = None,
+        semantic_protocol_path: Optional[str] = None,
+        excluded_scenes: Optional[Sequence[str]] = None,
+        llff_hold: Optional[int] = None,
+        test_ids: Optional[Sequence[int]] = None,
+        skip_bad: bool = False,
+        **kwargs,
+    ):
+        # Provider injects prompt-related kwargs for has_prompt_samples datasets.
+        for key in (
+            "prompt_mode",
+            "query_image_size",
+            "prompt_image_probability",
+            "prompt_min_target_pixels",
+        ):
+            kwargs.pop(key, None)
+        super().__init__(
+            root_path=root_path,
+            label_root=label_root,
+            manifest_path=manifest_path,
+            semantic_protocol_path=semantic_protocol_path,
+            excluded_scenes=excluded_scenes,
+            llff_hold=llff_hold,
+            test_ids=test_ids,
+            skip_bad=skip_bad,
+            **kwargs,
+        )
+        self.query_image_size = (224, 224)
+        prompt_samples = []
+        for sample in self.sample_list:
+            for class_id in range(1, 9):
+                prompt_samples.append(
+                    C3GPromptEvalSample(
+                        scene_name=sample.scene_name,
+                        context_raw_frame_ids=sample.context_raw_frame_ids,
+                        target_raw_frame_id=sample.target_raw_frame_id,
+                        class_id=class_id,
+                    )
+                )
+        self.sample_list = prompt_samples
+        self._active_prompt_sample: Optional[C3GPromptEvalSample] = None
+
+    def _get_reader(self, idx: int) -> ScanNetSensReader:
+        sample = self.sample_list[idx]
+        if (
+            self._cached_scene_name != sample.scene_name
+            or self._cached_reader is None
+        ):
+            scene_dir = self.scene_dirs[sample.scene_name]
+            self._cached_reader = ScanNetSensReader(
+                scene_dir / f"{sample.scene_name}.sens", frame_stride=1
+            )
+            self._cached_scene_name = sample.scene_name
+        self._active_prompt_sample = sample
+        return self._cached_reader
+
+    def get_context_target_frames(self, idx: int) -> tuple[list[int], list[int]]:
+        sample = self.sample_list[idx]
+        reader = self._get_reader(idx)
+        raw_to_logical = {
+            raw_frame_id: logical_id
+            for logical_id, raw_frame_id in enumerate(reader.frame_ids)
+        }
+        requested = (*sample.context_raw_frame_ids, sample.target_raw_frame_id)
+        unavailable = [value for value in requested if value not in raw_to_logical]
+        if unavailable:
+            raise ValueError(
+                f"C3G prompt eval frames have invalid poses for "
+                f"{sample.scene_name}/{sample.target_raw_frame_id}: {unavailable}"
+            )
+        return (
+            [raw_to_logical[value] for value in sample.context_raw_frame_ids],
+            [raw_to_logical[sample.target_raw_frame_id]],
+        )
+
+    def make_prompt_sample(
+        self,
+        semantic_label_output: torch.Tensor,
+        target_scene_name: str,
+        used_frame_ids: torch.Tensor,
+        rng: np.random.Generator,
+    ) -> dict:
+        del rng
+        sample = self._active_prompt_sample
+        if sample is None or sample.scene_name != target_scene_name:
+            raise RuntimeError("C3G prompt eval sample state is inconsistent")
+        expected_frames = (*sample.context_raw_frame_ids, sample.target_raw_frame_id)
+        if tuple(int(value) for value in used_frame_ids.tolist()) != expected_frames:
+            raise RuntimeError(
+                f"C3G prompt eval frame mismatch for {sample.scene_name}/"
+                f"{sample.target_raw_frame_id}"
+            )
+        class_names = self.semantic_class_names
+        negative_class_id = sample.class_id % 8 + 1
+        return {
+            "sample_id": (
+                f"c3g8_{sample.scene_name}_{sample.target_raw_frame_id}_"
+                f"class{sample.class_id}"
+            ),
+            "prompt_mode": "text_only",
+            "prompt_type": "text",
+            "prompt_class_id": torch.tensor(sample.class_id, dtype=torch.long),
+            "positive_text_prompt": class_names[sample.class_id - 1],
+            "negative_text_prompt": class_names[negative_class_id - 1],
+            "binary_mask_output": (
+                semantic_label_output == sample.class_id
+            ).float(),
+            "image_query_attempted": torch.tensor(False, dtype=torch.bool),
+            "has_image_query": torch.tensor(False, dtype=torch.bool),
+            "query_image": torch.zeros(
+                (3, *self.query_image_size), dtype=torch.float32
+            ),
+            "query_mask": torch.zeros(
+                (1, *self.query_image_size), dtype=torch.float32
+            ),
+            "query_scene_name": "",
+            "query_frame_id": torch.tensor(-1, dtype=torch.long),
+            "query_class_id": torch.tensor(sample.class_id, dtype=torch.long),
         }

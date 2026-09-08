@@ -38,6 +38,90 @@ def _broadcast_prompt_target(
     return rendered_probability, target_mask, valid_mask
 
 
+def instance_contrastive_loss(
+    rendered_features: torch.Tensor,
+    instance_labels: torch.Tensor,
+    valid_mask: torch.Tensor,
+    temperature: float = 0.07,
+    min_pixels: int = 32,
+    eps: float = 1e-6,
+) -> torch.Tensor:
+    """Cross-view instance-level InfoNCE on rendered per-pixel features.
+
+    ``rendered_features`` is [B, V, D, H, W] (alpha-composited token
+    features) and ``instance_labels`` is [B, V, H, W] with raw ScanNet
+    instance ids (0/255 ignored). ScanNet instance ids are consistent across
+    the frames of a scene, so pixels of the same instance id are aggregated
+    across ALL target views into one prototype; every valid pixel is then
+    classified against all prototypes (cross-entropy over instances). This
+    directly teaches cross-view feature consistency and instance
+    discriminability -- exactly what the feed-forward group head needs to
+    separate instances without test-time optimization.
+    """
+    batch_size, view_count, dim, height, width = rendered_features.shape
+    total = torch.zeros((), device=rendered_features.device)
+    n_batches = 0
+    for b in range(batch_size):
+        feat = rendered_features[b]  # [V,D,H,W]
+        labels = instance_labels[b]  # [V,H,W]
+        valid = (
+            valid_mask[b, :, 0]
+            if valid_mask.ndim == 5
+            else valid_mask[b]
+        )  # [V,H,W]
+        feat_flat = F.normalize(
+            feat.reshape(view_count, dim, -1)
+            .transpose(1, 2)
+            .reshape(-1, dim),
+            dim=-1,
+        )  # [V*HW, D]
+        labels_flat = labels.reshape(-1)
+        valid_flat = valid.reshape(-1)
+        unique_ids = torch.unique(labels_flat)
+        keep = [
+            int(value)
+            for value in unique_ids.tolist()
+            if int(value) not in (0, 255, -1)
+        ]
+        if len(keep) < 2:
+            continue
+        protos: list[torch.Tensor] = []
+        id_to_index: dict[int, int] = {}
+        for instance_id in keep:
+            mask = valid_flat & (labels_flat == instance_id)
+            if mask.sum() < min_pixels:
+                continue
+            proto = F.normalize(
+                feat_flat[mask].mean(dim=0, keepdim=True), dim=-1
+            )
+            id_to_index[instance_id] = len(protos)
+            protos.append(proto)
+        if len(protos) < 2:
+            continue
+        prototype_matrix = torch.cat(protos, dim=0)  # [K,D]
+        pixel_index = torch.full(
+            (view_count * height * width,),
+            -1,
+            dtype=torch.long,
+            device=labels.device,
+        )
+        for instance_id, index in id_to_index.items():
+            mask = valid_flat & (labels_flat == instance_id)
+            pixel_index[mask] = index
+        selected = pixel_index >= 0
+        if selected.sum() < min_pixels:
+            continue
+        logits = (
+            feat_flat[selected] @ prototype_matrix.t() / temperature
+        )  # [n,K]
+        targets = pixel_index[selected]
+        total = total + F.cross_entropy(logits, targets)
+        n_batches += 1
+    if n_batches == 0:
+        return torch.zeros((), device=rendered_features.device)
+    return total / n_batches
+
+
 def compute_prompt_mask_loss(
     rendered_probability: torch.Tensor,
     target_mask: torch.Tensor,
@@ -45,6 +129,8 @@ def compute_prompt_mask_loss(
     lambda_bce: float = 1.0,
     lambda_dice: float = 1.0,
     balance_classes: bool = False,
+    pos_weight: float = 0.5,
+    class_weights: tuple[float, ...] | None = None,
     eps: float = 1e-6,
 ) -> dict[str, torch.Tensor]:
     """Compute valid-pixel BCE + Dice in FP32 outside mixed-precision autocast."""
@@ -72,10 +158,24 @@ def compute_prompt_mask_loss(
             ) / negative_count.clamp_min(eps)
             class_bce = torch.where(
                 positive_count > 0,
-                0.5 * (positive_loss + negative_loss),
+                float(pos_weight) * positive_loss
+                + (1.0 - float(pos_weight)) * negative_loss,
                 negative_loss,
             )
-            bce = class_bce.mean()
+            if class_weights is not None:
+                if len(class_weights) != class_bce.shape[0]:
+                    raise ValueError(
+                        "class_weights must match the number of classes "
+                        f"({class_bce.shape[0]}), got {len(class_weights)}"
+                    )
+                weights = torch.as_tensor(
+                    class_weights,
+                    dtype=class_bce.dtype,
+                    device=class_bce.device,
+                )
+                bce = (class_bce * weights).sum() / weights.sum().clamp_min(eps)
+            else:
+                bce = class_bce.mean()
         else:
             valid_count = valid.sum().clamp_min(eps)
             bce = (bce_map * valid).sum() / valid_count
@@ -115,6 +215,9 @@ def compute_prompt_mask_metrics(
         intersection = (predicted & target_bool & valid_bool).sum().float()
         union = ((predicted | target_bool) & valid_bool).sum().float()
         iou = intersection / union.clamp_min(eps)
+        true_positive = (predicted & target_bool & valid_bool).sum().float()
+        target_count = (target_bool & valid_bool).sum().float()
+        mask_accuracy = true_positive / target_count.clamp_min(eps)
         foreground_probability = (probability * target * valid).sum() / (
             (target * valid).sum().clamp_min(eps)
         )
@@ -126,6 +229,7 @@ def compute_prompt_mask_metrics(
         gt_foreground_ratio = (target * valid).sum() / valid_count
     return {
         "mask_iou": iou,
+        "mask_accuracy": mask_accuracy,
         "foreground_probability": foreground_probability,
         "background_probability": background_probability,
         "predicted_foreground_ratio": predicted_foreground_ratio,

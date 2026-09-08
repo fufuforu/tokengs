@@ -55,8 +55,8 @@ class QueryBankEntry:
 class SmallPromptSample:
     sample_id: str
     scene: str
-    input_frame_ids: tuple[int, int]
-    target_frame_id: int
+    input_frame_ids: tuple[int, ...]
+    target_frame_ids: tuple[int, ...]
     class_id: int
     prompt_mode: PromptMode
     query: Optional[QueryBankEntry]
@@ -64,11 +64,19 @@ class SmallPromptSample:
     @classmethod
     def from_dict(cls, item: dict) -> "SmallPromptSample":
         query = item.get("query")
+        if "target_frame_ids" in item:
+            target_frame_ids = tuple(
+                int(value) for value in item["target_frame_ids"]
+            )
+        else:
+            target_frame_ids = (int(item["target_frame_id"]),)
         return cls(
             sample_id=str(item["sample_id"]),
             scene=str(item["scene"]),
-            input_frame_ids=tuple(int(value) for value in item["input_frame_ids"]),
-            target_frame_id=int(item["target_frame_id"]),
+            input_frame_ids=tuple(
+                int(value) for value in item["input_frame_ids"]
+            ),
+            target_frame_ids=target_frame_ids,
             class_id=int(item["class_id"]),
             prompt_mode=str(item["prompt_mode"]),
             query=None if query is None else QueryBankEntry.from_dict(query),
@@ -79,6 +87,7 @@ class ScanNetPromptTrain(ScanNet):
     """Provisional non-eval ScanNet split with text and cross-scene image queries."""
 
     has_prompt_samples = True
+    has_instance_labels = True
 
     def __init__(
         self,
@@ -91,6 +100,7 @@ class ScanNetPromptTrain(ScanNet):
         query_image_size: Sequence[int] = (224, 224),
         prompt_image_probability: float = 0.5,
         prompt_min_target_pixels: int = 64,
+        query_same_scene_min_gap: int = 90,
         frame_stride: int = 10,
         skip_bad: bool = False,
         **kwargs,
@@ -114,6 +124,7 @@ class ScanNetPromptTrain(ScanNet):
         if not 0.0 <= self.prompt_image_probability <= 1.0:
             raise ValueError("prompt_image_probability must be in [0, 1]")
         self.prompt_min_target_pixels = int(prompt_min_target_pixels)
+        self.query_same_scene_min_gap = int(query_same_scene_min_gap)
 
         with self.train_manifest_path.open(encoding="utf-8") as handle:
             train_manifest = json.load(handle)
@@ -166,20 +177,46 @@ class ScanNetPromptTrain(ScanNet):
         self._query_reader_scene: Optional[str] = None
         self._query_reader: Optional[ScanNetSensReader] = None
 
-    def _query_candidates_exist(self, class_id: int, target_scene: str) -> bool:
-        return any(
-            scene != target_scene
-            for scene in self.query_entries_by_class_scene.get(class_id, {})
-        )
+    def _query_candidates_exist(
+        self, class_id: int, target_scene: str, target_frame: int | None = None
+    ) -> bool:
+        for scene, entries in self.query_entries_by_class_scene.get(
+            class_id, {}
+        ).items():
+            if scene != target_scene:
+                return True
+            if target_frame is not None and any(
+                abs(entry.raw_frame_id - target_frame)
+                >= self.query_same_scene_min_gap
+                for entry in entries
+            ):
+                return True
+        return False
 
     def _sample_query_entry(
-        self, class_id: int, target_scene: str, rng: np.random.Generator
+        self,
+        class_id: int,
+        target_scene: str,
+        rng: np.random.Generator,
+        target_frame: int | None = None,
     ) -> QueryBankEntry:
         by_scene = self.query_entries_by_class_scene.get(class_id, {})
-        scenes = sorted(scene for scene in by_scene if scene != target_scene)
+        scenes = sorted(
+            scene
+            for scene in by_scene
+            if scene != target_scene
+            or (
+                target_frame is not None
+                and any(
+                    abs(entry.raw_frame_id - target_frame)
+                    >= self.query_same_scene_min_gap
+                    for entry in by_scene[scene]
+                )
+            )
+        )
         if not scenes:
             raise RuntimeError(
-                f"No cross-scene image query for class {class_id}, target {target_scene}"
+                f"No valid image query for class {class_id}, target {target_scene}"
             )
         query_scene = scenes[int(rng.integers(0, len(scenes)))]
         scene_entries = by_scene[query_scene]
@@ -280,7 +317,11 @@ class ScanNetPromptTrain(ScanNet):
             class_id
             for class_id in text_classes
             if class_id != 8
-            and self._query_candidates_exist(class_id, target_scene_name)
+            and self._query_candidates_exist(
+                class_id,
+                target_scene_name,
+                target_frame=int(used_frame_ids[-1]),
+            )
         ]
 
         image_attempted = self.prompt_mode == "image_only" or (
@@ -315,7 +356,12 @@ class ScanNetPromptTrain(ScanNet):
         if not use_image:
             return output
 
-        entry = self._sample_query_entry(prompt_class_id, target_scene_name, rng)
+        entry = self._sample_query_entry(
+            prompt_class_id,
+            target_scene_name,
+            rng,
+            target_frame=int(used_frame_ids[-1]),
+        )
         if entry.scene == target_scene_name:
             raise AssertionError("Image query must come from a different scene")
         if entry.scene in self.eval_scene_names:
@@ -350,6 +396,7 @@ class ScanNetPromptSmall(ScanNetPromptTrain):
         split: Literal["train", "validation"] = "train",
         prompt_mode: str = "manifest",
         frame_stride: int = 1,
+        wide_target_subsample: int = 0,
         **kwargs,
     ):
         if prompt_mode != "manifest":
@@ -367,11 +414,16 @@ class ScanNetPromptSmall(ScanNetPromptTrain):
             **kwargs,
         )
         self.prompt_mode = "manifest"
+        self.wide_target_subsample = int(wide_target_subsample)
+        self.training = split == "train"
         self.small_manifest_path = Path(small_manifest_path)
         self.split = split
         manifest = json.loads(self.small_manifest_path.read_text(encoding="utf-8"))
         if not manifest.get("provisional", False):
             raise ValueError("Small ScanNet prompt manifest must be marked provisional")
+        self.query_same_scene_min_frame_gap = int(
+            manifest.get("query_same_scene_min_frame_gap", 90)
+        )
         if set(manifest["excluded_eval_scenes"]) != self.eval_scene_names:
             raise ValueError("Small manifest and provisional split disagree on eval scenes")
 
@@ -397,6 +449,7 @@ class ScanNetPromptSmall(ScanNetPromptTrain):
         self.sample_list = samples
         self._cached_scene_name: Optional[str] = None
         self._active_sample: Optional[SmallPromptSample] = None
+        self._active_target_raw_ids: list[int] = []
 
     def _validate_samples(
         self, samples: list[SmallPromptSample], train_scenes: set[str]
@@ -404,9 +457,11 @@ class ScanNetPromptSmall(ScanNetPromptTrain):
         for sample in samples:
             if sample.scene not in self.split_scene_names:
                 raise ValueError(f"Sample scene is outside {self.split}: {sample.sample_id}")
-            if len(set(sample.input_frame_ids)) != 2:
-                raise ValueError(f"Input frames must be distinct: {sample.sample_id}")
-            if sample.target_frame_id in sample.input_frame_ids:
+            if len(set(sample.input_frame_ids)) != len(sample.input_frame_ids):
+                raise ValueError(
+                    f"Input frames must be distinct: {sample.sample_id}"
+                )
+            if set(sample.input_frame_ids) & set(sample.target_frame_ids):
                 raise ValueError(f"Input and target frames overlap: {sample.sample_id}")
             if sample.class_id not in range(1, 9):
                 raise ValueError(f"Invalid C3G8 class: {sample.sample_id}")
@@ -423,7 +478,16 @@ class ScanNetPromptSmall(ScanNetPromptTrain):
                 raise ValueError(f"Prompt/query mismatch: {sample.sample_id}")
             if sample.query is not None:
                 if sample.query.scene == sample.scene:
-                    raise ValueError(f"Query scene equals target scene: {sample.sample_id}")
+                    gap = min(
+                        abs(sample.query.raw_frame_id - target)
+                        for target in sample.target_frame_ids
+                    )
+                    if gap < self.query_same_scene_min_frame_gap:
+                        raise ValueError(
+                            f"Same-scene query frame gap {gap} below "
+                            f"{self.query_same_scene_min_frame_gap}: "
+                            f"{sample.sample_id}"
+                        )
                 if sample.query.scene not in train_scenes:
                     raise ValueError(f"Query must come from the small train split: {sample.sample_id}")
                 if sample.query.scene in self.eval_scene_names:
@@ -449,15 +513,30 @@ class ScanNetPromptSmall(ScanNetPromptTrain):
             raw_frame_id: logical_id
             for logical_id, raw_frame_id in enumerate(reader.frame_ids)
         }
-        requested = (*sample.input_frame_ids, sample.target_frame_id)
+        requested = (*sample.input_frame_ids, *sample.target_frame_ids)
         unavailable = [value for value in requested if value not in raw_to_logical]
         if unavailable:
             raise ValueError(
                 f"Small prompt frames have invalid poses for {sample.sample_id}: {unavailable}"
             )
+        target_raw_ids = list(sample.target_frame_ids)
+        if (
+            self.training
+            and self.wide_target_subsample > 0
+            and len(target_raw_ids) > self.wide_target_subsample
+        ):
+            rng = np.random.default_rng()
+            target_raw_ids = sorted(
+                rng.choice(
+                    target_raw_ids,
+                    size=self.wide_target_subsample,
+                    replace=False,
+                ).tolist()
+            )
+        self._active_target_raw_ids = target_raw_ids
         return (
             [raw_to_logical[value] for value in sample.input_frame_ids],
-            [raw_to_logical[sample.target_frame_id]],
+            [raw_to_logical[value] for value in target_raw_ids],
         )
 
     def make_prompt_sample(
@@ -471,7 +550,10 @@ class ScanNetPromptSmall(ScanNetPromptTrain):
         sample = self._active_sample
         if sample is None or sample.scene != target_scene_name:
             raise RuntimeError("Small prompt sample state is inconsistent")
-        expected_frames = (*sample.input_frame_ids, sample.target_frame_id)
+        expected_frames = (
+            *sample.input_frame_ids,
+            *self._active_target_raw_ids,
+        )
         if tuple(int(value) for value in used_frame_ids.tolist()) != expected_frames:
             raise RuntimeError(f"Manifest frame mismatch for {sample.sample_id}")
         class_names = self.semantic_class_names
@@ -581,10 +663,14 @@ class ScanNetSemanticSmall(ScanNet):
         for sample in samples:
             if sample.scene not in selected_scenes:
                 raise ValueError(f"Sample scene is outside {split}: {sample.sample_id}")
-            if len(set(sample.input_frame_ids)) != 2:
-                raise ValueError(f"Input frames must be distinct: {sample.sample_id}")
-            if sample.target_frame_id in sample.input_frame_ids:
-                raise ValueError(f"Input and target frames overlap: {sample.sample_id}")
+            if len(set(sample.input_frame_ids)) != len(sample.input_frame_ids):
+                raise ValueError(
+                    f"Input frames must be distinct: {sample.sample_id}"
+                )
+            if set(sample.input_frame_ids) & set(sample.target_frame_ids):
+                raise ValueError(
+                    f"Input and target frames overlap: {sample.sample_id}"
+                )
         if {sample.scene for sample in samples} != selected_scenes:
             raise ValueError(f"Not every {split} scene is represented by a sample")
 
@@ -608,7 +694,7 @@ class ScanNetSemanticSmall(ScanNet):
             raw_frame_id: logical_id
             for logical_id, raw_frame_id in enumerate(reader.frame_ids)
         }
-        requested = (*sample.input_frame_ids, sample.target_frame_id)
+        requested = (*sample.input_frame_ids, *sample.target_frame_ids)
         unavailable = [value for value in requested if value not in raw_to_logical]
         if unavailable:
             raise ValueError(
@@ -617,5 +703,5 @@ class ScanNetSemanticSmall(ScanNet):
             )
         return (
             [raw_to_logical[value] for value in sample.input_frame_ids],
-            [raw_to_logical[sample.target_frame_id]],
+            [raw_to_logical[value] for value in sample.target_frame_ids],
         )

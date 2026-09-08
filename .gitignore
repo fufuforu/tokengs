@@ -25,6 +25,8 @@ data/dl3dv_eval
 data/ScanNet
 data/scannet_prompt
 data/scannet2d_labels
+data/ImageNet
+data/scannetpp_processed
 
 # Tooling
 .vscode/

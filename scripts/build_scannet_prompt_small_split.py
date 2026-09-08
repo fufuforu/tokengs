@@ -5,11 +5,24 @@ from __future__ import annotations
 
 import argparse
 import json
+import multiprocessing
 from collections import Counter, defaultdict
 from pathlib import Path
 
 import numpy as np
 from PIL import Image
+import yaml
+
+try:
+    from scripts.build_scannet_prompt_data import (
+        CLASS_QUERY_FILTER_OVERRIDES,
+        _candidate_metadata,
+    )
+except ImportError:  # run directly as `python scripts/...`
+    from build_scannet_prompt_data import (
+        CLASS_QUERY_FILTER_OVERRIDES,
+        _candidate_metadata,
+    )
 
 from tokengs.data.static.scannet import ScanNet, ScanNetSensReader
 
@@ -215,14 +228,43 @@ def _build_target_candidates(
     return candidates, reader_reports
 
 
+def _index_chunk_worker(args) -> tuple[dict, dict]:
+    scenes, scan_root, label_root, lut, fallback, min_pixels, target_frames, min_fg = args
+    candidates, reports = _build_target_candidates(
+        scenes,
+        {},
+        Path(scan_root),
+        Path(label_root),
+        lut,
+        fallback,
+        min_pixels,
+        target_frames_per_scene=target_frames,
+        min_foreground_ratio=min_fg,
+    )
+    # Convert defaultdicts with lambda factories to plain dicts for pickling.
+    return (
+        {scene: dict(classes) for scene, classes in candidates.items()},
+        reports,
+    )
+
+
 def _assign_balanced_samples(
     scenes: list[str],
     target_candidates: dict[str, dict[int, list[dict]]],
-    samples_per_class: int,
+    samples_per_class: int | dict[int, int],
     split: str,
     rng: np.random.Generator,
 ) -> list[dict]:
-    quotas = {class_id: samples_per_class for class_id in CLASS_IDS}
+    if isinstance(samples_per_class, dict):
+        quotas = {
+            class_id: int(samples_per_class.get(class_id, 0))
+            for class_id in CLASS_IDS
+        }
+        balanced = False
+    else:
+        quotas = {class_id: int(samples_per_class) for class_id in CLASS_IDS}
+        balanced = True
+    original_quotas = dict(quotas)
     assigned: dict[int, list[dict]] = defaultdict(list)
     class_scene_frequency = Counter(
         class_id
@@ -258,10 +300,10 @@ def _assign_balanced_samples(
         unique_available = sum(
             len(target_candidates[scene][class_id]) for scene in class_scenes
         )
-        if unique_available < samples_per_class:
+        if unique_available < quotas[class_id]:
             raise RuntimeError(
                 f"{split} class {class_id} has only {unique_available} unique "
-                f"targets for quota {samples_per_class}"
+                f"targets for quota {quotas[class_id]}"
             )
         cursor = 0
         while quotas[class_id] > 0:
@@ -294,26 +336,32 @@ def _assign_balanced_samples(
             )
 
     samples = []
-    total_samples = samples_per_class * len(CLASS_IDS)
-    desired_text = round(total_samples * 0.4)
-    desired_image = round(total_samples * 0.3)
-    eligible_text = desired_text - samples_per_class
-    text_per_class = [eligible_text // len(IMAGE_CLASS_IDS)] * len(IMAGE_CLASS_IDS)
-    for index in range(eligible_text % len(IMAGE_CLASS_IDS)):
-        text_per_class[index] += 1
-    image_per_class = [desired_image // len(IMAGE_CLASS_IDS)] * len(IMAGE_CLASS_IDS)
-    for index in range(desired_image % len(IMAGE_CLASS_IDS)):
-        image_per_class[index] += 1
+    total_samples = sum(quotas.values())
+    if balanced:
+        desired_text = round(total_samples * 0.4)
+        desired_image = round(total_samples * 0.3)
+        eligible_text = desired_text - samples_per_class
+        text_per_class = [eligible_text // len(IMAGE_CLASS_IDS)] * len(IMAGE_CLASS_IDS)
+        for index in range(eligible_text % len(IMAGE_CLASS_IDS)):
+            text_per_class[index] += 1
+        image_per_class = [desired_image // len(IMAGE_CLASS_IDS)] * len(IMAGE_CLASS_IDS)
+        for index in range(desired_image % len(IMAGE_CLASS_IDS)):
+            image_per_class[index] += 1
     for class_id in CLASS_IDS:
         class_samples = assigned[class_id]
+        quota = original_quotas[class_id]
         if class_id == 8:
-            modes = ["text_only"] * samples_per_class
-        elif split == "validation" and samples_per_class == 3:
+            modes = ["text_only"] * quota
+        elif split == "validation" and quota == 3:
             modes = ["text_only", "image_only", "text_image_mixed"]
         else:
-            text_count = text_per_class[class_id - 1]
-            image_count = image_per_class[class_id - 1]
-            mixed_count = samples_per_class - text_count - image_count
+            if balanced:
+                text_count = text_per_class[class_id - 1]
+                image_count = image_per_class[class_id - 1]
+            else:
+                text_count = round(quota * 0.4)
+                image_count = round(quota * 0.3)
+            mixed_count = quota - text_count - image_count
             modes = (
                 ["text_only"] * text_count
                 + ["image_only"] * image_count
@@ -332,15 +380,22 @@ def _attach_queries(
     samples: list[dict],
     bank_entries: list[dict],
     allowed_query_scenes: set[str],
+    same_scene_min_frame_gap: int = 90,
+    same_scene_ratio: float = 0.5,
+    rng: np.random.Generator | None = None,
+    on_demand_pool: dict | None = None,
 ) -> None:
     entries_by_class_scene: dict[int, dict[str, list[dict]]] = defaultdict(
         lambda: defaultdict(list)
     )
+    same_scene_by_class: dict[int, dict[str, list[dict]]] = defaultdict(
+        lambda: defaultdict(list)
+    )
     for entry in bank_entries:
         if entry["scene"] in allowed_query_scenes:
-            entries_by_class_scene[int(entry["class_id"])][entry["scene"]].append(
-                entry
-            )
+            class_id = int(entry["class_id"])
+            entries_by_class_scene[class_id][entry["scene"]].append(entry)
+            same_scene_by_class[class_id][entry["scene"]].append(entry)
 
     # Interleave scenes before walking entries so image prompts see distinct
     # cross-scene appearances instead of repeatedly taking the first bank item.
@@ -365,14 +420,16 @@ def _attach_queries(
         ]
 
     cursors = Counter()
+    same_scene_cursors: dict[tuple[int, str], int] = Counter()
     for sample in samples:
         mode = sample["prompt_mode"]
         class_id = int(sample["class_id"])
         if mode == "text_only":
             sample["query"] = None
             continue
+        target_frame = int(sample["target_frame_id"])
         class_entries = entries_by_class[class_id]
-        selected_index = next(
+        cross_index = next(
             (
                 (cursors[class_id] + offset) % len(class_entries)
                 for offset in range(len(class_entries))
@@ -383,12 +440,49 @@ def _attach_queries(
             ),
             None,
         )
-        if selected_index is None:
-            raise RuntimeError(
-                f"No cross-scene query for class {class_id}, target {sample['scene']}"
+        cross_entry = (
+            class_entries[cross_index] if cross_index is not None else None
+        )
+        if cross_index is not None:
+            cursors[class_id] = cross_index + 1
+        same_entries_raw = list(
+            same_scene_by_class[class_id][sample["scene"]]
+        )
+        if on_demand_pool is not None:
+            same_entries_raw.extend(
+                on_demand_pool.get(sample["scene"], {}).get(class_id, [])
             )
-        entry = class_entries[selected_index]
-        cursors[class_id] = selected_index + 1
+        seen_keys = set()
+        same_entries = []
+        for entry in same_entries_raw:
+            if (
+                abs(int(entry["raw_frame_id"]) - target_frame)
+                < same_scene_min_frame_gap
+            ):
+                continue
+            key = (int(entry["raw_frame_id"]), entry.get("instance_id"))
+            if key in seen_keys:
+                continue
+            seen_keys.add(key)
+            same_entries.append(entry)
+        want_same = (
+            cross_entry is None
+            or (
+                bool(same_entries)
+                and same_scene_ratio > 0.0
+                and (rng is None or rng.random() < same_scene_ratio)
+            )
+        )
+        if want_same and same_entries:
+            cursor_key = (class_id, sample["scene"])
+            entry = same_entries[same_scene_cursors[cursor_key] % len(same_entries)]
+            same_scene_cursors[cursor_key] += 1
+        elif cross_entry is not None:
+            entry = cross_entry
+        else:
+            raise RuntimeError(
+                f"No query for class {class_id}, target {sample['scene']}"
+            )
         sample["query"] = {
             key: entry.get(key)
             for key in (
@@ -412,11 +506,42 @@ def _distribution(samples: list[dict]) -> dict:
     }
 
 
+def _scan_same_scene_pool_worker(args: tuple) -> tuple[str, dict[int, list[dict]]]:
+    scene, label_root, lut, fallback, stride, filters = args
+    label_dir = Path(label_root) / scene / "label-filt"
+    frames = sorted(
+        int(item.stem)
+        for item in label_dir.glob("*.png")
+        if item.stem.isdigit()
+    )
+    entries_by_class: dict[int, list[dict]] = defaultdict(list)
+    for frame_id in frames[:: int(stride)]:
+        label = _map_label(label_dir / f"{frame_id}.png", lut, fallback)
+        for class_id in range(1, 8):  # 1..7; "other" never gets image queries
+            mask = label == class_id
+            if not mask.any():
+                continue
+            entry = _candidate_metadata(
+                scene,
+                frame_id,
+                class_id,
+                mask,
+                None,
+                "same_scene_class",
+                filters,
+            )
+            if entry is not None:
+                entries_by_class[class_id].append(entry)
+    return scene, dict(entries_by_class)
+
+
 def build(args: argparse.Namespace) -> None:
     provisional = json.loads(Path(args.train_manifest).read_text(encoding="utf-8"))
     bank = json.loads(Path(args.query_bank).read_text(encoding="utf-8"))
     protocol_path = Path(args.protocol)
     lut, fallback, class_names = ScanNet._load_c3g8_protocol(protocol_path)
+    with protocol_path.open(encoding="utf-8") as handle:
+        query_filters = yaml.safe_load(handle)["query_bank_filters"]
     excluded = set(provisional["excluded_eval_scenes"])
     provisional_scenes = set(provisional["scenes"])
     bank_entries = [
@@ -436,12 +561,23 @@ def build(args: argparse.Namespace) -> None:
         validation_scenes = [
             str(scene) for scene in scene_split["validation_scenes"]
         ]
-        if len(train_scenes) != args.train_scenes:
-            raise ValueError("scene_split_from has an unexpected train-scene count")
+        if len(train_scenes) > args.train_scenes:
+            raise ValueError("scene_split_from has more train scenes than requested")
         if len(validation_scenes) != args.validation_scenes:
             raise ValueError("scene_split_from has an unexpected validation-scene count")
         if (set(train_scenes) | set(validation_scenes)) - set(eligible_scenes):
             raise ValueError("scene_split_from contains unavailable scenes")
+        if len(train_scenes) < args.train_scenes:
+            additional_candidates = sorted(
+                set(eligible_scenes) - set(train_scenes) - set(validation_scenes)
+            )
+            additional = _select_diverse_scenes(
+                additional_candidates,
+                scene_classes,
+                args.train_scenes - len(train_scenes),
+                rng,
+            )
+            train_scenes = train_scenes + additional
     else:
         validation_scenes = _select_diverse_scenes(
             eligible_scenes, scene_classes, args.validation_scenes, rng
@@ -456,21 +592,116 @@ def build(args: argparse.Namespace) -> None:
         if entry["scene"] in selected:
             entries_by_scene[entry["scene"]].append(entry)
 
-    target_candidates, reader_reports = _build_target_candidates(
-        selected,
-        entries_by_scene,
-        Path(args.scan_root),
-        Path(args.label_root),
-        lut,
-        fallback,
-        args.min_target_pixels,
-        target_frames_per_scene=args.target_frames_per_scene,
-        min_foreground_ratio=args.min_target_foreground_ratio,
+    if args.workers > 1 and args.target_frames_per_scene > 0:
+        chunks = [
+            [scene for index, scene in enumerate(selected) if index % args.workers == offset]
+            for offset in range(args.workers)
+        ]
+        chunks = [chunk for chunk in chunks if chunk]
+        chunk_args = [
+            (
+                chunk,
+                args.scan_root,
+                args.label_root,
+                lut,
+                fallback,
+                args.min_target_pixels,
+                args.target_frames_per_scene,
+                args.min_target_foreground_ratio,
+            )
+            for chunk in chunks
+        ]
+        with multiprocessing.Pool(args.workers) as pool:
+            results = pool.map(_index_chunk_worker, chunk_args)
+        target_candidates: dict[str, dict[int, list[dict]]] = defaultdict(
+            lambda: defaultdict(list)
+        )
+        reader_reports = {}
+        for chunk_candidates, chunk_reports in results:
+            for scene, classes in chunk_candidates.items():
+                for class_id, items in classes.items():
+                    target_candidates[scene][class_id].extend(items)
+            reader_reports.update(chunk_reports)
+    else:
+        target_candidates, reader_reports = _build_target_candidates(
+            selected,
+            entries_by_scene,
+            Path(args.scan_root),
+            Path(args.label_root),
+            lut,
+            fallback,
+            args.min_target_pixels,
+            target_frames_per_scene=args.target_frames_per_scene,
+            min_foreground_ratio=args.min_target_foreground_ratio,
+        )
+
+    on_demand_pool: dict[str, dict[int, list[dict]]] = {}
+    if args.same_scene_ondemand:
+        print(
+            "Scanning scenes for on-demand same-scene queries "
+            f"(stride={args.same_scene_ondemand_stride}) ...",
+            flush=True,
+        )
+        pool_args = [
+            (
+                scene,
+                str(Path(args.label_root)),
+                lut,
+                fallback,
+                args.same_scene_ondemand_stride,
+                query_filters,
+            )
+            for scene in selected
+        ]
+        if args.workers > 1:
+            with multiprocessing.Pool(args.workers) as pool:
+                pool_results = pool.map(_scan_same_scene_pool_worker, pool_args)
+        else:
+            pool_results = [
+                _scan_same_scene_pool_worker(arg) for arg in pool_args
+            ]
+        for scene, entries in pool_results:
+            on_demand_pool[scene] = entries
+        total_on_demand = sum(
+            len(entries)
+            for scene_entries in on_demand_pool.values()
+            for entries in scene_entries.values()
+        )
+        print(f"On-demand same-scene query pool entries: {total_on_demand}", flush=True)
+    per_class_unique = {
+        class_id: sum(
+            len(target_candidates[scene].get(class_id, []))
+            for scene in train_scenes
+        )
+        for class_id in CLASS_IDS
+    }
+    print(
+        "Unique train target frames per class: "
+        + json.dumps(per_class_unique, sort_keys=True)
     )
+    # Per-class quota: classes are NOT forced to the global minimum, so rare
+    # classes (e.g. ceiling, only ~710 unique target frames) no longer cap
+    # the whole manifest. For instance-only training the class balance is
+    # irrelevant; this unlocks real data expansion for the abundant classes.
+    samples_per_class = {
+        class_id: min(
+            args.train_samples_per_class, per_class_unique[class_id]
+        )
+        for class_id in CLASS_IDS
+    }
+    if any(
+        quota != args.train_samples_per_class
+        for quota in samples_per_class.values()
+    ):
+        print(
+            "Per-class train sample quotas (requested "
+            f"{args.train_samples_per_class}): "
+            + json.dumps(samples_per_class, sort_keys=True)
+        )
     train_samples = _assign_balanced_samples(
         train_scenes,
         target_candidates,
-        args.train_samples_per_class,
+        samples_per_class,
         "train",
         rng,
     )
@@ -481,8 +712,23 @@ def build(args: argparse.Namespace) -> None:
         "validation",
         rng,
     )
-    _attach_queries(train_samples, bank_entries, set(train_scenes))
-    _attach_queries(validation_samples, bank_entries, set(train_scenes))
+    _attach_queries(
+        train_samples,
+        bank_entries,
+        set(train_scenes),
+        same_scene_min_frame_gap=args.query_same_scene_min_frame_gap,
+        same_scene_ratio=args.query_same_scene_ratio,
+        rng=rng,
+        on_demand_pool=on_demand_pool if args.same_scene_ondemand else None,
+    )
+    _attach_queries(
+        validation_samples,
+        bank_entries,
+        set(train_scenes),
+        same_scene_min_frame_gap=args.query_same_scene_min_frame_gap,
+        same_scene_ratio=0.0,
+        on_demand_pool=None,
+    )
     if args.validation_samples_from is not None:
         validation_source = json.loads(
             Path(args.validation_samples_from).read_text(encoding="utf-8")
@@ -543,6 +789,10 @@ def build(args: argparse.Namespace) -> None:
         "validation_scenes": validation_scenes,
         "target_frames_per_scene": args.target_frames_per_scene,
         "min_target_foreground_ratio": args.min_target_foreground_ratio,
+        "query_same_scene_min_frame_gap": args.query_same_scene_min_frame_gap,
+        "query_same_scene_ratio": args.query_same_scene_ratio,
+        "same_scene_ondemand": bool(args.same_scene_ondemand),
+        "same_scene_ondemand_stride": args.same_scene_ondemand_stride,
         "scene_split_from": (
             str(Path(args.scene_split_from).resolve())
             if args.scene_split_from is not None
@@ -593,6 +843,33 @@ def main() -> None:
         default="/space0/mawb/tokengs/data/scannet_prompt/scannet_prompt_small_64_8.json",
     )
     parser.add_argument("--seed", type=int, default=20260801)
+    parser.add_argument("--workers", type=int, default=1)
+    parser.add_argument(
+        "--query-same-scene-min-frame-gap",
+        type=int,
+        default=90,
+        help="Minimum raw-frame distance for same-scene image queries.",
+    )
+    parser.add_argument(
+        "--query-same-scene-ratio",
+        type=float,
+        default=0.5,
+        help="Fraction of image queries drawn from the same scene.",
+    )
+    parser.add_argument(
+        "--same-scene-ondemand",
+        action="store_true",
+        help=(
+            "Generate same-scene image queries by scanning each scene's label "
+            "frames directly (bypasses the bank's per-scene frame cap)."
+        ),
+    )
+    parser.add_argument(
+        "--same-scene-ondemand-stride",
+        type=int,
+        default=25,
+        help="Frame stride when scanning scenes for on-demand queries.",
+    )
     parser.add_argument("--train-scenes", type=int, default=64)
     parser.add_argument("--validation-scenes", type=int, default=8)
     parser.add_argument("--train-samples-per-class", type=int, default=40)

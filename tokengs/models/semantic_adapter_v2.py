@@ -12,6 +12,7 @@ import torch.nn.functional as F
 from transformers import CLIPModel, CLIPTokenizerFast
 
 from tokengs.models.prompt_matching import DEFAULT_CLIP_MODEL_PATH
+from tokengs.models.prompt_matching import PromptEncoder
 
 
 C3G8_CLASS_NAMES = (
@@ -198,6 +199,101 @@ class SemanticMatcherV2(nn.Module):
                 if current[key].shape == state_dict[key].shape:
                     current[key].copy_(state_dict[key])
         return nn.modules.module._IncompatibleKeys(missing, unexpected)
+
+
+class OpenVocabSemanticMatcher(SemanticMatcherV2):
+    """Shared semantic space with prompt-conditioned dynamic prototypes.
+
+    Token features, arbitrary CLIP text, and arbitrary CLIP image queries are
+    all projected into one 256-dim space. During training the positive class's
+    prototype is replaced by the sample's prompt embedding (text/image/mixed),
+    so image and text prompts learn to align with the same token semantics while
+    the remaining seven classes keep their text prototypes (joint supervision).
+    At inference any text or image query becomes the prototype for a binary mask.
+    """
+
+    def __init__(
+        self,
+        clip_model_path: str | Path = DEFAULT_CLIP_MODEL_PATH,
+        token_dim: int = 1024,
+        semantic_dim: int = 256,
+        temperature_init: float = 14.285714,
+        class_names: Sequence[str] = C3G8_CLASS_NAMES,
+        image_pooling: str = "masked_input_cls",
+    ):
+        super().__init__(
+            clip_model_path=clip_model_path,
+            token_dim=token_dim,
+            semantic_dim=semantic_dim,
+            temperature_init=temperature_init,
+            class_names=class_names,
+        )
+        self.image_encoder = PromptEncoder(
+            clip_model_path, image_pooling=image_pooling
+        )
+        self.image_encoder.requires_grad_(False)
+        # PromptTokenGS._encode_prompt_batch expects a PromptEncoder under this
+        # name; the image encoder is a full PromptEncoder (text + image).
+        self.prompt_encoder = self.image_encoder
+        # Reuse the same adapter module for class texts and prompt embeddings so
+        # text/image prompts share one semantic space with the eight prototypes.
+        self.prompt_adapter = self.prompt_semantic_adapter
+
+    def train(self, mode: bool = True) -> "OpenVocabSemanticMatcher":
+        super().train(mode)
+        self.image_encoder.eval()
+        self.image_encoder.requires_grad_(False)
+        return self
+
+    def build_prototypes(
+        self,
+        batch_size: int,
+        prompt_embeddings: torch.Tensor | None = None,
+        positive_class_ids: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        text_prototypes = self.prompt_semantic_adapter(
+            self.clip_text_prototypes
+        ).unsqueeze(0).expand(batch_size, -1, -1).clone()
+        if prompt_embeddings is None:
+            return text_prototypes
+        if positive_class_ids is None:
+            raise ValueError("positive_class_ids is required with prompt embeddings")
+        adapted_prompts = self.prompt_adapter(prompt_embeddings)
+        if adapted_prompts.shape[1] != 1:
+            raise ValueError(
+                "prompt_embeddings must have shape [B,1,dim] for prototype "
+                f"replacement, got {tuple(adapted_prompts.shape)}"
+            )
+        adapted_prompts = adapted_prompts[:, 0]
+        batch_indices = torch.arange(
+            batch_size, device=prompt_embeddings.device, dtype=torch.long
+        )
+        text_prototypes[batch_indices, positive_class_ids] = adapted_prompts
+        return text_prototypes
+
+    def forward(
+        self,
+        token_hidden: torch.Tensor,
+        prompt_embeddings: torch.Tensor | None = None,
+        positive_class_ids: torch.Tensor | None = None,
+    ) -> dict[str, torch.Tensor]:
+        if token_hidden.ndim != 3:
+            raise ValueError("token_hidden must have shape [B,T,1024]")
+        semantic_tokens = self.semantic_token_adapter(token_hidden)
+        semantic_prompts = self.build_prototypes(
+            token_hidden.shape[0],
+            prompt_embeddings=prompt_embeddings,
+            positive_class_ids=positive_class_ids,
+        )
+        token_prompt_logits = torch.einsum(
+            "bqd,btd->bqt", semantic_prompts, semantic_tokens
+        ) * self.temperature
+        return {
+            "semantic_tokens": semantic_tokens,
+            "semantic_prompts": semantic_prompts,
+            "token_logits": token_prompt_logits,
+            "temperature": self.temperature,
+        }
 
 
 def compute_semantic_v2_metrics(

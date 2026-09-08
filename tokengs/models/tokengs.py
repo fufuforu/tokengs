@@ -19,6 +19,7 @@ TokenGS: Encoder-decoder model for 3D scene reconstruction from sparse views.
 
 from typing import Optional
 from functools import partial
+import math
 import torch
 import torch.nn as nn
 from einops import rearrange
@@ -129,6 +130,9 @@ class TokenGS(nn.Module):
         self.gs_tokens = nn.Parameter(
             self.opt.gs_token_std * torch.randn(self.opt.num_gs_tokens, self.opt.token_dim)
         )
+        # Populated by the anchor_3d token-initialization probe; consumed by
+        # forward_decoder when ``anchor_3d_pass_decoder=False``.
+        self._anchor_3d_init_cache: Optional[dict] = None
 
         if self.opt.num_dynamic_gs_tokens > 0:
             self.gs_tokens_dynamic = nn.Parameter(
@@ -224,7 +228,12 @@ class TokenGS(nn.Module):
             values=image_feature_values,
         )
 
-    def get_gs_tokens(self, batch_size: int) -> torch.Tensor:
+    def get_gs_tokens(
+        self,
+        batch_size: int,
+        encoder_latent: "EncoderLatent | None" = None,
+        decoder_input: "ModelInputDecoder | None" = None,
+    ) -> torch.Tensor:
         """
         Get initial GS tokens (without time conditioning).
         Useful for test-time training where you want to optimize the GS tokens.
@@ -232,6 +241,9 @@ class TokenGS(nn.Module):
         
         Args:
             batch_size: Batch size
+            encoder_latent: Encoder latent (required for scene-adaptive
+                ``anchor_3d`` token initialization).
+            decoder_input: Decoder input (required for ``anchor_3d`` init).
             
         Returns:
             GS tokens with shape [B, num_gs_tokens, C]
@@ -240,7 +252,126 @@ class TokenGS(nn.Module):
         if self.opt.num_dynamic_gs_tokens > 0:
             dyn = self.gs_tokens_dynamic.unsqueeze(0).expand(batch_size, -1, -1).clone()
             batch_gs_tokens = torch.cat([batch_gs_tokens, dyn], dim=1)
+        if (
+            getattr(self.opt, "gs_token_init", "learnable") == "anchor_3d"
+            and encoder_latent is not None
+            and decoder_input is not None
+        ):
+            batch_gs_tokens = self._anchor_3d_initialized_tokens(
+                batch_gs_tokens, encoder_latent, decoder_input
+            )
         return batch_gs_tokens
+
+    def _anchor_3d_fourier_features(self, pos_norm: torch.Tensor) -> torch.Tensor:
+        """Fixed Fourier features of normalized 3D positions (no learned params)."""
+        freqs = (
+            2.0
+            ** torch.arange(
+                0,
+                int(getattr(self.opt, "anchor_3d_pos_freqs", 4)),
+                device=pos_norm.device,
+                dtype=pos_norm.dtype,
+            )
+            * math.pi
+        )  # [F]
+        arg = pos_norm.unsqueeze(-1) * freqs  # [B,T,3,F]
+        feats = torch.cat([torch.sin(arg), torch.cos(arg)], dim=-1)  # [B,T,3,2F]
+        return feats.reshape(
+            pos_norm.shape[0], pos_norm.shape[1], 3 * 2 * int(getattr(self.opt, "anchor_3d_pos_freqs", 4))
+        )
+
+    def _anchor_3d_pos_projection(self, pos_feat: torch.Tensor) -> torch.Tensor:
+        """Fixed deterministic projection of Fourier position features to C."""
+        dim_in = pos_feat.shape[-1]
+        proj = getattr(self, "_anchor_3d_proj_cache", None)
+        if (
+            proj is None
+            or proj.shape != (dim_in, int(self.opt.enc_embed_dim))
+            or proj.device != pos_feat.device
+        ):
+            gen = torch.Generator(device=pos_feat.device).manual_seed(1234)
+            proj = torch.randn(
+                dim_in,
+                int(self.opt.enc_embed_dim),
+                generator=gen,
+                device=pos_feat.device,
+                dtype=pos_feat.dtype,
+            ) / math.sqrt(float(dim_in))
+            self._anchor_3d_proj_cache = proj
+        return pos_feat @ proj  # [B,T,C]
+
+    def _anchor_3d_initialized_tokens(
+        self,
+        base_tokens: torch.Tensor,
+        encoder_latent: "EncoderLatent",
+        decoder_input: "ModelInputDecoder",
+    ) -> torch.Tensor:
+        """Scene-adaptive, 3D-anchored GS token initialization.
+
+        The decoder weights, instance head, losses, backbone and evaluation
+        are untouched; only the token queries fed into the (frozen) decoder
+        are re-initialized per scene. A frozen probe pass decodes the default
+        tokens to obtain per-token 3D anchor positions (mean of the token's
+        Gaussian centers). The new queries are the probe token features
+        (``anchor_3d_query_source="hidden"``) or the default tokens
+        (``"global"``) plus a fixed, scale-controlled Fourier position
+        embedding of the normalized anchors.
+
+        When ``anchor_3d_pass_decoder=False`` (default) the probe outputs are
+        cached and forward_decoder short-circuits: the *geometry* stays the
+        frozen baseline exactly (PSNR identical), while the instance head
+        reads the position-augmented token features ``probe_hidden + PE``.
+        When ``True`` the anchored queries are fed through the frozen decoder
+        (geometry changes; keep ``anchor_3d_pos_scale`` small, e.g. 0.003).
+        Everything is detached: this is initialization only, with no learned
+        parameters.
+        """
+        batch_size = base_tokens.shape[0]
+        num_tokens = base_tokens.shape[1]
+        num_gaussians_per_token = self.opt.dec_patch_size**2
+        with torch.no_grad():
+            probe_tokens = base_tokens
+            for layer in self.enc_dec_backbone.decoder_blocks:
+                probe_tokens = layer(
+                    gs_tokens=probe_tokens,
+                    keys=encoder_latent.keys,
+                    values=encoder_latent.values,
+                )
+            probe_hidden = probe_tokens
+            probe_gaussians = self.activation_head(probe_hidden)
+            probe_gaussians = probe_gaussians.clone()
+            probe_gaussians[..., 2] = (
+                probe_gaussians[..., 2] + self.opt.gaussian_z_offset
+            )
+            means = probe_gaussians[..., :3].view(
+                batch_size, num_tokens, num_gaussians_per_token, 3
+            )
+            anchor_pos = means.mean(dim=2)  # [B,T,3]
+            center = anchor_pos.mean(dim=1, keepdim=True)
+            scale = (
+                (anchor_pos - center).square().mean(dim=(1, 2), keepdim=True)
+                .sqrt()
+                .clamp_min(1e-4)
+            )
+            pos_norm = (anchor_pos - center) / scale  # [B,T,3]
+            pos_feat = self._anchor_3d_fourier_features(pos_norm)
+            pos_embed = self._anchor_3d_pos_projection(pos_feat)
+            pos_embed = pos_embed * float(
+                getattr(self.opt, "anchor_3d_pos_scale", 0.1)
+            )
+            if getattr(self.opt, "anchor_3d_query_source", "hidden") == "hidden":
+                queries = probe_hidden + pos_embed
+            else:
+                queries = base_tokens + pos_embed
+            self._anchor_3d_init_cache = {
+                "probe_hidden": probe_hidden.detach(),
+                "probe_gaussians": probe_gaussians.detach(),
+                "pos_embed": pos_embed.detach(),
+                "pass_decoder": bool(
+                    getattr(self.opt, "anchor_3d_pass_decoder", False)
+                ),
+            }
+        return queries.detach()
     
     def _apply_time_embedding_to_gs_tokens(
         self, 
@@ -316,7 +447,27 @@ class TokenGS(nn.Module):
         
         # Get or use provided GS tokens (without time conditioning)
         if gs_tokens is None:
-            gs_tokens = self.get_gs_tokens(batch_size=B)
+            gs_tokens = self.get_gs_tokens(
+                batch_size=B,
+                encoder_latent=encoder_latent,
+                decoder_input=decoder_input,
+            )
+        anchor_cache = getattr(self, "_anchor_3d_init_cache", None)
+        if (
+            anchor_cache is not None
+            and not anchor_cache["pass_decoder"]
+            and getattr(self.opt, "gs_token_init", "learnable") == "anchor_3d"
+        ):
+            # Geometry stays the frozen baseline; the head reads the
+            # position-augmented probe token features (see
+            # ``_anchor_3d_initialized_tokens``).
+            hidden_out = (
+                anchor_cache["probe_hidden"] + anchor_cache["pos_embed"]
+            )
+            gaussians = anchor_cache["probe_gaussians"]
+            if return_gs_token_hidden:
+                return gaussians, hidden_out
+            return gaussians
 
         # Apply time embedding to GS tokens
         gs_tokens = self._apply_time_embedding_to_gs_tokens(gs_tokens, decoder_input)
@@ -329,11 +480,23 @@ class TokenGS(nn.Module):
                 values=encoder_latent.values,
             )
 
+        # Semantic/instance extensions may inject object-level context before
+        # the Gaussian activation head.  The base TokenGS path remains an
+        # exact no-op because the hook is implemented as an identity by
+        # default in downstream models.
+        condition_geometry = getattr(self, "_condition_geometry_hidden", None)
+        if condition_geometry is not None:
+            gs_tokens = condition_geometry(gs_tokens, decoder_input)
+
         # Convert to Gaussians
         gaussians = self.activation_head(gs_tokens)
 
         # give gaussians an offset to the z axis so it is visible when initialized
         gaussians[..., 2] = gaussians[..., 2] + self.opt.gaussian_z_offset
+
+        finalize_geometry = getattr(self, "_finalize_conditioned_gaussians", None)
+        if finalize_geometry is not None:
+            gaussians = finalize_geometry(gaussians)
 
         if return_gs_token_hidden:
             return gaussians, gs_tokens

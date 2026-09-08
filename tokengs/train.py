@@ -21,6 +21,7 @@ import datetime
 from dataclasses import asdict
 
 import torch
+import torch.nn as nn
 from torch.utils.tensorboard import SummaryWriter
 from accelerate import Accelerator, DataLoaderConfiguration
 from safetensors.torch import load_file, save_file
@@ -31,22 +32,41 @@ import numpy as np
 from tokengs.options import AllConfigs
 from tokengs.data import get_multi_dataloader
 from tokengs.models import model_registry
+from tokengs.models.instance_group_loss import hungarian_instance_group_loss
 
 import warnings
 
 from tokengs.utils.gaussians import Gaussians
 warnings.filterwarnings("ignore")
 
+try:
+    from _240_path_remap import remap_path as _240_remap_path
+except Exception:  # pragma: no cover - non-240 checkout
+    def _240_remap_path(value):
+        return value
+
 
 def setup_workspace_and_status(opt, accelerator):
     """Setup workspace directory and check for existing completion."""
     status_dir = os.path.join(opt.workspace, "status")
     complete_file = os.path.join(status_dir, "COMPLETE")
-    
+
     if accelerator.is_main_process:
         os.makedirs(status_dir, exist_ok=True)
         if os.path.exists(complete_file):
-            raise RuntimeError(f"Found existing COMPLETE file at {complete_file}, remove it if you want to run the job again")
+            if os.path.exists(os.path.join(opt.workspace, "model.safetensors")):
+                accelerator.print(
+                    f"[workspace] COMPLETE marker found at {complete_file}; "
+                    "continuing from the existing checkpoint "
+                    "(pass --num_epochs larger than the previous run to "
+                    "extend training, or use a fresh --workspace to restart)"
+                )
+                os.remove(complete_file)
+            else:
+                raise RuntimeError(
+                    f"Found COMPLETE file at {complete_file} but no "
+                    "model.safetensors to resume from; use a fresh workspace"
+                )
 
 
 def load_checkpoint_and_resume(opt, accelerator):
@@ -97,6 +117,57 @@ def setup_wandb(opt, accelerator, epoch_start, wandb_run_id):
     return wandb_run_id, writer
 
 
+def apply_checkpoint_architecture(opt):
+    """Patch architecture options from the resume checkpoint metadata.
+
+    Eval and resumed training must build the same model as the checkpoint
+    (CLIP variant, feature-field dimension, geometry conditioning, teacher
+    projection), otherwise shape mismatches break strict loading.
+    """
+    resume = getattr(opt, "resume", None)
+    if not resume or resume in (None, "None"):
+        return
+    checkpoint_path = os.path.abspath(resume)
+    step_name = os.path.basename(checkpoint_path).replace(
+        "model_step_", ""
+    ).replace(".safetensors", "")
+    candidates = [
+        os.path.join(
+            os.path.dirname(checkpoint_path),
+            f"metadata_step_{step_name}.json",
+        ),
+        os.path.join(os.path.dirname(checkpoint_path), "metadata_best.json"),
+        os.path.join(os.path.dirname(checkpoint_path), "metadata.json"),
+    ]
+    for candidate in candidates:
+        if not os.path.isfile(candidate):
+            continue
+        with open(candidate, "r", encoding="utf-8") as handle:
+            meta = json.load(handle)
+        if "prompt_clip_model_path" in meta:
+            opt.prompt_clip_model_path = _240_remap_path(
+                str(meta["prompt_clip_model_path"])
+            )
+        if "semantic_v4_feature_dim" in meta:
+            opt.semantic_v4_feature_dim = int(meta["semantic_v4_feature_dim"])
+            opt.semantic_v4_use_geometry = bool(
+                meta.get("semantic_v4_use_geometry", True)
+            )
+            opt.semantic_v4_teacher_projection = str(
+                meta.get("semantic_v4_teacher_projection", "frozen_random")
+            )
+        if "semantic_v2_class_weights" in meta:
+            weights = tuple(float(value) for value in meta["semantic_v2_class_weights"])
+            if len(weights) == 8:
+                opt.semantic_v2_class_weights = weights
+        print(
+            f"[checkpoint-arch] loaded {os.path.basename(candidate)}: "
+            f"clip={os.path.basename(str(opt.prompt_clip_model_path))} "
+            f"feature_dim={getattr(opt, 'semantic_v4_feature_dim', 32)}"
+        )
+        return
+
+
 def load_model_checkpoint(opt, model, accelerator, epoch_start):
     """Load model checkpoint with tolerance for shape mismatches."""
     if opt.resume is None or opt.resume == 'None':
@@ -110,7 +181,12 @@ def load_model_checkpoint(opt, model, accelerator, epoch_start):
     if getattr(opt, "prompt_training", False):
         checkpoint_label = (
             "SemanticTokenGSv2"
-            if opt.model_type == "semantic_tokengs_v2"
+            if opt.model_type in (
+                "semantic_tokengs_v2",
+                "semantic_tokengs_v3",
+                "semantic_tokengs_v4",
+                "semantic_tokengs_v5",
+            )
             else "PromptTokenGS"
         )
         checkpoint_path = os.path.abspath(opt.resume)
@@ -128,9 +204,446 @@ def load_model_checkpoint(opt, model, accelerator, epoch_start):
             f"[{checkpoint_label}] loading trainable checkpoint: {checkpoint_path}"
         )
         accelerator.print(f"[{checkpoint_label}] checkpoint step: {checkpoint_step}")
-        state_dict = model.state_dict()
+        state_dict = (
+            nn.Module.state_dict(model)
+            if bool(getattr(opt, "tsh_query_memory_refine_probe", False))
+            else model.state_dict()
+        )
+        # Frozen-backbone recipes save prompt checkpoints without the
+        # TokenGS backbone, but we resume from a full wide7l checkpoint
+        # (which includes it). Load the frozen parts directly through the
+        # native Module API (the PromptTokenGS.load_state_dict override only
+        # knows about the trainable prompt subset), then drop them from the
+        # prompt checkpoint so the strict validation below sees a clean set.
+        backbone_resume_path = (
+            getattr(opt, "backbone_resume", "") or ""
+        )
+        load_backbone = (
+            not getattr(opt, "prompt_unfreeze_tokengs", False)
+            or (backbone_resume_path and os.path.isfile(backbone_resume_path))
+        )
+        if load_backbone:
+            frozen_prefixes = [
+                "patch_embed.",
+                "patch_plucker_embed.",
+                "activation_head.",
+                "anchor_pos_encoder.",
+            ]
+            # In the SIU3R-MBM recipes the decoder tail is trainable and is
+            # restored by the guarded-joint branch below.  Do not consume it
+            # here as part of the frozen-backbone load, otherwise the later
+            # strict tail check sees an empty checkpoint and silently falls
+            # back to the base8k constructor weights.
+            if (
+                float(getattr(opt, "tsh_mbm_decoder_tail_lr", 0.0)) <= 0.0
+                and not bool(getattr(opt, "ta_riu_enabled", False))
+            ):
+                frozen_prefixes.append("enc_dec_backbone.")
+            frozen_prefixes = tuple(frozen_prefixes)
+            frozen_keys = [
+                key
+                for key in ckpt
+                if key.startswith(frozen_prefixes) or key == "gs_tokens"
+            ]
+            backbone_ckpt = ckpt
+            backbone_source = os.path.basename(checkpoint_path)
+            if not frozen_keys:
+                # Prompt-only checkpoint (frozen-backbone recipe) does not
+                # carry the TokenGS backbone; fall back to the full
+                # checkpoint that training actually used (backbone_resume).
+                backbone_path = getattr(opt, "backbone_resume", "") or ""
+                if backbone_path and os.path.isfile(backbone_path):
+                    backbone_ckpt = load_file(backbone_path, device="cpu")
+                    backbone_source = os.path.basename(backbone_path)
+                    frozen_keys = [
+                        key
+                        for key in backbone_ckpt
+                        if key.startswith(frozen_prefixes)
+                        or key == "gs_tokens"
+                    ]
+            if frozen_keys:
+                native_state = nn.Module.state_dict(model)
+                loadable = {
+                    key: backbone_ckpt[key]
+                    for key in frozen_keys
+                    if key in native_state
+                    and native_state[key].shape == backbone_ckpt[key].shape
+                }
+                # TA-RIU's source is Both@1420: it contains the 324 decoder
+                # tail keys but not the other frozen-backbone keys.  A
+                # non-empty partial namespace must not suppress the fallback
+                # to the exact backbone checkpoint used by Both.
+                ta_missing_fallback = 0
+                if bool(getattr(opt, "ta_riu_enabled", False)):
+                    expected_frozen = [
+                        key for key in native_state
+                        if key.startswith(frozen_prefixes) or key == "gs_tokens"
+                    ]
+                    missing_frozen = [
+                        key for key in expected_frozen if key not in loadable
+                    ]
+                    fallback_path = getattr(opt, "backbone_resume", "") or ""
+                    if missing_frozen and fallback_path and os.path.isfile(fallback_path):
+                        fallback_ckpt = load_file(fallback_path, device="cpu")
+                        fallback_loadable = {
+                            key: fallback_ckpt[key]
+                            for key in missing_frozen
+                            if key in fallback_ckpt
+                            and key in native_state
+                            and native_state[key].shape == fallback_ckpt[key].shape
+                        }
+                        loadable.update(fallback_loadable)
+                        ta_missing_fallback = len(fallback_loadable)
+                if loadable:
+                    nn.Module.load_state_dict(model, loadable, strict=False)
+                    for key in loadable:
+                        if key in ckpt:
+                            ckpt.pop(key)
+                accelerator.print(
+                    f"[{checkpoint_label}] frozen-backbone resume: loaded "
+                    f"{len(loadable)}/"
+                    f"{len(set(frozen_keys).union(loadable.keys()))} frozen keys "
+                    f"(source={len(frozen_keys)}, fallback={ta_missing_fallback}) "
+                    f"from {backbone_source}"
+                )
+        # Group-count changes resize only the final head projection; drop it
+        # from the checkpoint so it is reinitialized from the fresh state.
+        model_head_keys = {
+            key
+            for key in state_dict
+            if key.startswith("instance_group_head.")
+        }
+        ckpt_head_keys = {
+            key for key in ckpt if key.startswith("instance_group_head.")
+        }
+        head_shape_mismatch = any(
+            key in state_dict and ckpt[key].shape != state_dict[key].shape
+            for key in ckpt_head_keys
+        )
+        if (
+            model_head_keys
+            and ckpt_head_keys
+            and (model_head_keys != ckpt_head_keys or head_shape_mismatch)
+        ):
+            # Key-level merge instead of a wholesale drop: keep every
+            # instance_group_head weight that still exists with the same
+            # shape (e.g. the warm-started base decoder of the per-Gaussian
+            # residual head), drop keys whose architecture changed, and let
+            # brand-new head parameters stay at their fresh initialization.
+            dropped = 0
+            kept = 0
+            for key in list(ckpt):
+                if not key.startswith("instance_group_head."):
+                    continue
+                if key in state_dict and ckpt[key].shape == state_dict[key].shape:
+                    kept += 1
+                else:
+                    ckpt.pop(key)
+                    dropped += 1
+            accelerator.print(
+                f"[{checkpoint_label}] instance_group_head architecture "
+                f"changed: kept {kept} matching keys, dropped {dropped} "
+                f"stale keys ({len(ckpt_head_keys)} ckpt -> "
+                f"{len(model_head_keys)} model, "
+                f"shape_mismatch={head_shape_mismatch}); new keys stay fresh"
+            )
+        for token_type in ("gs_tokens", "gs_tokens_dynamic"):
+            if (
+                token_type not in ckpt
+                or token_type not in state_dict
+                or ckpt[token_type].shape == state_dict[token_type].shape
+            ):
+                continue
+            old_count = ckpt[token_type].shape[0]
+            new_count = state_dict[token_type].shape[0]
+            initialized = state_dict[token_type].clone()
+            if new_count >= old_count:
+                initialized[:old_count].copy_(ckpt[token_type])
+                extra = new_count - old_count
+                repeat_factor = (extra + old_count - 1) // old_count
+                expanded = ckpt[token_type].repeat(repeat_factor, 1)[:extra]
+                initialized[old_count:] = (
+                    expanded + 0.01 * torch.randn_like(expanded)
+                )
+            else:
+                indices = torch.linspace(0, old_count - 1, new_count).long()
+                initialized.copy_(ckpt[token_type][indices])
+            ckpt[token_type] = initialized
+            accelerator.print(
+                f"[{checkpoint_label}] resized {token_type}: "
+                f"{old_count} -> {new_count}"
+            )
+        if bool(getattr(opt, "instance_branch_abs_units", False)):
+            guarded = bool(getattr(opt, "abs_joint_guarded", False)) or bool(
+                getattr(opt, "abs_true_shared_units", False)
+            )
+            if guarded:
+                # Checkpoint init / continuation semantics:
+                #  * A) first fork from full3 (no tsh_instance_head keys):
+                #    strict abs 24/24 load, new head initialized from a
+                #    FIXED fresh seed, no legacy dual-unit params imported.
+                #  * B) resume of a true-shared training checkpoint (contains
+                #    tsh_instance_head.*): abs + tsh head are both loaded and
+                #    fresh reset is NEVER triggered.
+                # Legacy dual-unit guarded runs keep their previous semantics.
+                tsh_mode = bool(
+                    getattr(opt, "abs_true_shared_units", False)
+                )
+                ckpt_has_tsh = any(
+                    key.startswith("tsh_instance_head.")
+                    for key in ckpt
+                )
+                ta_prefixes = (
+                    "ta_riu_shared_mixer.",
+                    "ta_riu_geometry_head.",
+                    "ta_riu_appearance_head.",
+                )
+                ckpt_has_ta_riu = any(
+                    key.startswith(ta_prefixes) for key in ckpt
+                )
+                if tsh_mode:
+                    reinit = not ckpt_has_tsh
+                    prefixes = (
+                        ("absolute_gs_head.", "tsh_instance_head.")
+                        if ckpt_has_tsh
+                        else ("absolute_gs_head.",)
+                    )
+                    # TA-RIU is a new fork: its modules are fresh when the
+                    # source is Both@1420, but are strict on continuation.
+                    if bool(getattr(opt, "ta_riu_enabled", False)) and ckpt_has_ta_riu:
+                        prefixes = prefixes + ta_prefixes
+                else:
+                    reinit = bool(
+                        getattr(
+                            opt, "guarded_instance_head_reinit", False
+                        )
+                    )
+                    prefixes = (
+                        ("absolute_gs_head.",)
+                        if reinit
+                        else (
+                            "absolute_gs_head.",
+                            "instance_branch.",
+                        )
+                    )
+                native_state = model.state_dict()
+                expected = [
+                    key for key in native_state
+                    if key.startswith(prefixes)
+                ]
+                loadable = {
+                    key: ckpt[key]
+                    for key in ckpt
+                    if key.startswith(prefixes)
+                    and key in native_state
+                    and native_state[key].shape == ckpt[key].shape
+                }
+                missing = [
+                    key for key in expected if key not in loadable
+                ]
+                if bool(getattr(opt, "tsh_query_memory_refine", False)):
+                    # First fork from Both@1420: the original 50 TSH keys
+                    # remain strict, while the new refiner is intentionally
+                    # initialized fresh.  A checkpoint from this probe must
+                    # contain all refiner keys and therefore remains strict
+                    # on resume.
+                    missing_refiner = [
+                        key for key in missing
+                        if key.startswith("tsh_instance_head.query_memory_refiner.")
+                    ]
+                    missing = [key for key in missing if key not in missing_refiner]
+                if missing:
+                    raise RuntimeError(
+                        f"[{checkpoint_label}] guarded-joint resume failed: "
+                        f"missing {len(missing)} head keys, e.g. "
+                        f"{missing[:5]}"
+                    )
+                nn.Module.load_state_dict(
+                    model, loadable, strict=False
+                )
+                # SIU3R-MBM family: the shared token-transformer tail has
+                # its own low-LR group and must be restored together with
+                # the two heads on any resume/eval load; it is saved in the
+                # same checkpoint (trainable => kept by state_dict()).
+                tail_lr = float(
+                    getattr(opt, "tsh_mbm_decoder_tail_lr", 0.0)
+                )
+                if tail_lr > 0.0 or bool(getattr(opt, "ta_riu_enabled", False)):
+                    tail_expected = [
+                        key
+                        for key in native_state
+                        if key.startswith(
+                            "enc_dec_backbone.decoder_blocks."
+                        )
+                    ]
+                    tail_in_ckpt = {
+                        key: ckpt[key]
+                        for key in ckpt
+                        if key.startswith(
+                            "enc_dec_backbone.decoder_blocks."
+                        )
+                        and key in native_state
+                        and native_state[key].shape == ckpt[key].shape
+                    }
+                    if not tail_in_ckpt:
+                        accelerator.print(
+                            f"[{checkpoint_label}] decoder-tail keys not "
+                            f"present in checkpoint (dev fork from a "
+                            f"frozen-tail run): keeping the constructor "
+                            f"(base8k) decoder-tail initialization"
+                        )
+                    else:
+                        tail_missing = [
+                            key
+                            for key in tail_expected
+                            if key not in tail_in_ckpt
+                        ]
+                        if tail_missing:
+                            raise RuntimeError(
+                                f"[{checkpoint_label}] decoder-tail resume "
+                                f"failed: missing {len(tail_missing)} keys, "
+                                f"e.g. {tail_missing[:5]}"
+                            )
+                        nn.Module.load_state_dict(
+                            model, tail_in_ckpt, strict=False
+                        )
+                        accelerator.print(
+                            f"[{checkpoint_label}] decoder-tail restored "
+                            f"{len(tail_in_ckpt)}/{len(tail_expected)} "
+                            f"keys (tsh_mbm_decoder_tail_lr={tail_lr})"
+                        )
+                if bool(getattr(opt, "tsh_per_gs_refine", False)):
+                    refine_expected = [
+                        key
+                        for key in native_state
+                        if key.startswith("tsh_slot_refine_head.")
+                    ]
+                    refine_in_ckpt = {
+                        key: ckpt[key]
+                        for key in ckpt
+                        if key.startswith("tsh_slot_refine_head.")
+                        and key in native_state
+                        and native_state[key].shape == ckpt[key].shape
+                    }
+                    if not refine_in_ckpt:
+                        # First fork from the calibrated Both checkpoint:
+                        # keep the freshly initialized (zero-gate) refine
+                        # head; NEVER fresh-reset abs/tsh.
+                        accelerator.print(
+                            f"[{checkpoint_label}] per-GS refine keys not "
+                            f"present (fork from Both checkpoint): keeping "
+                            f"zero-initialized refine head, abs/tsh fully "
+                            f"restored above"
+                        )
+                    else:
+                        refine_missing = [
+                            key
+                            for key in refine_expected
+                            if key not in refine_in_ckpt
+                        ]
+                        if refine_missing:
+                            raise RuntimeError(
+                                f"[{checkpoint_label}] per-GS refine resume "
+                                f"failed: missing {len(refine_missing)} "
+                                f"keys, e.g. {refine_missing[:5]}"
+                            )
+                        nn.Module.load_state_dict(
+                            model, refine_in_ckpt, strict=False
+                        )
+                        accelerator.print(
+                            f"[{checkpoint_label}] per-GS refine restored "
+                            f"{len(refine_in_ckpt)}/"
+                            f"{len(refine_expected)} keys"
+                        )
+                abs_keys = sum(
+                    1 for key in loadable
+                    if key.startswith("absolute_gs_head.")
+                )
+                ins_keys = len(loadable) - abs_keys
+                tsh_keys = sum(
+                    1
+                    for key in loadable
+                    if key.startswith("tsh_instance_head.")
+                )
+                ta_keys = sum(
+                    1 for key in loadable if key.startswith(ta_prefixes)
+                )
+                accelerator.print(
+                        f"[{checkpoint_label}] guarded-joint resume: "
+                        f"true_shared={tsh_mode} "
+                        f"absolute_gs_head loaded {abs_keys}/24 strict "
+                    f"(expected {sum(1 for k in expected if k.startswith('absolute_gs_head.'))}), "
+                    f"instance_branch keys loaded {ins_keys}, "
+                    f"tsh_instance_head keys loaded {tsh_keys} "
+                    f"ta_riu keys loaded {ta_keys}"
+                    + (
+                        (
+                            "; first fork from full3: tsh head uses "
+                            "FIXED fresh seed"
+                            if tsh_mode
+                            else "; instance branch left at FRESH init "
+                            "(guarded_instance_head_reinit=True)"
+                        )
+                        if reinit
+                        else (
+                            "; checkpoint continuation: heads loaded, "
+                            "fresh reset NOT applied"
+                        )
+                    )
+                )
+                if bool(getattr(opt, "ta_riu_enabled", False)) and not ckpt_has_ta_riu:
+                    accelerator.print(
+                        f"[{checkpoint_label}] TA-RIU modules absent in source "
+                        "checkpoint: initialized fresh; abs/TSH continuation "
+                        "was not reset"
+                    )
+                if reinit:
+                    # Fixed, reproducible fresh seed for the very first fork.
+                    fresh_seed = (int(opt.seed) + 987654321) % (2**31)
+                    torch.manual_seed(fresh_seed)
+                    branch = getattr(model, "instance_branch", None)
+                    if branch is not None and hasattr(
+                        branch, "reset_parameters_fresh"
+                    ):
+                        branch.reset_parameters_fresh()
+                    tsh_head = getattr(model, "tsh_instance_head", None)
+                    if tsh_head is not None and hasattr(
+                        tsh_head, "reset_parameters_fresh"
+                    ):
+                        tsh_head.reset_parameters_fresh()
+                    accelerator.print(
+                        f"[{checkpoint_label}] guarded-joint instance branch "
+                        f"re-initialized with fresh seed {fresh_seed} "
+                        f"(imported tsh/instance keys = 0; continuation never "
+                        f"enters this branch)"
+                    )
+                return
+            # Absolute-student head-only checkpoint: load every matching
+            # weight tolerantly (the frozen TokenGS backbone comes from
+            # backbone_resume).  The full-model strict validation below is
+            # not applicable to a head-only fork checkpoint.
+            matched = torch.nn.Module.load_state_dict(
+                model, ckpt, strict=False
+            )
+            head_matched = len(ckpt) - len(matched.unexpected_keys)
+            accelerator.print(
+                f"[{checkpoint_label}] abs fork resume: tolerant load "
+                f"(head keys matched {head_matched}/{len(ckpt)}; "
+                f"full-model missing={len(matched.missing_keys)} expected "
+                f"(backbone/CLIP loaded separately), "
+                f"unexpected={len(matched.unexpected_keys)})"
+            )
+            return
         missing = sorted(set(state_dict) - set(ckpt))
         unexpected = sorted(set(ckpt) - set(state_dict))
+        # DINOv2 is a frozen external extractor loaded lazily; if an older
+        # checkpoint saved its weights (instance_branch._dino_model.*), they
+        # are not part of the trainable model and must be ignored on resume.
+        unexpected = [
+            key
+            for key in unexpected
+            if not key.startswith("instance_branch._dino_model.")
+        ]
         mismatched = sorted(
             (key, tuple(ckpt[key].shape), tuple(state_dict[key].shape))
             for key in set(state_dict) & set(ckpt)
@@ -139,8 +652,29 @@ def load_model_checkpoint(opt, model, accelerator, epoch_start):
         accelerator.print(f"[{checkpoint_label}] resume missing keys: {missing}")
         accelerator.print(f"[{checkpoint_label}] resume unexpected keys: {unexpected}")
         accelerator.print(f"[{checkpoint_label}] resume shape-mismatched keys: {mismatched}")
-        if missing or unexpected or mismatched:
+        matcher_prefixes = (
+            "semantic_token_adapter.",
+            "prompt_semantic_adapter.",
+            "prompt_adapter.",
+            "log_temperature",
+            "matching_decoder.",
+        )
+        matcher_missing = [
+            key
+            for key in missing
+            if key.startswith(matcher_prefixes)
+        ]
+        if matcher_missing or unexpected or mismatched:
             raise RuntimeError("Prompt checkpoint failed strict validation")
+        if missing:
+            accelerator.print(
+                f"[{checkpoint_label}] warm-start: initializing "
+                f"{len(missing)} non-matcher keys (e.g. semantic last-decoder "
+                "fork / unfrozen TokenGS) from the pretrained state"
+            )
+            fresh_state = model.state_dict()
+            for key in missing:
+                ckpt[key] = fresh_state[key]
         model.load_state_dict(ckpt, strict=True)
         return
     
@@ -154,6 +688,114 @@ def load_model_checkpoint(opt, model, accelerator, epoch_start):
                 accelerator.print(f'[WARN] mismatching shape for param {k}: ckpt {v.shape} != model {state_dict[k].shape}, ignored.')
         else:
             accelerator.print(f'[WARN] unexpected param {k}: {v.shape}')
+
+
+def load_fresh_backbone_resume(opt, model, accelerator):
+    """Fresh-start (no resume) frozen-backbone recipe support.
+
+    When a Step-2 run starts from scratch (``resume`` unset) on top of a
+    domain-adapted backbone, the model constructor only restores the
+    ``prompt_tokengs_checkpoint`` encoder/decoder.  If ``backbone_resume``
+    points to a different checkpoint (e.g. Step-1 domain adaptation output),
+    load its trainable backbone subset (decoder blocks / activation head /
+    GS tokens) on top, leaving all heads at their fresh initialization.
+    This lets instance heads train from scratch on domain-aligned token
+    features instead of silently retraining on the raw pretrained backbone.
+    """
+    resume = getattr(opt, "resume", None)
+    if resume not in (None, "", "None"):
+        return
+    if not getattr(opt, "prompt_training", False):
+        return
+    backbone_path = getattr(opt, "backbone_resume", "") or ""
+    if not backbone_path or not os.path.isfile(backbone_path):
+        return
+    base_path = getattr(opt, "prompt_tokengs_checkpoint", "") or ""
+    if os.path.abspath(backbone_path) == os.path.abspath(base_path):
+        return
+    try:
+        ckpt = load_file(backbone_path, device="cpu")
+    except Exception as exc:  # pragma: no cover - read failure only
+        accelerator.print(
+            f"[fresh-backbone] failed to read {backbone_path}: {exc}"
+        )
+        return
+    prefixes = (
+        "enc_dec_backbone.",
+        "patch_embed.",
+        "patch_plucker_embed.",
+        "activation_head.",
+        "anchor_pos_encoder.",
+    )
+    native_state = nn.Module.state_dict(model)
+    loadable = {}
+    for key, value in ckpt.items():
+        if key == "gs_tokens" or key.startswith(prefixes):
+            if key in native_state and native_state[key].shape == value.shape:
+                loadable[key] = value
+    if not loadable:
+        accelerator.print(
+            f"[fresh-backbone] no loadable backbone keys in {backbone_path}; "
+            "keeping the constructor's pretrained backbone"
+        )
+        return
+    nn.Module.load_state_dict(model, loadable, strict=False)
+    accelerator.print(
+        f"[fresh-backbone] loaded {len(loadable)} trainable backbone keys "
+        f"from {backbone_path} (heads kept at fresh init)"
+    )
+
+
+def load_semantic_adapter_resume(opt, model, accelerator):
+    """Warm-start the semantic adapters from a full checkpoint at fresh start.
+
+    Used when semantic losses are turned on for a fresh-head run (e.g. the
+    wide7l semantic-stabilizer test): the adapters (semantic_token_adapter,
+    prompt_semantic_adapter, gaussian_feature_head, log_temperature) start
+    from the trained checkpoint instead of random projections, so the
+    semantic losses are meaningful from step 0. No-op when resume is set or
+    the option is empty.
+    """
+    resume = getattr(opt, "resume", None)
+    if resume not in (None, "", "None"):
+        return
+    path = getattr(opt, "prompt_semantic_adapter_resume", "") or ""
+    if not path or not os.path.isfile(path):
+        return
+    try:
+        ckpt = load_file(path, device="cpu")
+    except Exception as exc:  # pragma: no cover - read failure only
+        accelerator.print(
+            f"[sem-adapter-resume] failed to read {path}: {exc}"
+        )
+        return
+    prefixes = (
+        "semantic_token_adapter.",
+        "prompt_semantic_adapter.",
+        "gaussian_feature_head.",
+        "log_temperature",
+    )
+    native_state = nn.Module.state_dict(model)
+    loadable = {}
+    for key, value in ckpt.items():
+        if not key.startswith(prefixes):
+            continue
+        target = key
+        if key not in native_state:
+            target = "prompt_matcher." + key
+        if target in native_state and native_state[target].shape == value.shape:
+            loadable[target] = value
+    if not loadable:
+        accelerator.print(
+            "[sem-adapter-resume] no loadable semantic adapter keys in "
+            f"{path}; keeping fresh init"
+        )
+        return
+    nn.Module.load_state_dict(model, loadable, strict=False)
+    accelerator.print(
+        f"[sem-adapter-resume] loaded {len(loadable)} semantic adapter "
+        f"keys from {path}"
+    )
 
     if opt.init_tokens_from_existing and epoch_start == 0:
         _initialize_tokens_from_existing(ckpt, state_dict, accelerator)
@@ -253,23 +895,202 @@ def _initialize_dynamic_tokens_from_static(ckpt, state_dict, accelerator):
 def setup_optimizer(opt, model, accelerator, epoch_start):
     """Setup optimizer. Call before accelerator.prepare()."""
     decay_params, nodecay_params = [], []
+    geometry_decay, geometry_nodecay = [], []
+    guarded_abs_decay, guarded_abs_nodecay = [], []
+    guarded_ins_decay, guarded_ins_nodecay = [], []
+    refine_decay, refine_nodecay = [], []
+    ta_shared_decay, ta_shared_nodecay = [], []
+    ta_geo_decay, ta_geo_nodecay = [], []
+    ta_app_decay, ta_app_nodecay = [], []
+    tsh = bool(getattr(opt, "abs_true_shared_units", False))
+    guarded = bool(getattr(opt, "abs_joint_guarded", False)) or tsh
+    if tsh:
+        instance_prefixes = ("tsh_instance_head.",)
+        if str(getattr(opt, "ga_idu_mode", "off")) == "1":
+            instance_prefixes = instance_prefixes + ("ga_idu1_head.",)
+        if bool(getattr(opt, "tsh_per_gs_refine", False)):
+            instance_prefixes = instance_prefixes + (
+                "tsh_slot_refine_head.",
+            )
+    else:
+        instance_prefixes = ("instance_branch.",)
+    abs_group_lr = (
+        float(getattr(opt, "tsh_abs_lr", 1e-5))
+        if tsh
+        else float(getattr(opt, "guarded_abs_lr", 1e-5))
+    )
+    instance_group_lr = (
+        float(getattr(opt, "ga_idu_instance_lr", 1e-4))
+        if str(getattr(opt, "ga_idu_mode", "off")) == "1"
+        else float(getattr(opt, "tsh_instance_lr", 1e-4))
+        if tsh
+        else float(getattr(opt, "guarded_instance_lr", 1e-4))
+    )
+    refine_group_lr = float(getattr(opt, "tsh_query_memory_refine_lr", 1e-4))
+    joint_refine = bool(getattr(opt, "tsh_query_memory_refine_head_joint_probe", False))
+    geometry_lr = float(getattr(opt, "prompt_unfreeze_tokengs_lr", 0.0))
+    separate_geometry = (
+        bool(getattr(opt, "prompt_unfreeze_tokengs", False))
+        and geometry_lr > 0.0
+    )
     for name, param in model.named_parameters():
         if not param.requires_grad:
             continue
+        if bool(getattr(opt, "ta_riu_enabled", False)) and name.startswith(
+            (
+                "ta_riu_shared_mixer.",
+                "ta_riu_geometry_head.",
+                "ta_riu_appearance_head.",
+            )
+        ):
+            if name.startswith("ta_riu_shared_mixer."):
+                target_decay, target_nodecay = ta_shared_decay, ta_shared_nodecay
+            elif name.startswith("ta_riu_geometry_head."):
+                target_decay, target_nodecay = ta_geo_decay, ta_geo_nodecay
+            else:
+                target_decay, target_nodecay = ta_app_decay, ta_app_nodecay
+            if param.dim() == 1 or getattr(param, "_no_weight_decay", False):
+                target_nodecay.append(param)
+            else:
+                target_decay.append(param)
+            continue
+        # Only the actual TokenGS reconstruction path belongs to the lower
+        # geometry learning-rate group. Instance/group heads are semantic
+        # predictors and must keep the main LR; the old broad predicate put
+        # them in the geometry group whenever decoder fine-tuning was enabled.
+        is_geometry = separate_geometry and (
+            name.startswith("enc_dec_backbone.")
+            or name.startswith("activation_head.")
+            or name in ("gs_tokens", "gs_tokens_dynamic")
+        )
         if param.dim() == 1 or getattr(param, '_no_weight_decay', False):
-            nodecay_params.append(param)
+            if guarded and name.startswith("absolute_gs_head."):
+                guarded_abs_nodecay.append(param)
+            elif joint_refine and name.startswith("tsh_instance_head.query_memory_refiner."):
+                refine_nodecay.append(param)
+            elif guarded and any(
+                name.startswith(p) for p in instance_prefixes
+            ):
+                guarded_ins_nodecay.append(param)
+            elif is_geometry:
+                geometry_nodecay.append(param)
+            else:
+                nodecay_params.append(param)
         else:
-            decay_params.append(param)
+            if guarded and name.startswith("absolute_gs_head."):
+                guarded_abs_decay.append(param)
+            elif joint_refine and name.startswith("tsh_instance_head.query_memory_refiner."):
+                refine_decay.append(param)
+            elif guarded and any(
+                name.startswith(p) for p in instance_prefixes
+            ):
+                guarded_ins_decay.append(param)
+            elif is_geometry:
+                geometry_decay.append(param)
+            else:
+                decay_params.append(param)
 
     optim_groups = []
     if len(decay_params) > 0:
         optim_groups.append({'params': decay_params, 'weight_decay': opt.weight_decay})
     if len(nodecay_params) > 0:
         optim_groups.append({'params': nodecay_params, 'weight_decay': 0.0})
+    if guarded:
+        guarded_lr_groups = (
+            (
+                guarded_abs_decay,
+                guarded_abs_nodecay,
+                abs_group_lr,
+            ),
+            (
+                guarded_ins_decay,
+                guarded_ins_nodecay,
+                instance_group_lr,
+            ),
+            (refine_decay, refine_nodecay, refine_group_lr),
+        )
+        for decay_list, nodecay_list, group_lr in guarded_lr_groups:
+            if len(decay_list) > 0:
+                optim_groups.append(
+                    {
+                        'params': decay_list,
+                        'weight_decay': opt.weight_decay,
+                        'lr': group_lr,
+                    }
+                )
+            if len(nodecay_list) > 0:
+                optim_groups.append(
+                    {
+                        'params': nodecay_list,
+                        'weight_decay': 0.0,
+                        'lr': group_lr,
+                    }
+                )
+        if bool(getattr(opt, "ta_riu_enabled", False)):
+            ta_lr_groups = (
+                (ta_shared_decay, ta_shared_nodecay, float(getattr(opt, "ta_riu_shared_lr", 1.0e-5))),
+                (ta_geo_decay, ta_geo_nodecay, float(getattr(opt, "ta_riu_geometry_lr", 1.0e-5))),
+                (ta_app_decay, ta_app_nodecay, float(getattr(opt, "ta_riu_appearance_lr", 1.0e-5))),
+            )
+            for decay_list, nodecay_list, group_lr in ta_lr_groups:
+                if len(decay_list) > 0:
+                    optim_groups.append(
+                        {
+                            'params': decay_list,
+                            'weight_decay': opt.weight_decay,
+                            'lr': group_lr,
+                        }
+                    )
+                if len(nodecay_list) > 0:
+                    optim_groups.append(
+                        {
+                            'params': nodecay_list,
+                            'weight_decay': 0.0,
+                            'lr': group_lr,
+                        }
+                    )
+        accelerator.print(
+            f"[optimizer] guarded joint groups: "
+            f"abs_lr={abs_group_lr} instance_lr={instance_group_lr} "
+            f"refine_lr={refine_group_lr} "
+            f"(true_shared={tsh}) "
+            f"abs_params={len(guarded_abs_decay) + len(guarded_abs_nodecay)} "
+            f"instance_params={len(guarded_ins_decay) + len(guarded_ins_nodecay)} "
+            f"ta_shared_params={len(ta_shared_decay) + len(ta_shared_nodecay)} "
+            f"ta_geo_params={len(ta_geo_decay) + len(ta_geo_nodecay)} "
+            f"ta_app_params={len(ta_app_decay) + len(ta_app_nodecay)}"
+        )
+    if separate_geometry:
+        if len(geometry_decay) > 0:
+            optim_groups.append(
+                {
+                    'params': geometry_decay,
+                    'weight_decay': opt.weight_decay,
+                    'lr': geometry_lr,
+                }
+            )
+        if len(geometry_nodecay) > 0:
+            optim_groups.append(
+                {
+                    'params': geometry_nodecay,
+                    'weight_decay': 0.0,
+                    'lr': geometry_lr,
+                }
+            )
+        accelerator.print(
+            f"[optimizer] separate geometry LR={geometry_lr} "
+            f"({len(geometry_decay) + len(geometry_nodecay)} params)"
+        )
 
     optimizer = torch.optim.AdamW(optim_groups, lr=opt.lr, betas=(0.9, 0.95), fused=True)
 
-    if epoch_start > 0:
+    fork_continue = bool(
+        getattr(opt, "tsh_fork_continue_step", 0) > 0
+    )
+    if epoch_start > 0 or (
+        fork_continue
+        and os.path.isfile(os.path.join(opt.workspace, "optimizer.pth"))
+    ):
         optimizer.load_state_dict(torch.load(os.path.join(opt.workspace, 'optimizer.pth'), map_location='cpu'))
 
     return optimizer
@@ -279,7 +1100,13 @@ def setup_scheduler(opt, optimizer, iters_per_epoch, accelerator, epoch_start):
     """Setup scheduler. Call after accelerator.prepare() with per-GPU iters_per_epoch."""
     if opt.lr_scheduler == "constant":
         scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lambda _: 1.0)
-        if epoch_start > 0:
+        fork_continue = bool(
+            getattr(opt, "tsh_fork_continue_step", 0) > 0
+        )
+        if epoch_start > 0 or (
+            fork_continue
+            and os.path.isfile(os.path.join(opt.workspace, "scheduler.pth"))
+        ):
             scheduler.load_state_dict(torch.load(os.path.join(opt.workspace, 'scheduler.pth')))
         return scheduler
 
@@ -309,6 +1136,19 @@ def save_checkpoint(
         torch.save(scheduler.state_dict(), os.path.join(opt.workspace, 'scheduler.pth'))
         
         metadata = {'epoch': epoch, 'step': int(global_step)}
+        if bool(getattr(opt, "tsh_ddp8", False)):
+            world = int(getattr(accelerator, "num_processes", 1))
+            gbs = int(opt.batch_size) * world
+            metadata.update(
+                {
+                    "optimizer_step": int(global_step),
+                    "equivalent_global_samples": int(global_step) * gbs,
+                    "epoch": int(epoch),
+                    "world_size": world,
+                    "per_gpu_batch_size": int(opt.batch_size),
+                    "global_batch_size": gbs,
+                }
+            )
         if getattr(opt, "prompt_training", False):
             metadata["tokengs_checkpoint"] = opt.prompt_tokengs_checkpoint
             metadata["prompt_checkpoint"] = os.path.join(opt.workspace, "model.safetensors")
@@ -326,6 +1166,55 @@ def save_checkpoint(
             
         with open(f'{opt.workspace}/metadata.json', 'w') as f:
             json.dump(metadata, f)
+
+
+def save_fork_rng_state(
+    opt, accelerator, epoch, global_step
+):
+    """Per-rank RNG / sampling state for causal-fork continuation."""
+    if not bool(getattr(opt, "tsh_ddp8", False)):
+        return
+    state_dir = os.path.join(opt.workspace, ".fork_state")
+    os.makedirs(state_dir, exist_ok=True)
+    rank = int(getattr(accelerator, "process_index", -1))
+    import random
+
+    payload = {
+        "epoch": int(epoch),
+        "optimizer_step": int(global_step),
+        "torch_rng": torch.get_rng_state(),
+        "cuda_rng": torch.cuda.get_rng_state(),
+        "python_random": random.getstate(),
+    }
+    torch.save(
+        payload,
+        os.path.join(state_dir, f"rank{rank}.pt"),
+    )
+
+
+def load_fork_rng_state(opt, accelerator):
+    """Restore per-rank RNG state saved by the common warm-up run."""
+    if int(getattr(opt, "tsh_fork_continue_step", 0)) <= 0:
+        return
+    rank = int(getattr(accelerator, "process_index", -1))
+    path = os.path.join(
+        opt.workspace, ".fork_state", f"rank{rank}.pt"
+    )
+    if not os.path.isfile(path):
+        raise RuntimeError(
+            f"missing per-rank fork state for rank {rank}: {path}"
+        )
+    payload = torch.load(path, map_location="cpu")
+    import random
+
+    torch.set_rng_state(payload["torch_rng"])
+    torch.cuda.set_rng_state(payload["cuda_rng"])
+    random.setstate(payload["python_random"])
+    if accelerator.is_main_process:
+        print(
+            f"[fork] restored rank {rank} RNG state at "
+            f"optimizer_step={payload['optimizer_step']}"
+        )
 
 
 def save_prompt_validation_checkpoint(
@@ -355,11 +1244,38 @@ def save_prompt_validation_checkpoint(
             "prompt_checkpoint": os.path.abspath(checkpoint_path),
             "model_type": opt.model_type,
         }
+        if bool(getattr(opt, "tsh_ddp8", False)):
+            world = int(getattr(accelerator, "num_processes", 1))
+            gbs = int(opt.batch_size) * world
+            metadata.update(
+                {
+                    "optimizer_step": int(global_step),
+                    "equivalent_global_samples": int(global_step) * gbs,
+                    "world_size": world,
+                    "per_gpu_batch_size": int(opt.batch_size),
+                    "global_batch_size": gbs,
+                }
+            )
+        if "macro_miou" in validation_metrics:
+            metadata["macro_miou"] = float(validation_metrics["macro_miou"])
+            metadata["macc"] = float(validation_metrics["macc"])
+            metadata["mask_accuracy"] = float(
+                validation_metrics.get("mask_accuracy", float("nan"))
+            )
+        for key in (
+            "predicted_foreground_ratio",
+            "gt_foreground_ratio",
+            "foreground_probability",
+            "background_probability",
+        ):
+            if key in validation_metrics:
+                metadata[key] = float(validation_metrics[key])
         if opt.model_type in ("prompt_tokengs", "conditional_prompt_tokengs"):
             metadata["prompt_image_pooling"] = opt.prompt_image_pooling
             metadata["conditional_query_decoder"] = (
                 opt.model_type == "conditional_prompt_tokengs"
             )
+            metadata["prompt_balanced_bce"] = bool(opt.prompt_balanced_bce)
             if opt.model_type == "prompt_tokengs":
                 metadata["prompt_tune_last_cross_attention"] = bool(
                     opt.prompt_tune_last_cross_attention
@@ -368,21 +1284,152 @@ def save_prompt_validation_checkpoint(
                 metadata["conditional_v3_tune_last_cross_attention"] = bool(
                     opt.conditional_v3_tune_last_cross_attention
                 )
-        elif opt.model_type == "semantic_tokengs_v2":
+        elif opt.model_type in (
+            "semantic_tokengs_v2",
+            "semantic_tokengs_v3",
+            "semantic_tokengs_v4",
+            "semantic_tokengs_v5",
+            "semantic_tokengs_v6",
+        ):
             unwrapped = accelerator.unwrap_model(model)
             metadata["semantic_v2_dim"] = int(opt.semantic_v2_dim)
+            metadata["prompt_clip_model_path"] = str(opt.prompt_clip_model_path)
+            metadata["semantic_v2_class_weights"] = list(
+                getattr(opt, "semantic_v2_class_weights", (1.0,) * 8)
+            )
+            if opt.model_type in (
+                "semantic_tokengs_v4",
+                "semantic_tokengs_v5",
+                "semantic_tokengs_v6",
+            ):
+                metadata["semantic_v4_feature_dim"] = int(
+                    getattr(opt, "semantic_v4_feature_dim", 32)
+                )
+                metadata["semantic_v4_use_geometry"] = bool(
+                    getattr(opt, "semantic_v4_use_geometry", True)
+                )
+            metadata["semantic_v4_teacher_projection"] = str(
+                getattr(
+                    opt, "semantic_v4_teacher_projection", "frozen_random"
+                )
+            )
+            metadata["instance_group_num_groups"] = int(
+                getattr(opt, "instance_group_num_groups", 64)
+            )
+            metadata["instance_group_conditioned_gaussians"] = bool(
+                getattr(opt, "instance_group_conditioned_gaussians", False)
+            )
+            metadata["instance_group_condition_dim"] = int(
+                getattr(opt, "instance_group_condition_dim", 256)
+            )
+            metadata["instance_group_condition_heads"] = int(
+                getattr(opt, "instance_group_condition_heads", 8)
+            )
+            metadata["instance_group_condition_layers"] = int(
+                getattr(opt, "instance_group_condition_layers", 2)
+            )
+            metadata["instance_group_condition_residual_scale"] = float(
+                getattr(opt, "instance_group_condition_residual_scale", 1.0)
+            )
+            metadata[
+                "instance_group_condition_assignment_temperature"
+            ] = float(
+                getattr(
+                    opt,
+                    "instance_group_condition_assignment_temperature",
+                    10.0,
+                )
+            )
+            metadata["instance_group_condition_gaussian_blend"] = float(
+                getattr(opt, "instance_group_condition_gaussian_blend", 0.1)
+            )
+            metadata["instance_group_condition_per_gaussian"] = bool(
+                getattr(opt, "instance_group_condition_per_gaussian", False)
+            )
+            metadata[
+                "instance_group_condition_per_gaussian_opacity_scale"
+            ] = float(
+                getattr(
+                    opt,
+                    "instance_group_condition_per_gaussian_opacity_scale",
+                    0.05,
+                )
+            )
+            metadata["instance_group_per_gaussian"] = bool(
+                getattr(opt, "instance_group_per_gaussian", False)
+            )
+            metadata["instance_group_decoder"] = bool(
+                getattr(opt, "instance_group_decoder", False)
+            )
+            metadata["instance_group_decoder_layers"] = int(
+                getattr(opt, "instance_group_decoder_layers", 2)
+            )
+            metadata["instance_group_use_anchor_pos"] = bool(
+                getattr(opt, "instance_group_use_anchor_pos", False)
+            )
+            metadata["instance_group_residual_head"] = bool(
+                getattr(opt, "instance_group_residual_head", False)
+            )
+            metadata["instance_group_residual_scale"] = float(
+                getattr(opt, "instance_group_residual_scale", 0.3)
+            )
+            metadata["instance_group_adaptive_count"] = bool(
+                getattr(opt, "instance_group_adaptive_count", False)
+            )
+            metadata["instance_group_count_head"] = bool(
+                getattr(opt, "instance_group_count_head", False)
+            )
+            metadata["instance_group_count_hidden"] = int(
+                getattr(opt, "instance_group_count_hidden", 128)
+            )
+            metadata["lambda_instance_group_count"] = float(
+                getattr(opt, "lambda_instance_group_count", 0.0)
+            )
+            metadata["instance_group_pos_attn_layers"] = int(
+                getattr(opt, "instance_group_pos_attn_layers", 0)
+            )
+            metadata["instance_group_pos_attn_scale"] = float(
+                getattr(opt, "instance_group_pos_attn_scale", 1.0)
+            )
+            # For frozen-backbone recipes the resume checkpoint is prompt
+            # only, so point the eval's backbone loader at the full
+            # checkpoint that training actually used.
+            metadata["resume"] = str(
+                getattr(opt, "backbone_resume", "")
+                or getattr(opt, "resume", "")
+                or ""
+            )
+            if getattr(opt, "backbone_resume", ""):
+                metadata["backbone_resume"] = str(opt.backbone_resume)
             metadata["semantic_v2_balanced_bce"] = bool(opt.semantic_v2_balanced_bce)
             metadata["semantic_v2_score_mode"] = opt.semantic_v2_score_mode
             metadata["semantic_v2_tune_last_cross_attention"] = bool(
                 opt.semantic_v2_tune_last_cross_attention
             )
+            metadata["prompt_unfreeze_tokengs"] = bool(
+                opt.prompt_unfreeze_tokengs
+            )
+            abs_best = bool(
+                getattr(opt, "instance_branch_abs_units", False)
+            )
             selection_metric = (
-                "argmax_macro_miou"
-                if opt.semantic_v2_score_mode == "softmax"
-                else "mask_iou"
+                "psnr"
+                if abs_best
+                else (
+                    "argmax_macro_miou"
+                    if opt.semantic_v2_score_mode == "softmax"
+                    else "mask_iou"
+                )
             )
             metadata["selection_metric"] = selection_metric
-            metadata["selection_iou"] = float(validation_metrics[selection_metric])
+            if abs_best:
+                metadata["selection_psnr"] = float(
+                    validation_metrics[selection_metric]
+                )
+            else:
+                metadata["selection_iou"] = float(
+                    validation_metrics[selection_metric]
+                )
             metadata["temperature"] = float(
                 unwrapped.semantic_matcher.temperature.detach().cpu()
             )
@@ -405,13 +1452,21 @@ def save_prompt_validation_checkpoint(
                 encoding="utf-8",
             ) as handle:
                 json.dump(best_metadata, handle, indent=2)
-            accelerator.print(
-                f"[prompt-best] step={global_step} "
-                f"selection_metric={metadata.get('selection_metric', 'mask_iou')} "
-                f"selection_iou={metadata.get('selection_iou', validation_metrics['mask_iou']):.6f} "
-                f"mask_iou={validation_metrics['mask_iou']:.6f} "
-                f"path={os.path.abspath(best_path)}"
-            )
+            if bool(getattr(opt, "instance_branch_abs_units", False)):
+                accelerator.print(
+                    f"[prompt-best] step={global_step} "
+                    f"selection_metric=psnr "
+                    f"selection_psnr={validation_metrics['psnr']:.4f} "
+                    f"path={os.path.abspath(best_path)}"
+                )
+            else:
+                accelerator.print(
+                    f"[prompt-best] step={global_step} "
+                    f"selection_metric={metadata.get('selection_metric', 'mask_iou')} "
+                    f"selection_iou={metadata.get('selection_iou', validation_metrics['mask_iou']):.6f} "
+                    f"mask_iou={validation_metrics['mask_iou']:.6f} "
+                    f"path={os.path.abspath(best_path)}"
+                )
     accelerator.wait_for_everyone()
 
 
@@ -422,7 +1477,13 @@ def log_training_images(
     if not accelerator.is_main_process:
         return
     if getattr(opt, "prompt_training", False):
-        if opt.model_type == "semantic_tokengs_v2":
+        if opt.model_type in (
+            "semantic_tokengs_v2",
+            "semantic_tokengs_v3",
+            "semantic_tokengs_v4",
+            "semantic_tokengs_v5",
+            "semantic_tokengs_v6",
+        ):
             log_semantic_v2_images(
                 opt, data, out, epoch, i, is_train=is_train, global_step=global_step
             )
@@ -618,12 +1679,17 @@ def log_semantic_v2_images(
 
 
 def train_epoch(opt, accelerator, model, optimizer, scheduler, train_dataloader, 
-                iters_per_epoch, epoch, writer, start_time, train_dataset):
+                iters_per_epoch, epoch, writer, start_time, train_dataset,
+                global_step_offset: int = 0,
+                sample_skip: int = 0):
     """Train for one epoch."""
     model.train()
     total_loss = 0
     total_psnr = 0
     log_time = time.time()
+    epoch_iters = min(iters_per_epoch, opt.max_iters_per_epoch)
+    if sample_skip > 0:
+        epoch_iters = max(0, epoch_iters - sample_skip)
 
     def grad_norm(parameters):
         squared = []
@@ -646,6 +1712,87 @@ def train_epoch(opt, accelerator, model, optimizer, scheduler, train_dataloader,
                 global_step_for_aux,
                 opt,
             )
+        if hasattr(unwrapped_model, "compute_instance_group_lambda_eff"):
+            unwrapped_model.instance_group_lambda_eff = (
+                unwrapped_model.compute_instance_group_lambda_eff(
+                    global_step_for_aux, opt
+                )
+            )
+        if hasattr(unwrapped_model, "compute_teacher_lambda_eff"):
+            unwrapped_model.teacher_lambda_eff = (
+                unwrapped_model.compute_teacher_lambda_eff(
+                    global_step_for_aux, opt
+                )
+            )
+        if hasattr(unwrapped_model, "compute_instance_stage_eff"):
+            unwrapped_model.instance_stage_eff = (
+                unwrapped_model.compute_instance_stage_eff(
+                    global_step_for_aux, opt
+                )
+            )
+        if bool(getattr(opt, "abs_joint_guarded", False)) and hasattr(
+            unwrapped_model, "compute_guarded_instance_effs"
+        ):
+            (
+                unwrapped_model.guarded_instance_loss_weight_eff,
+                unwrapped_model.guarded_instance_unit_grad_eff,
+            ) = unwrapped_model.compute_guarded_instance_effs(
+                global_step_for_aux, opt
+            )
+        if bool(getattr(opt, "abs_true_shared_units", False)) and hasattr(
+            unwrapped_model, "compute_tsh_effs"
+        ):
+            if bool(getattr(opt, "ta_riu_enabled", False)):
+                # TA-RIU's only warm-up is the explicit residual/mixer gate;
+                # the complete TSH head is trainable from the first forward.
+                unwrapped_model.tsh_instance_loss_weight_eff = 1.0
+                unwrapped_model.tsh_unit_grad_eff = 1.0
+            else:
+                (
+                    unwrapped_model.tsh_instance_loss_weight_eff,
+                    unwrapped_model.tsh_unit_grad_eff,
+                ) = unwrapped_model.compute_tsh_effs(
+                    global_step_for_aux, opt
+                )
+        if bool(getattr(opt, "abs_true_shared_units", False)) and hasattr(
+            unwrapped_model, "compute_tsh_mbm_u2r_eff"
+        ):
+            unwrapped_model.tsh_mbm_u2r_eff = (
+                unwrapped_model.compute_tsh_mbm_u2r_eff(
+                    global_step_for_aux, opt
+                )
+            )
+        if bool(getattr(opt, "tsh_per_gs_refine", False)) and hasattr(
+            unwrapped_model, "compute_tsh_per_gs_gate_eff"
+        ):
+            unwrapped_model.tsh_per_gs_gate_eff = (
+                unwrapped_model.compute_tsh_per_gs_gate_eff(
+                    global_step_for_aux, opt
+                )
+            )
+        if bool(getattr(opt, "tsh_query_memory_refine", False)) and hasattr(
+            unwrapped_model, "compute_tsh_query_memory_refine_eff"
+        ):
+            unwrapped_model.tsh_query_memory_refine_gate_eff = (
+                unwrapped_model.compute_tsh_query_memory_refine_eff(
+                    global_step_for_aux, opt
+                )
+            )
+        if str(getattr(opt, "ga_idu_mode", "off")) == "1" and hasattr(
+            unwrapped_model, "compute_ga_idu_gate_eff"
+        ):
+            unwrapped_model.ga_idu_gate_eff = unwrapped_model.compute_ga_idu_gate_eff(
+                global_step_for_aux, opt
+            )
+        if bool(getattr(opt, "ta_riu_enabled", False)) and hasattr(
+            unwrapped_model, "compute_ta_riu_gate_eff"
+        ):
+            ta_gate = unwrapped_model.compute_ta_riu_gate_eff(
+                global_step_for_aux, opt
+            )
+            unwrapped_model.ta_riu_gate_eff = ta_gate
+            unwrapped_model.ta_riu_geo_gate_eff = ta_gate
+            unwrapped_model.ta_riu_app_gate_eff = ta_gate
 
         completed_step = global_step + 1
         compute_quality_metrics = (
@@ -671,13 +1818,104 @@ def train_epoch(opt, accelerator, model, optimizer, scheduler, train_dataloader,
         backward_loss = out.get('backward_loss', loss)
         accelerator.backward(backward_loss)
 
+        if (
+            bool(getattr(opt, "instance_branch_abs_units", False))
+            and accelerator.is_main_process
+            and completed_step % max(1, opt.print_freq) == 0
+        ):
+            base_model = accelerator.unwrap_model(model)
+
+            def _grad_sum(prefixes):
+                total = 0.0
+                for name, param in base_model.named_parameters():
+                    if param.grad is None:
+                        continue
+                    if any(name.startswith(prefix) for prefix in prefixes):
+                        total += float(param.grad.abs().sum())
+                return total
+
+            abs_dec_grad = _grad_sum(("absolute_gs_head.",))
+            instance_grad = _grad_sum(
+                ("instance_branch.", "tsh_instance_head.")
+            )
+            backbone_grad = _grad_sum(
+                (
+                    "enc_dec_backbone.",
+                    "patch_embed.",
+                    "patch_plucker_embed.",
+                    "activation_head.",
+                    "anchor_pos_encoder.",
+                )
+            )
+            teacher_grad = _grad_sum(("activation_head.",))
+            semantic_prefixes = (
+                "prompt_matcher.",
+                "semantic_lifting_head.",
+                "semantic_projector.",
+                "prompt_semantic_adapter.",
+                "gaussian_feature_head.",
+            )
+            if not bool(
+                getattr(opt, "abs_joint_guarded", False)
+            ):
+                semantic_prefixes = semantic_prefixes + ("instance_branch.",)
+            sem_grad = _grad_sum(semantic_prefixes)
+            abs_param_norm = 0.0
+            for _name, param in base_model.absolute_gs_head.named_parameters():
+                abs_param_norm += float(param.detach().float().abs().sum())
+            scene_name = (
+                data["scene_name"][0] if "scene_name" in data else "?"
+            )
+            frame0 = (
+                int(data["frame_ids"][0][0])
+                if "frame_ids" in data
+                else -1
+            )
+            accelerator.print(
+                f"[abs-train] step={completed_step} "
+                f"sample={scene_name}:{frame0} "
+                f"loss_rgb={float(out['loss_rgb']):.4f} "
+                f"teacher_gs={float(out['loss_teacher_gs']):.4f} "
+                f"teacher_rgb={float(out['loss_teacher_rgb']):.4f} "
+                f"teacher_eff={getattr(base_model, 'teacher_lambda_eff', 0.0):.4f} "
+                f"inst={float(out.get('loss_instance_group', 0.0)):.4f} "
+                f"inst_eff={getattr(base_model, 'instance_stage_eff', 1.0):.4f} "
+                f"inst_w={float(out.get('tsh_instance_loss_weight', out.get('guarded_instance_loss_weight', 0.0))):.6f} "
+                f"inst_unit_eff={float(out.get('tsh_unit_grad_eff', out.get('guarded_instance_unit_grad_eff', 0.0))):.4f} "
+                f"teacher_called={int(bool(getattr(base_model, 'teacher_called', False)))} "
+                f"abs_grad={abs_dec_grad:.2f} abs_norm={abs_param_norm:.2f} "
+                f"inst_grad={instance_grad:.2f} "
+                f"backbone_grad={backbone_grad:.2f} "
+                f"teacher_grad={teacher_grad:.2f} "
+                f"sem_grad={sem_grad:.2f} "
+                f"gaussians_source=absolute_student old_gs_head_calls=0 "
+                f"psnr={float(psnr):.2f}"
+            )
+
         if getattr(opt, "prompt_training", False):
             base_model = accelerator.unwrap_model(model)
-            if opt.model_type == "semantic_tokengs_v2":
+            if (
+                opt.model_type
+                in (
+                "semantic_tokengs_v2",
+                "semantic_tokengs_v3",
+                "semantic_tokengs_v4",
+                "semantic_tokengs_v5",
+                "semantic_tokengs_v6",
+                )
+            ):
                 groups = base_model.semantic_trainable_groups()
                 out["token_adapter_grad_norm"] = grad_norm(groups["token_adapter"])
                 out["prompt_adapter_grad_norm"] = grad_norm(groups["prompt_adapter"])
                 out["temperature_grad_norm"] = grad_norm(groups["temperature"])
+                if "gaussian_feature_head" in groups:
+                    out["gaussian_feature_head_grad_norm"] = grad_norm(
+                        groups["gaussian_feature_head"]
+                    )
+                if "instance_group_head" in groups:
+                    out["instance_group_head_grad_norm"] = grad_norm(
+                        groups["instance_group_head"]
+                    )
                 adapter_group_names = (
                     "token_adapter", "prompt_adapter", "temperature"
                 )
@@ -690,11 +1928,15 @@ def train_epoch(opt, accelerator, model, optimizer, scheduler, train_dataloader,
                     out["last_cross_attention_grad_norm"] = grad_norm(
                         groups["last_cross_attention"]
                     )
-                frozen_parameters = (
-                    parameter
-                    for parameter in base_model.parameters()
-                    if not parameter.requires_grad
-                )
+                if "tokengs" in groups:
+                    out["tokengs_grad_norm"] = grad_norm(groups["tokengs"])
+                    frozen_parameters = ()
+                else:
+                    frozen_parameters = (
+                        parameter
+                        for parameter in base_model.parameters()
+                        if not parameter.requires_grad
+                    )
             elif opt.model_type == "conditional_prompt_tokengs":
                 groups = base_model.conditional_trainable_groups()
                 out["condition_projection_grad_norm"] = grad_norm(
@@ -732,7 +1974,8 @@ def train_epoch(opt, accelerator, model, optimizer, scheduler, train_dataloader,
                     for parameter in base_model.parameters()
                     if not parameter.requires_grad
                 )
-            out["tokengs_grad_norm"] = grad_norm(frozen_parameters)
+            if "tokengs_grad_norm" not in out:
+                out["tokengs_grad_norm"] = grad_norm(frozen_parameters)
 
         if accelerator.sync_gradients:
             accelerator.clip_grad_norm_(model.parameters(), opt.gradient_clip)
@@ -757,8 +2000,78 @@ def train_epoch(opt, accelerator, model, optimizer, scheduler, train_dataloader,
         loss_value_detailed = {}
         for key in (
             "loss_rgb",
+            "loss_feat",
+            "loss_ce",
+            "loss_ce_cosine",
             "loss_bce",
             "loss_dice",
+            "loss_boundary_rgb",
+            "loss_instance_group",
+            "instance_group_gt_count",
+            "instance_group_matched_count",
+            "instance_group_active_count",
+            "instance_group_supervised_view_count",
+            "loss_instance_group_dice",
+            "loss_instance_group_mask",
+            "loss_instance_group_void",
+            "loss_instance_group_unmatched",
+            "loss_instance_group_ce",
+            "loss_instance_group_entropy",
+            "loss_mbm_u2r",
+            "tsh_mbm_u2r_eff",
+            "mbm_u2r_loss_x",
+            "mbm_u2r_loss_y",
+            "mbm_u2r_interior_share_x",
+            "mbm_u2r_interior_share_y",
+            "mbm_u2r_valid_share",
+            "mbm_u2r_conf_mean",
+            "mbm_u2r_depth_has_nan",
+            "tsh_per_gs_alpha",
+            "tsh_per_gs_unit_logit_diff_mean",
+            "tsh_per_gs_unit_logit_diff_max",
+            "tsh_per_gs_unit_prob_diff_mean",
+            "loss_instance_branch_rgb",
+            "loss_instance_branch_rgb_weighted",
+            "loss_unit_entropy",
+            "loss_unit_compactness",
+            "loss_unit_purity",
+            "unit_purity_monitor",
+            "loss_unit_embedding",
+            "unit_embedding_same_sim",
+            "unit_embedding_diff_sim",
+            "unit_embedding_collapse",
+            "unit_embedding_margin",
+            "unit_embedding_center_cos_mean",
+            "unit_embedding_center_margin",
+            "unit_knn_agreement",
+            "pseudo_gs_kept_ratio",
+            "pseudo_unit_kept_ratio",
+            "loss_unit_assignment",
+            "unit_assignment_match",
+            "unit_assignment_void",
+            "unit_assignment_agreement",
+            "slot_usage_entropy",
+            "loss_dpg_prototype",
+            "dpg_proto_similarity",
+            "dpg_assignment_accuracy",
+            "render_space_pull",
+            "render_space_push",
+            "render_space_cross",
+            "render_space_info_nce",
+            "instance_proto_cos",
+            "instance_proto_margin",
+            "loss_direct_gs_pull",
+            "loss_direct_gs_push",
+            "loss_direct_gs_cross",
+            "direct_gs_proto_cos",
+            "direct_gs_proto_margin",
+            "direct_gs_pixel_same",
+            "direct_gs_pixel_diff",
+            "direct_gs_pixel_gap",
+            "num_clusters",
+            "loss_instance_contrastive",
+            "loss_instance_dense_aux",
+            "loss_semantic_lifting",
             "mask_iou",
             "foreground_probability",
             "background_probability",
@@ -770,9 +2083,22 @@ def train_epoch(opt, accelerator, model, optimizer, scheduler, train_dataloader,
             "semantic_adapter_grad_norm",
             "token_adapter_grad_norm",
             "prompt_adapter_grad_norm",
+            "gaussian_feature_head_grad_norm",
+            "instance_group_head_grad_norm",
             "temperature_grad_norm",
             "last_cross_attention_grad_norm",
             "tokengs_grad_norm",
+            "gc2_assignment_entropy",
+            "gc2_assignment_max_probability",
+            "gc2_assignment_void_share",
+            "gc2_active_group_count",
+            "gc2_conditioning_residual_ratio",
+            "gc2_gaussian_abs_delta",
+            "gc2_xyz_abs_delta",
+            "gc3_gaussian_assignment_entropy",
+            "gc3_gaussian_assignment_void_share",
+            "gc4_image_anchor_valid_share",
+            "gc4_image_anchor_gate",
             "macro_miou",
             "macc",
             "temperature",
@@ -805,11 +2131,20 @@ def train_epoch(opt, accelerator, model, optimizer, scheduler, train_dataloader,
     if accelerator.is_main_process:
         print(f"[INFO] Setting RNG epoch to {epoch}")
 
-    for i, data in enumerate(iter(train_dataloader)):
-        if i >= opt.max_iters_per_epoch:
-            break
-
-        global_step = epoch * iters_per_epoch + i
+    iterator = iter(train_dataloader)
+    if sample_skip > 0:
+        if accelerator.is_main_process:
+            print(
+                f"[fork] skipping first {sample_skip} local samples "
+                "to continue from step 125"
+            )
+        for _ in range(sample_skip):
+            next(iterator)
+        if accelerator.is_main_process:
+            print(f"[fork] skip done; {epoch_iters} steps remain in epoch")
+    for i in range(epoch_iters):
+        data = next(iterator)
+        global_step = global_step_offset + i
         completed_step = global_step + 1
         if getattr(opt, "prompt_overfit_single_batch", False):
             save_after_step = completed_step in set(opt.prompt_visualization_steps)
@@ -852,6 +2187,56 @@ def train_epoch(opt, accelerator, model, optimizer, scheduler, train_dataloader,
                 except: 
                     pass
 
+        if bool(getattr(opt, "tsh_ddp8", False)) and os.environ.get(
+            "TOKENG_DDP_TRACE", "0"
+        ) == "1" and completed_step % max(1, opt.print_freq) == 0:
+            trace_dir = os.path.join(opt.workspace, ".ddp_trace")
+            os.makedirs(trace_dir, exist_ok=True)
+            scene = (
+                str(data["scene_name"][0])
+                if "scene_name" in data
+                else "?"
+            )
+            rank = int(getattr(accelerator, "process_index", -1))
+            with open(
+                os.path.join(trace_dir, "rank_samples.txt"),
+                "a",
+                encoding="utf-8",
+            ) as handle:
+                handle.write(
+                    f"rank={rank} step={completed_step} epoch={epoch} "
+                    f"scene={scene}\n"
+                )
+            import hashlib
+
+            unwrapped = accelerator.unwrap_model(model)
+            digest = hashlib.sha256()
+            hash_prefixes = (
+                "absolute_gs_head.",
+                "tsh_instance_head.",
+            )
+            if bool(getattr(opt, "tsh_per_gs_refine", False)):
+                hash_prefixes = hash_prefixes + (
+                    "tsh_slot_refine_head.",
+                )
+            for name, param in unwrapped.named_parameters():
+                if name.startswith(hash_prefixes):
+                    digest.update(
+                        name.encode()
+                        + param.detach().float().cpu().contiguous()
+                        .numpy()
+                        .tobytes()
+                    )
+            with open(
+                os.path.join(trace_dir, "rank_hashes.txt"),
+                "a",
+                encoding="utf-8",
+            ) as handle:
+                handle.write(
+                    f"rank={rank} step={completed_step} "
+                    f"sha={digest.hexdigest()}\n"
+                )
+
         if accelerator.is_main_process:
             # logging
             if completed_step % opt.print_freq == 0:
@@ -866,16 +2251,82 @@ def train_epoch(opt, accelerator, model, optimizer, scheduler, train_dataloader,
                     f"{key}={value.item():.6f}"
                     for key, value in loss_value_detailed.items()
                 )
-                print(f"[INFO] step={completed_step} epoch={epoch} {i}/{iters_per_epoch} mem: {memory} lr: {scheduler.get_last_lr()[0]:.10f} loss: {loss_value.item():.6f} {details} psnr={psnr_value.item():.4f} speed: {speed:.2f} it/s")
+                if bool(
+                    getattr(opt, "abs_joint_guarded", False)
+                ) or bool(getattr(opt, "abs_true_shared_units", False)):
+                    lr_str = str(
+                        [group["lr"] for group in optimizer.param_groups]
+                    )
+                else:
+                    lr_str = f"{scheduler.get_last_lr()[0]:.10f}"
+                print(f"[INFO] step={completed_step} epoch={epoch} {i}/{epoch_iters} mem: {memory} lr: {lr_str} loss: {loss_value.item():.6f} {details} psnr={psnr_value.item():.4f} speed: {speed:.2f} it/s")
                 log_time = time.time()
+        if (
+            accelerator.is_main_process
+            and bool(getattr(opt, "instance_branch_abs_units", False))
+            and int(getattr(opt, "abs_ckpt_every", 0)) > 0
+            and (
+                completed_step % int(opt.abs_ckpt_every) == 0
+                or completed_step
+                in set(int(value) for value in getattr(
+                    opt, "abs_ckpt_steps_extra", ()
+                ))
+            )
+        ):
+            # Intra-epoch periodic head checkpoints for recovery/staging
+            # (optimizer state stays in the workspace-level saves).
+            ckpt_dir = os.path.join(opt.workspace, "checkpoints")
+            os.makedirs(ckpt_dir, exist_ok=True)
+            from safetensors.torch import save_file
+
+            state = {
+                key: value.detach().cpu().contiguous()
+                for key, value in accelerator.unwrap_model(model).state_dict().items()
+            }
+            save_file(
+                state,
+                os.path.join(
+                    ckpt_dir, f"model_step_{completed_step:06d}.safetensors"
+                ),
+            )
+            if bool(getattr(opt, "tsh_ddp8", False)):
+                world = int(getattr(accelerator, "num_processes", 1))
+                gbs = int(opt.batch_size) * world
+                intra_meta = {
+                    "optimizer_step": int(completed_step),
+                    "equivalent_global_samples": int(completed_step) * gbs,
+                    "epoch": int(epoch),
+                    "world_size": world,
+                    "per_gpu_batch_size": int(opt.batch_size),
+                    "global_batch_size": gbs,
+                }
+                with open(
+                    os.path.join(
+                        ckpt_dir,
+                        f"metadata_step_{completed_step:06d}.json",
+                    ),
+                    "w",
+                    encoding="utf-8",
+                ) as handle:
+                    json.dump(intra_meta, handle, indent=2)
+            print(
+                f"[abs-ckpt] saved intra-epoch head checkpoint "
+                f"step={completed_step}"
+            )
 
     total_loss = accelerator.gather_for_metrics(total_loss).mean()
     total_psnr = accelerator.gather_for_metrics(total_psnr).mean()
     
     if accelerator.is_main_process:
-        total_loss /= iters_per_epoch
-        total_psnr /= iters_per_epoch
+        total_loss /= max(1, epoch_iters)
+        total_psnr /= max(1, epoch_iters)
         accelerator.print(f"[train] epoch: {epoch} loss: {total_loss.item():.6f} psnr: {total_psnr.item():.4f}")
+        if bool(getattr(opt, "instance_branch_abs_units", False)):
+            accelerator.print(
+                f"[abs-recon-epoch] epoch={epoch} "
+                f"samples_this_epoch={epoch_iters} "
+                f"cumulative_step={global_step_offset + epoch_iters}"
+            )
 
         if opt.use_wandb:
             writer.add_scalar(f"psnr/train", total_psnr.item(), epoch)
@@ -912,12 +2363,88 @@ def log_gaussian_histograms(opt, all_gaussians, epoch, writer):
         writer.add_histogram(f'gaussian/rgb_{label}', gaussians.rgb[:, i].clamp(0, 1), global_step=epoch, bins=rgb_bins)
 
 
+def _instance_eval_stats(opt, out, data, model, accelerator):
+    """Lightweight instance proxy for the training-time eval.
+
+    The instance-group loss is gated by ``self.training`` in the model
+    forward, so the training eval never reported any instance signal. This
+    recomputes the full-strength (lambda_eff=1) Hungarian-matched BCE+Dice
+    loss and the matched/GT ratio on the target views from the rendered
+    group probabilities, giving a real-time instance quality readout during
+    training. Returns None when the head / labels are unavailable.
+    """
+    unwrapped = accelerator.unwrap_model(model)
+    head = getattr(unwrapped, "instance_group_head", None)
+    if head is None:
+        head = getattr(unwrapped, "instance_branch", None)
+    if head is None:
+        return None
+    rendered = out.get("rendered_instance_group_probability")
+    labels = data.get("instance_label_output")
+    if rendered is None or labels is None:
+        return None
+    if rendered.ndim != 6 or labels.ndim != 4:
+        return None
+    loss, stats = hungarian_instance_group_loss(
+        rendered.float(),
+        labels.long(),
+        # Void is the last rendered channel; scene-adaptive cluster counts
+        # (unit-embedding clustering) vary per scene.
+        num_groups=int(rendered.shape[1] - 1),
+        min_instance_pixels=int(
+            getattr(opt, "instance_group_min_instance_pixels", 32)
+        ),
+        dice_weight=float(getattr(opt, "lambda_instance_group_dice", 1.0)),
+        mask_weight=float(getattr(opt, "lambda_instance_group_mask", 1.0)),
+        void_weight=float(getattr(opt, "lambda_instance_group_void", 0.1)),
+        unmatched_weight=float(
+            getattr(opt, "lambda_instance_group_unmatched", 0.1)
+        ),
+        lambda_eff=1.0,
+        area_alpha=float(getattr(opt, "instance_group_area_alpha", 0.0)),
+        match_area_norm=bool(
+            getattr(opt, "instance_group_match_area_norm", False)
+        ),
+        ce_weight=float(getattr(opt, "lambda_instance_group_ce", 0.0)),
+        match_topk=int(getattr(opt, "instance_group_match_topk", 1)),
+        secondary_pair_weight=float(
+            getattr(opt, "instance_group_secondary_pair_weight", 0.3)
+        ),
+        usage_entropy_weight=float(
+            getattr(opt, "instance_group_usage_entropy", 0.0)
+        ),
+        scene_level_matching=bool(
+            getattr(opt, "instance_group_scene_level_matching", False)
+        ),
+    )
+    gt_count = float(stats["instance_group_gt_count"].detach())
+    matched_count = float(stats["instance_group_matched_count"].detach())
+    return {
+        "eval_loss_instance_group": float(loss.detach()),
+        "eval_instance_gt_count": gt_count,
+        "eval_instance_matched_count": matched_count,
+        "eval_instance_match_ratio": (
+            matched_count / gt_count if gt_count > 0 else 0.0
+        ),
+    }
+
+
 def evaluate_epoch(
     opt, accelerator, model, test_dataloader, epoch, writer, global_step=None
 ):
     """Evaluate for one epoch."""
     use_input_supervision = opt.use_input_supervision
     opt.use_input_supervision = False
+    # The instance-group lambda is updated by train_step (linear warm-up),
+    # which would wrongly scale the reported eval instance loss to ~0 during
+    # the warm-up phase. Evaluation should always report full-strength
+    # losses/metrics, so force lambda_eff = 1.0 here.
+    if hasattr(accelerator.unwrap_model(model), "instance_group_lambda_eff"):
+        accelerator.unwrap_model(model).instance_group_lambda_eff = 1.0
+    if hasattr(accelerator.unwrap_model(model), "teacher_lambda_eff"):
+        accelerator.unwrap_model(model).teacher_lambda_eff = 0.0
+    if hasattr(accelerator.unwrap_model(model), "instance_stage_eff"):
+        accelerator.unwrap_model(model).instance_stage_eff = 1.0
     with torch.inference_mode():
         model.eval()
 
@@ -925,12 +2452,16 @@ def evaluate_epoch(
         prompt_metric_totals = {}
         class_iou_totals = {}
         class_counts = {}
+        class_acc_totals = {}
         mode_iou_totals = {}
         mode_counts = {}
+        mode_acc_totals = {}
         semantic_v2_totals = {}
         semantic_v2_vectors = {}
         semantic_v2_prototype_cosine = None
         semantic_v2_region_embeddings = []
+        semantic_v2_per_class_data = None
+        instance_eval_totals = None
         all_gaussians = []
         for i, data in enumerate(iter(test_dataloader)):
             if opt.max_eval_iters > 0 and i >= opt.max_eval_iters:
@@ -939,13 +2470,39 @@ def evaluate_epoch(
                 out = model(data, compute_quality_metrics=True)
             else:
                 out = model(data)
+            instance_stats = _instance_eval_stats(
+                opt, out, data, model, accelerator
+            )
+            if instance_stats is not None:
+                if instance_eval_totals is None:
+                    instance_eval_totals = {
+                        key: 0.0 for key in instance_stats
+                    }
+                for key, value in instance_stats.items():
+                    instance_eval_totals[key] += value
             psnr = out['psnr']
             total_psnr += psnr.detach()
-            if opt.model_type == "semantic_tokengs_v2":
+            if (
+                not bool(getattr(opt, "instance_branch_abs_units", False))
+                and opt.model_type in (
+                "semantic_tokengs_v2",
+                "semantic_tokengs_v3",
+                "semantic_tokengs_v4",
+                "semantic_tokengs_v5",
+                "semantic_tokengs_v6",
+                )
+            ):
                 for key in (
                     "loss",
                     "loss_bce",
                     "loss_dice",
+                    "loss_instance_group",
+                    "instance_group_gt_count",
+                    "instance_group_matched_count",
+                    "instance_group_active_count",
+                    "instance_group_supervised_view_count",
+                    "loss_instance_dense_aux",
+                    "loss_boundary_rgb",
                     "foreground_probability",
                     "background_probability",
                     "predicted_foreground_ratio",
@@ -962,9 +2519,10 @@ def evaluate_epoch(
                     "ssim",
                     "lpips",
                 ):
-                    semantic_v2_totals[key] = (
-                        semantic_v2_totals.get(key, 0) + out[key].detach()
-                    )
+                    if key in out:
+                        semantic_v2_totals[key] = (
+                            semantic_v2_totals.get(key, 0) + out[key].detach()
+                        )
                 for key in (
                     "class_intersection",
                     "class_union",
@@ -1003,12 +2561,16 @@ def evaluate_epoch(
                                     region_embeddings[batch_index, class_index],
                                 )
                             )
-            elif getattr(opt, "prompt_training", False):
+            elif (
+                not bool(getattr(opt, "instance_branch_abs_units", False))
+                and getattr(opt, "prompt_training", False)
+            ):
                 for key in (
                     "loss",
                     "loss_bce",
                     "loss_dice",
                     "mask_iou",
+                    "mask_accuracy",
                     "foreground_probability",
                     "background_probability",
                     "predicted_foreground_ratio",
@@ -1030,14 +2592,22 @@ def evaluate_epoch(
                     intersection = (predicted & target & valid).sum().float()
                     union = ((predicted | target) & valid).sum().float()
                     sample_iou = intersection / union.clamp_min(1e-6)
+                    target_count = (target & valid).sum().float()
+                    sample_acc = intersection / target_count.clamp_min(1e-6)
                     class_iou_totals[class_id] = (
                         class_iou_totals.get(class_id, 0) + sample_iou
                     )
                     class_counts[class_id] = class_counts.get(class_id, 0) + 1
+                    class_acc_totals[class_id] = (
+                        class_acc_totals.get(class_id, 0) + sample_acc
+                    )
                     mode_iou_totals[prompt_mode] = (
                         mode_iou_totals.get(prompt_mode, 0) + sample_iou
                     )
                     mode_counts[prompt_mode] = mode_counts.get(prompt_mode, 0) + 1
+                    mode_acc_totals[prompt_mode] = (
+                        mode_acc_totals.get(prompt_mode, 0) + sample_acc
+                    )
             
             # Collect gaussians for histogram logging
             if accelerator.is_main_process:
@@ -1063,7 +2633,25 @@ def evaluate_epoch(
         total_psnr = accelerator.gather_for_metrics(total_psnr).mean()
         eval_count = min(len(test_dataloader), opt.max_eval_iters) if opt.max_eval_iters > 0 else len(test_dataloader)
         evaluation_summary = {}
-        if opt.model_type == "semantic_tokengs_v2":
+        if bool(getattr(opt, "instance_branch_abs_units", False)):
+            # Absolute student: validation only monitors reconstruction.
+            eval_psnr = float(total_psnr) / max(1, eval_count)
+            accelerator.print(
+                f"[eval] epoch: {epoch} psnr: {eval_psnr:.4f} "
+                f"(count={eval_count})"
+            )
+            return {
+                "psnr": eval_psnr,
+                "mask_iou": 0.0,
+                "loss": 0.0,
+            }
+        if opt.model_type in (
+            "semantic_tokengs_v2",
+            "semantic_tokengs_v3",
+            "semantic_tokengs_v4",
+            "semantic_tokengs_v5",
+            "semantic_tokengs_v6",
+        ):
             count = max(1, eval_count)
             intersection = semantic_v2_vectors["class_intersection"]
             union = semantic_v2_vectors["class_union"]
@@ -1074,6 +2662,13 @@ def evaluate_epoch(
             per_class_recall = intersection / target_count.clamp_min(1e-6)
             per_class_pred_ratio = predicted_count / valid_count.clamp_min(1e-6)
             per_class_gt_ratio = target_count / valid_count.clamp_min(1e-6)
+            semantic_v2_per_class_data = {
+                ("wall", "floor", "ceiling", "chair", "table", "sofa", "bed", "other")[class_index]: {
+                    "mask_iou": float(per_class_iou[class_index].item()),
+                    "mask_acc": float(per_class_recall[class_index].item()),
+                }
+                for class_index in range(8)
+            }
             per_class_fg_probability = (
                 semantic_v2_vectors["class_foreground_probability_sum"]
                 / target_count.clamp_min(1e-6)
@@ -1119,15 +2714,58 @@ def evaluate_epoch(
                     ),
                 }
             )
+        if instance_eval_totals is not None:
+            eval_count_instance = (
+                min(len(test_dataloader), opt.max_eval_iters)
+                if opt.max_eval_iters > 0
+                else len(test_dataloader)
+            )
+            eval_count_instance = max(1, eval_count_instance)
+            for key, value in instance_eval_totals.items():
+                evaluation_summary[key] = value / eval_count_instance
         elif getattr(opt, "prompt_training", False):
             evaluation_summary = {
                 key: float((value / max(1, eval_count)).item())
                 for key, value in prompt_metric_totals.items()
             }
+            if class_counts:
+                class_ids = sorted(class_counts)
+                macro_miou = sum(
+                    class_iou_totals[class_id] / class_counts[class_id]
+                    for class_id in class_ids
+                ) / len(class_ids)
+                macro_acc = sum(
+                    class_acc_totals[class_id] / class_counts[class_id]
+                    for class_id in class_ids
+                ) / len(class_ids)
+                evaluation_summary["macro_miou"] = float(macro_miou.item())
+                evaluation_summary["macc"] = float(macro_acc.item())
         if accelerator.is_main_process:
             total_psnr /= max(1, eval_count)
             accelerator.print(f"[eval] epoch: {epoch} psnr: {total_psnr:.4f}")
-            if opt.model_type == "semantic_tokengs_v2":
+            if instance_eval_totals is not None:
+                step_text = "none" if global_step is None else str(global_step)
+                instance_text = " ".join(
+                    f"{key}={evaluation_summary[key]:.4f}"
+                    for key in (
+                        "eval_loss_instance_group",
+                        "eval_instance_match_ratio",
+                        "eval_instance_gt_count",
+                        "eval_instance_matched_count",
+                    )
+                    if key in evaluation_summary
+                )
+                accelerator.print(
+                    f"[eval-instance] step={step_text} epoch={epoch} "
+                    f"{instance_text}"
+                )
+            if opt.model_type in (
+                "semantic_tokengs_v2",
+                "semantic_tokengs_v3",
+                "semantic_tokengs_v4",
+                "semantic_tokengs_v5",
+                "semantic_tokengs_v6",
+            ):
                 step_text = "none" if global_step is None else str(global_step)
                 scalar_text = " ".join(
                     f"{key}={value:.6f}"
@@ -1234,16 +2872,27 @@ def evaluate_epoch(
                 )
                 for class_id in sorted(class_counts):
                     class_iou = class_iou_totals[class_id] / class_counts[class_id]
+                    class_acc = class_acc_totals[class_id] / class_counts[class_id]
                     accelerator.print(
                         f"[eval-class] step={step_text} class_id={class_id} "
                         f"class_name={class_names[class_id - 1]} "
-                        f"count={class_counts[class_id]} mask_iou={class_iou.item():.6f}"
+                        f"count={class_counts[class_id]} mask_iou={class_iou.item():.6f} "
+                        f"mask_acc={class_acc.item():.6f}"
                     )
                 for prompt_mode in sorted(mode_counts):
                     mode_iou = mode_iou_totals[prompt_mode] / mode_counts[prompt_mode]
+                    mode_acc = mode_acc_totals[prompt_mode] / mode_counts[prompt_mode]
                     accelerator.print(
                         f"[eval-mode] step={step_text} prompt_mode={prompt_mode} "
-                        f"count={mode_counts[prompt_mode]} mask_iou={mode_iou.item():.6f}"
+                        f"count={mode_counts[prompt_mode]} mask_iou={mode_iou.item():.6f} "
+                        f"mask_acc={mode_acc.item():.6f}"
+                    )
+                if class_counts:
+                    accelerator.print(
+                        f"[eval-prompt-macro] step={step_text} epoch={epoch} "
+                        f"macro_miou={evaluation_summary['macro_miou']:.6f} "
+                        f"macc={evaluation_summary['macc']:.6f} "
+                        f"mask_accuracy={evaluation_summary['mask_accuracy']:.6f}"
                     )
 
             if opt.use_wandb:
@@ -1252,6 +2901,52 @@ def evaluate_epoch(
                 # Log Gaussian property histograms
                 if len(all_gaussians) > 0:
                     log_gaussian_histograms(opt, all_gaussians, epoch, writer)
+
+    if accelerator.is_main_process and getattr(opt, "evaluating", False):
+        metrics_payload = {
+            "evaluation_summary": {
+                key: float(value)
+                for key, value in evaluation_summary.items()
+            },
+            "psnr": float(total_psnr.item()),
+            "num_samples": int(eval_count),
+            "per_class": {},
+            "per_mode": {},
+        }
+        if semantic_v2_per_class_data is not None:
+            metrics_payload["per_class"] = semantic_v2_per_class_data
+        if class_counts:
+            metrics_payload["per_class"] = {
+                class_names[class_id - 1]: {
+                    "count": int(class_counts[class_id]),
+                    "mask_iou": float(
+                        (class_iou_totals[class_id] / class_counts[class_id]).item()
+                    ),
+                    "mask_acc": float(
+                        (class_acc_totals[class_id] / class_counts[class_id]).item()
+                    ),
+                }
+                for class_id in sorted(class_counts)
+            }
+        if mode_counts:
+            metrics_payload["per_mode"] = {
+                prompt_mode: {
+                    "count": int(mode_counts[prompt_mode]),
+                    "mask_iou": float(
+                        (mode_iou_totals[prompt_mode] / mode_counts[prompt_mode]).item()
+                    ),
+                    "mask_acc": float(
+                        (mode_acc_totals[prompt_mode] / mode_counts[prompt_mode]).item()
+                    ),
+                }
+                for prompt_mode in sorted(mode_counts)
+            }
+        metrics_path = os.path.join(opt.workspace, "eval_metrics.json")
+        with open(metrics_path, "w", encoding="utf-8") as handle:
+            json.dump(metrics_payload, handle, indent=2)
+        accelerator.print(
+            f"[eval-metrics] saved to {os.path.abspath(metrics_path)}"
+        )
 
     opt.use_input_supervision = use_input_supervision
     return evaluation_summary
@@ -1263,10 +2958,31 @@ def main():
 
     torch.manual_seed(opt.seed)
 
+    ddp_kwargs = None
+    if (
+        bool(getattr(opt, "abs_true_shared_units", False))
+        and (
+            str(getattr(opt, "tsh_mbm_mode", "off")) != "off"
+            or float(getattr(opt, "tsh_mbm_decoder_tail_lr", 0.0)) > 0.0
+        )
+    ):
+        # The SIU3R-MBM forward runs the frozen old-GS teacher inside a
+        # no_grad block and the shared decoder tail a second time with
+        # autograd inside the same DDP forward.  DDP's default reducer
+        # mis-detects those decoder-tail parameters as unused; the
+        # find_unused_parameters pass resolves it (trainable params are
+        # still used every step; legacy m0/m4 runs are unaffected).
+        from accelerate.utils import DistributedDataParallelKwargs
+
+        ddp_kwargs = DistributedDataParallelKwargs(
+            find_unused_parameters=True
+        )
+
     accelerator = Accelerator(
         mixed_precision=opt.mixed_precision,
         gradient_accumulation_steps=opt.gradient_accumulation_steps,
         dataloader_config=DataLoaderConfiguration(use_seedable_sampler=True),
+        kwargs_handlers=[ddp_kwargs] if ddp_kwargs is not None else None,
     )
 
     # Setup workspace and status
@@ -1286,7 +3002,13 @@ def main():
                 "[prompt-loss] BCE input: rendered sigmoid probability clamped to "
                 "[eps, 1-eps]; target is a binary mask (BCEWithLogitsLoss is not used)"
             )
-            if opt.model_type == "semantic_tokengs_v2":
+            if opt.model_type in (
+                "semantic_tokengs_v2",
+                "semantic_tokengs_v3",
+                "semantic_tokengs_v4",
+                "semantic_tokengs_v5",
+                "semantic_tokengs_v6",
+            ):
                 bce_reduction = (
                     "per-class positive/negative balanced mean"
                     if opt.semantic_v2_balanced_bce
@@ -1314,10 +3036,13 @@ def main():
             print(f"[INFO] Config saved to {config_save_path=}")
 
     # model
+    apply_checkpoint_architecture(opt)
     model = model_registry[opt.model_type](opt)
 
     # Load model checkpoint
     load_model_checkpoint(opt, model, accelerator, epoch_start)
+    load_fresh_backbone_resume(opt, model, accelerator)
+    load_semantic_adapter_resume(opt, model, accelerator)
     
     # Data
     train_dataloader, test_dataloader, train_dataset, test_dataset = get_multi_dataloader(opt, accelerator)
@@ -1332,6 +3057,14 @@ def main():
 
     # Compute per-GPU iterations from the prepared (sharded) dataloader
     iters_per_epoch = min(len(train_dataloader), opt.max_iters_per_epoch)
+    if bool(getattr(opt, "tsh_ddp8", False)):
+        accelerator.print(
+            f"[ddp8] rank={getattr(accelerator, 'process_index', -1)} "
+            f"world={int(getattr(accelerator, 'num_processes', 1))} "
+            f"local_dataloader_len={len(train_dataloader)} "
+            f"iters_per_epoch={iters_per_epoch} "
+            f"train_dataset_len={len(train_dataset)}"
+        )
 
     if opt.evaluating:
         os.makedirs(opt.workspace, exist_ok=True)
@@ -1382,10 +3115,27 @@ def main():
             )
 
     epoch = epoch_start
+    fork_step = int(getattr(opt, "tsh_fork_continue_step", 0))
+    fork_pending = fork_step > 0
+    if fork_pending:
+        # Common warm-up workspace saved metadata epoch=0/step=125; resume
+        # mid-epoch instead of jumping to epoch 1.
+        epoch_start = 0
+        epoch = 0
+        load_fork_rng_state(opt, accelerator)
     while epoch < opt.num_epochs:
         # train
+        offset = (
+            fork_step
+            if fork_pending
+            else epoch * iters_per_epoch
+        )
+        sample_skip = fork_step if fork_pending else 0
         train_epoch(opt, accelerator, model, optimizer, scheduler, train_dataloader, 
-                    iters_per_epoch, epoch, writer, start_time, train_dataset)
+                    iters_per_epoch, epoch, writer, start_time, train_dataset,
+                    global_step_offset=offset,
+                    sample_skip=sample_skip)
+        fork_pending = False
         
         # checkpoint
         global_step = (epoch + 1) * iters_per_epoch
@@ -1399,6 +3149,7 @@ def main():
             wandb_run_id,
             global_step,
         )
+        save_fork_rng_state(opt, accelerator, epoch, global_step)
 
         # eval
         if not getattr(opt, "prompt_overfit_single_batch", False):
@@ -1412,12 +3163,25 @@ def main():
                 global_step=global_step,
             )
             if getattr(opt, "prompt_training", False):
-                selection_metric = (
-                    "argmax_macro_miou"
-                    if opt.model_type == "semantic_tokengs_v2"
-                    and opt.semantic_v2_score_mode == "softmax"
-                    else "mask_iou"
-                )
+                if bool(
+                    getattr(opt, "instance_branch_abs_units", False)
+                ):
+                    # Absolute student: select the best checkpoint by
+                    # reconstruction PSNR, not semantic mask IoU.
+                    selection_metric = "psnr"
+                else:
+                    selection_metric = (
+                        "argmax_macro_miou"
+                        if opt.model_type in (
+                            "semantic_tokengs_v2",
+                            "semantic_tokengs_v3",
+                            "semantic_tokengs_v4",
+                            "semantic_tokengs_v5",
+                            "semantic_tokengs_v6",
+                        )
+                        and opt.semantic_v2_score_mode == "softmax"
+                        else "mask_iou"
+                    )
                 current_iou = float(validation_metrics[selection_metric])
                 is_best = current_iou > best_prompt_iou
                 save_prompt_validation_checkpoint(

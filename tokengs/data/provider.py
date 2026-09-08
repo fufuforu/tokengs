@@ -33,6 +33,7 @@ from tokengs.data.datafield import (
     DF_FRAME_IDS,
     DF_SCENE_NAME,
     DF_SEMANTIC_LABEL,
+    DF_INSTANCE_LABEL,
 )
 
 
@@ -66,6 +67,7 @@ class Provider(Dataset):
                     "query_image_size": opt.query_image_size,
                     "prompt_image_probability": opt.prompt_image_probability,
                     "prompt_min_target_pixels": opt.prompt_min_target_pixels,
+                    "query_same_scene_min_gap": opt.prompt_same_scene_query_min_gap,
                 }
             )
         if getattr(dataset_entry['cls'], "has_explicit_split", False):
@@ -105,6 +107,11 @@ class Provider(Dataset):
             self.data_fields.append(DF_DEPTH)
         if getattr(self.dataset, "has_semantic_labels", False):
             self.data_fields.append(DF_SEMANTIC_LABEL)
+        if (
+            getattr(self.opt, "use_instance_labels", False)
+            and getattr(self.dataset, "has_instance_labels", False)
+        ):
+            self.data_fields.append(DF_INSTANCE_LABEL)
 
     def set_rng_epoch(self, epoch: int) -> None:
         self.rng = np.random.default_rng(epoch + self.opt.seed)
@@ -193,6 +200,7 @@ class Provider(Dataset):
         timesteps,
         has_mask,
         semantic_labels=None,
+        instance_labels=None,
         scene_name=None,
         frame_ids=None,
     ):
@@ -203,6 +211,9 @@ class Provider(Dataset):
         rgbs, shift, scale, flip_flag = self.image_transform.preprocess_images(rgbs)
         semantic_labels = self._transform_index_labels(
             semantic_labels, rgbs.shape[-2:]
+        )
+        instance_labels = self._transform_index_labels(
+            instance_labels, rgbs.shape[-2:]
         )
         masks, _, _, _ = self.image_transform.preprocess_images(masks)
         depths, _, _, _ = self.image_transform.preprocess_images(depths)
@@ -286,6 +297,10 @@ class Provider(Dataset):
             output['semantic_label_all'] = semantic_labels
             output['semantic_label_input'] = semantic_labels[:self.opt.num_input_views]
             output['semantic_label_output'] = semantic_labels[self.opt.num_input_views:]
+        if instance_labels is not None:
+            output['instance_label_all'] = instance_labels
+            output['instance_label_input'] = instance_labels[:self.opt.num_input_views]
+            output['instance_label_output'] = instance_labels[self.opt.num_input_views:]
         if scene_name is not None:
             output['scene_name'] = scene_name
         if frame_ids is not None:
@@ -426,6 +441,8 @@ class Provider(Dataset):
         return rgbs, masks, depths, c2ws, intrinsics, timesteps
 
     def get_item(self, idx):
+        if hasattr(self.dataset, "training"):
+            self.dataset.training = self.training
         if hasattr(self.dataset, 'get_context_target_frames'):
             _get_indices_fn = self._get_indices_eval
             # Use special curate function for dynamic evaluation datasets
@@ -455,6 +472,7 @@ class Provider(Dataset):
 
         all_rgbs, all_c2ws, all_intrinsics, all_masks, all_depths = original_output_dict[DF_IMAGE_RGB], original_output_dict[DF_CAMERA_C2W_TRANSFORM], original_output_dict[DF_CAMERA_INTRINSICS], original_output_dict[DF_FOREGROUND_MASK], original_output_dict[DF_DEPTH]
         semantic_labels = original_output_dict.get(DF_SEMANTIC_LABEL)
+        instance_labels = original_output_dict.get(DF_INSTANCE_LABEL)
         scene_name = original_output_dict.get(DF_SCENE_NAME)
         raw_frame_ids = original_output_dict.get(DF_FRAME_IDS)
 
@@ -469,6 +487,7 @@ class Provider(Dataset):
             timesteps,
             has_mask,
             semantic_labels=semantic_labels,
+            instance_labels=instance_labels,
             scene_name=scene_name,
             frame_ids=raw_frame_ids,
         )

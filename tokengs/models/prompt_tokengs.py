@@ -28,8 +28,8 @@ class PromptTokenGS(TokenGS):
     def __init__(self, opt):
         if not getattr(opt, "prompt_training", False):
             raise ValueError("PromptTokenGS requires prompt_training=True")
-        if int(opt.num_gs_tokens) != 1024:
-            raise ValueError("PromptTokenGS requires num_gs_tokens=1024")
+        if int(opt.num_gs_tokens) <= 0:
+            raise ValueError("num_gs_tokens must be positive")
         super().__init__(opt)
 
         self.num_gaussians_per_token = int(self.opt.dec_patch_size) ** 2
@@ -45,6 +45,7 @@ class PromptTokenGS(TokenGS):
             num_heads=self.opt.prompt_attention_heads,
             mixed_text_weight=self.opt.prompt_mixed_text_weight,
             image_pooling=self.opt.prompt_image_pooling,
+            text_adapter=bool(self.opt.prompt_text_adapter),
         )
         self.semantic_last_decoder = (
             deepcopy(self.enc_dec_backbone.decoder_blocks[-1])
@@ -67,6 +68,13 @@ class PromptTokenGS(TokenGS):
         )
 
     def _load_pretrained_tokengs(self, checkpoint_path: str) -> None:
+        if not checkpoint_path:
+            print(
+                "[PromptTokenGS] training TokenGS from scratch: no "
+                "pretrained checkpoint (random encoder/decoder/GS-token "
+                "initialization)"
+            )
+            return
         path = Path(checkpoint_path)
         if not path.is_file():
             raise FileNotFoundError(f"Pretrained TokenGS checkpoint is unavailable: {path}")
@@ -79,6 +87,14 @@ class PromptTokenGS(TokenGS):
             for key in set(current) & set(checkpoint)
             if checkpoint[key].shape != current[key].shape
         )
+        token_mismatch = (
+            "gs_tokens" in checkpoint
+            and "gs_tokens" in current
+            and checkpoint["gs_tokens"].shape != current["gs_tokens"].shape
+        )
+        mismatched = [
+            item for item in mismatched if item[0] != "gs_tokens"
+        ]
         checkpoint_token_shape = tuple(checkpoint.get("gs_tokens", torch.empty(0)).shape)
         current_token_shape = tuple(current["gs_tokens"].shape)
         print(f"[PromptTokenGS] pretrained checkpoint: {path}")
@@ -87,24 +103,42 @@ class PromptTokenGS(TokenGS):
         print(f"[PromptTokenGS] missing keys: {missing}")
         print(f"[PromptTokenGS] unexpected keys: {unexpected}")
         print(f"[PromptTokenGS] shape-mismatched keys: {mismatched}")
-        if checkpoint_token_shape != (1024, 1024):
+        if checkpoint_token_shape[1:] != (1024,):
             raise RuntimeError(
-                f"Expected checkpoint gs_tokens [1024,1024], got {checkpoint_token_shape}"
+                f"Expected checkpoint gs_tokens [*,1024], got {checkpoint_token_shape}"
             )
-        if current_token_shape != checkpoint_token_shape:
-            raise RuntimeError(
-                "Configured GS tokens do not exactly match the pretrained checkpoint"
+        if token_mismatch:
+            old_count = checkpoint_token_shape[0]
+            new_count = current_token_shape[0]
+            resized = current["gs_tokens"].clone()
+            if new_count >= old_count:
+                resized[:old_count].copy_(checkpoint["gs_tokens"])
+                extra = new_count - old_count
+                repeat_factor = (extra + old_count - 1) // old_count
+                expanded = checkpoint["gs_tokens"].repeat(repeat_factor, 1)[:extra]
+                resized[old_count:] = expanded + 0.01 * torch.randn_like(
+                    expanded
+                )
+            else:
+                indices = torch.linspace(0, old_count - 1, new_count).long()
+                resized.copy_(checkpoint["gs_tokens"][indices])
+            checkpoint["gs_tokens"] = resized
+            print(
+                f"[PromptTokenGS] resized gs_tokens: {old_count} -> {new_count}"
             )
         if missing or unexpected or mismatched:
             raise RuntimeError("Pretrained TokenGS checkpoint failed strict validation")
         with torch.no_grad():
             for key, value in checkpoint.items():
-                current[key].copy_(value)
+                if key in current and current[key].shape == value.shape:
+                    current[key].copy_(value)
 
     def _freeze_for_prompt_training(self) -> None:
         self.requires_grad_(False)
         self.prompt_matcher.prompt_encoder.requires_grad_(False)
         self.prompt_matcher.matching_decoder.requires_grad_(True)
+        if self.prompt_matcher.prompt_adapter is not None:
+            self.prompt_matcher.prompt_adapter.requires_grad_(True)
         if self.semantic_last_decoder is not None:
             self.semantic_last_decoder.gs_cross_attn.requires_grad_(True)
             self.semantic_last_decoder.gs_cross_attn_scale.requires_grad_(True)
@@ -129,6 +163,10 @@ class PromptTokenGS(TokenGS):
                 self.prompt_matcher.matching_decoder.parameters()
             )
         }
+        if self.prompt_matcher.prompt_adapter is not None:
+            groups["prompt_adapter"] = list(
+                self.prompt_matcher.prompt_adapter.parameters()
+            )
         if self.semantic_last_decoder is not None:
             groups["last_cross_attention"] = [
                 parameter
@@ -154,28 +192,18 @@ class PromptTokenGS(TokenGS):
         strict: bool = True,
         assign: bool = False,
     ) -> nn.modules.module._IncompatibleKeys:
-        del assign
-        current = self.state_dict()
-        missing = sorted(set(current) - set(state_dict))
-        unexpected = sorted(set(state_dict) - set(current))
-        mismatched = sorted(
-            key
-            for key in set(current) & set(state_dict)
-            if current[key].shape != state_dict[key].shape
-        )
-        if strict and (missing or unexpected or mismatched):
-            raise RuntimeError(
-                "PromptTokenGS checkpoint mismatch: "
-                f"missing={missing}, unexpected={unexpected}, "
-                f"shape_mismatched={mismatched}"
-            )
-        with torch.no_grad():
-            for key in set(current) & set(state_dict):
-                if current[key].shape == state_dict[key].shape:
-                    current[key].copy_(state_dict[key])
-        return nn.modules.module._IncompatibleKeys(
-            missing, unexpected + mismatched
-        )
+        # DINOv2 is a frozen external extractor loaded lazily; if an older
+        # checkpoint saved its weights (instance_branch._dino_model.*), they
+        # are not part of the trainable model and are ignored.  Delegate to
+        # the base implementation (which copies into the real parameters,
+        # unlike the previous manual copy from a state_dict() snapshot that
+        # silently no-op'd).
+        filtered = {
+            key: value
+            for key, value in state_dict.items()
+            if not key.startswith("instance_branch._dino_model.")
+        }
+        return super().load_state_dict(filtered, strict=strict, assign=assign)
 
     def _forward_prompt_reconstruction(self, model_input):
         """Keep geometry frozen and optionally adapt a copied semantic last layer."""
@@ -191,7 +219,11 @@ class PromptTokenGS(TokenGS):
 
         with torch.no_grad():
             encoder_latent = super().forward_encoder(model_input.encoder)
-            hidden = super().get_gs_tokens(encoder_latent.keys.shape[0])
+            hidden = super().get_gs_tokens(
+                encoder_latent.keys.shape[0],
+                encoder_latent=encoder_latent,
+                decoder_input=model_input.decoder,
+            )
             hidden = super()._apply_time_embedding_to_gs_tokens(
                 hidden, model_input.decoder
             )
@@ -328,21 +360,30 @@ class PromptTokenGS(TokenGS):
             self._forward_prompt_reconstruction(model_input)
         )
 
-        if gs_token_hidden.shape[1:] != (1024, 1024):
+        if gs_token_hidden.ndim != 3 or gs_token_hidden.shape[-1] != 1024:
             raise RuntimeError(
-                f"Expected gs_token_hidden [B,1024,1024], got {tuple(gs_token_hidden.shape)}"
+                f"Expected gs_token_hidden [B,T,1024], got {tuple(gs_token_hidden.shape)}"
             )
-        if reconstruction.gaussians.shape[1] != 65_536:
+        expected_gaussians = (
+            int(self.opt.num_gs_tokens) * int(self.num_gaussians_per_token)
+        )
+        if reconstruction.gaussians.shape[1] != expected_gaussians:
             raise RuntimeError(
-                f"Expected 65,536 Gaussians, got {reconstruction.gaussians.shape[1]}"
+                f"Expected {expected_gaussians} Gaussians, got "
+                f"{reconstruction.gaussians.shape[1]}"
             )
 
-        prompt_embedding = self._encode_prompt_batch(data).detach()
+        prompt_embedding = self.prompt_matcher.apply_prompt_adapter(
+            self._encode_prompt_batch(data).detach()
+        )
         token_logits = self.prompt_matcher.matching_decoder(
             self._matching_hidden(gs_token_hidden), prompt_embedding
         )
-        if token_logits.shape[-1] != 1024:
-            raise RuntimeError(f"Expected token_logits [B,Q,1024], got {token_logits.shape}")
+        if token_logits.shape[-1] != int(self.opt.num_gs_tokens):
+            raise RuntimeError(
+                f"Expected token_logits [B,Q,{self.opt.num_gs_tokens}], "
+                f"got {token_logits.shape}"
+            )
         gaussian_scores = token_scores_to_gaussians(
             token_logits, self.num_gaussians_per_token
         )
@@ -368,6 +409,8 @@ class PromptTokenGS(TokenGS):
             valid_mask,
             lambda_bce=self.opt.prompt_lambda_bce,
             lambda_dice=self.opt.prompt_lambda_dice,
+            balance_classes=bool(self.opt.prompt_balanced_bce),
+            pos_weight=self.opt.prompt_balanced_bce_pos_weight,
         )
         mask_metrics = compute_prompt_mask_metrics(
             rendered_probability,

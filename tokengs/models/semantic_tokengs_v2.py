@@ -193,7 +193,11 @@ class SemanticTokenGSv2(TokenGS):
 
         with torch.no_grad():
             encoder_latent = super().forward_encoder(model_input.encoder)
-            hidden = super().get_gs_tokens(encoder_latent.keys.shape[0])
+            hidden = super().get_gs_tokens(
+                encoder_latent.keys.shape[0],
+                encoder_latent=encoder_latent,
+                decoder_input=model_input.decoder,
+            )
             hidden = super()._apply_time_embedding_to_gs_tokens(
                 hidden, model_input.decoder
             )

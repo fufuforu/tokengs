@@ -191,6 +191,42 @@ class PromptEncoder(nn.Module):
         embedding = F.normalize(embedding.float(), dim=-1)
         return embedding.reshape(batch_size, query_count, self.output_dim)
 
+    def encode_dense_features(self, images: torch.Tensor) -> torch.Tensor:
+        """Return normalized CLIP patch features [B, V, G, G, C].
+
+        Runs the frozen CLIP vision tower at its native resolution and returns
+        the projected, L2-normalized patch tokens (CLS excluded). These serve
+        as a dense open-vocabulary teacher for per-Gaussian feature lifting.
+        """
+        if images.ndim == 4:
+            images = images[:, None]
+        if images.ndim != 5 or images.shape[2] != 3:
+            raise ValueError(
+                "images must have shape [B,3,H,W] or [B,V,3,H,W]"
+            )
+        batch_size, view_count = images.shape[:2]
+        flat = images.flatten(0, 1).float()
+        flat = flat.clamp(0.0, 1.0)
+        flat = self._preprocess_images(flat)
+        device = next(self.clip_model.parameters()).device
+        flat = flat.to(device)
+        with torch.no_grad():
+            vision_output = self.clip_model.vision_model(pixel_values=flat)
+            patch_tokens = vision_output.last_hidden_state[:, 1:]
+            patch_tokens = self.clip_model.vision_model.post_layernorm(
+                patch_tokens
+            )
+            patch_tokens = self.clip_model.visual_projection(patch_tokens)
+        patch_tokens = F.normalize(patch_tokens.float(), dim=-1)
+        grid_size = int(round(patch_tokens.shape[1] ** 0.5))
+        if grid_size * grid_size != patch_tokens.shape[1]:
+            raise ValueError(
+                f"CLIP patch layout is not square: {patch_tokens.shape[1]}"
+            )
+        return patch_tokens.reshape(
+            batch_size, view_count, grid_size, grid_size, -1
+        )
+
     def forward(
         self,
         mode: PromptMode,
@@ -295,6 +331,31 @@ class PromptGaussianDecoder(nn.Module):
             dim=-1,
         )
         return self.matching_head(pair_features).squeeze(-1)
+
+
+class PromptTextAdapter(nn.Module):
+    """Trainable residual MLP that de-entangles frozen CLIP prompt embeddings.
+
+    Raw CLIP embeddings for coarse semantic classes (e.g. the C3G8 names) are
+    heavily entangled; this adapter learns a small residual correction in the
+    same dimension so the matching decoder can separate classes during training.
+    """
+
+    def __init__(self, input_dim: int = 512, hidden_dim: int = 512):
+        super().__init__()
+        self.input_norm = nn.LayerNorm(input_dim)
+        self.residual_mlp = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, input_dim),
+        )
+        self.output_norm = nn.LayerNorm(input_dim)
+
+    def forward(self, embeddings: torch.Tensor) -> torch.Tensor:
+        adapted = self.output_norm(
+            embeddings + self.residual_mlp(self.input_norm(embeddings.float()))
+        )
+        return F.normalize(adapted.float(), dim=-1)
 
 
 class ConditionalQueryDecoder(nn.Module):
@@ -449,6 +510,7 @@ class PromptConditionedTokenMatcher(nn.Module):
         num_heads: int = 4,
         mixed_text_weight: float = 0.5,
         image_pooling: ImagePoolingMode = "masked_patch",
+        text_adapter: bool = False,
     ):
         super().__init__()
         self.prompt_encoder = PromptEncoder(
@@ -459,6 +521,12 @@ class PromptConditionedTokenMatcher(nn.Module):
             prompt_dim=self.prompt_encoder.output_dim,
             hidden_dim=hidden_dim,
             num_heads=num_heads,
+        )
+        self.text_adapter_enabled = bool(text_adapter)
+        self.prompt_adapter = (
+            PromptTextAdapter(self.prompt_encoder.output_dim)
+            if self.text_adapter_enabled
+            else None
         )
         if not 0.0 <= mixed_text_weight <= 1.0:
             raise ValueError("mixed_text_weight must be in [0, 1]")
@@ -479,10 +547,14 @@ class PromptConditionedTokenMatcher(nn.Module):
 
     def trainable_state_dict(self) -> OrderedDict[str, torch.Tensor]:
         """Return only matching weights; frozen CLIP weights are loaded locally."""
-        return OrderedDict(
+        state = OrderedDict(
             (f"matching_decoder.{name}", value)
             for name, value in self.matching_decoder.state_dict().items()
         )
+        if self.prompt_adapter is not None:
+            for name, value in self.prompt_adapter.state_dict().items():
+                state[f"prompt_adapter.{name}"] = value
+        return state
 
     def state_dict(self, *args, **kwargs) -> OrderedDict[str, torch.Tensor]:
         """Keep local frozen CLIP weights out of standard training checkpoints."""
@@ -501,6 +573,13 @@ class PromptConditionedTokenMatcher(nn.Module):
             for name, value in state_dict.items()
         }
         return self.matching_decoder.load_state_dict(matching_state, strict=strict)
+
+    def apply_prompt_adapter(
+        self, prompt_embedding: torch.Tensor
+    ) -> torch.Tensor:
+        if self.prompt_adapter is None:
+            return prompt_embedding
+        return self.prompt_adapter(prompt_embedding)
 
     def load_state_dict(
         self,
