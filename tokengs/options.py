@@ -308,6 +308,9 @@ class Options:
     # Extra intra-epoch optimizer steps that also save head checkpoints
     # (ddp8 metadata included).  Empty by default.
     abs_ckpt_steps_extra: tuple[int, ...] = ()
+    # Save optimizer/scheduler/per-rank RNG and provenance sidecars for
+    # intra-epoch snapshots when an independently resumable probe needs them.
+    abs_ckpt_full_state: bool = False
     # Dedicated rendered-space instance feature (InstanceSplat-style
     # grounding): an explicit instance head on the 8 local units, propagated
     # to GS, rendered to 2D feature maps and supervised by per-view GT
@@ -9046,13 +9049,71 @@ config_defaults["semantic_v6_absolute_units_true_shared_ta_riu_v1_ddp8"] = confi
     tsh_abs_lr=0.0,
     tsh_instance_lr=3.0e-5,
     tsh_unit_gradient_multiplier_max=1.0,
+    abs_bootstrap_steps=0,
+    abs_teacher_decay_steps=0,
+    abs_teacher_gs_weight=0.0,
+    abs_teacher_rgb_weight=0.0,
     prompt_unfreeze_tokengs=False,
     num_epochs=1,
     max_iters_per_epoch=200,
     abs_ckpt_every=200,
     abs_ckpt_steps_extra=(1, 5, 25, 50, 100),
+    abs_ckpt_full_state=False,
     workspace="workspace/semantic_v6_absolute_units_true_shared_ta_riu_v1_ddp8",
     experiment_name="semantic_v6_absolute_units_true_shared_ta_riu_v1_ddp8",
+)
+
+config_doc["semantic_v6_absolute_units_true_shared_ta_riu_v1_short250_ddp8"] = (
+    "TA-RIU v1 short multi-scene generalization probe from Both@1420.  This "
+    "keeps the fixed-batch-validated token-aligned coupling and frozen "
+    "reconstruction boundary, but uses the formal 8-context/7-target "
+    "multi-scene dataloader for exactly 250 DDP8 optimizer steps."
+)
+config_defaults[
+    "semantic_v6_absolute_units_true_shared_ta_riu_v1_short250_ddp8"
+] = config_defaults[
+    "semantic_v6_absolute_units_true_shared_ta_riu_v1_ddp8"
+].evolve(
+    # The parent is the fixed-batch audit recipe; the short probe must use
+    # the real formal multi-scene sampler instead of its one-sample override.
+    prompt_overfit_single_batch=False,
+    abs_instance_warmup_steps=0,
+    num_epochs=1,
+    max_iters_per_epoch=250,
+    print_freq=10,
+    log_image_freq=250,
+    abs_ckpt_every=25,
+    abs_ckpt_steps_extra=(25, 50, 100, 150, 200, 250),
+    abs_ckpt_full_state=True,
+    workspace=(
+        "workspace/semantic_v6_absolute_units_true_shared_ta_riu_v1_"
+        "short250_ddp8"
+    ),
+    experiment_name=(
+        "semantic_v6_absolute_units_true_shared_ta_riu_v1_short250_ddp8"
+    ),
+)
+
+config_doc[
+    "semantic_v6_absolute_units_true_shared_ta_riu_v1_short250_retry_v2_ddp8"
+] = (
+    "Retry of the TA-RIU v1 short multi-scene probe after correcting the "
+    "inherited absolute-student instance warm-up; this workspace is kept "
+    "separate from the aborted preflight workspace."
+)
+config_defaults[
+    "semantic_v6_absolute_units_true_shared_ta_riu_v1_short250_retry_v2_ddp8"
+] = config_defaults[
+    "semantic_v6_absolute_units_true_shared_ta_riu_v1_short250_ddp8"
+].evolve(
+    abs_instance_warmup_steps=0,
+    workspace=(
+        "workspace/semantic_v6_absolute_units_true_shared_ta_riu_v1_"
+        "short250_retry_v2_ddp8"
+    ),
+    experiment_name=(
+        "semantic_v6_absolute_units_true_shared_ta_riu_v1_short250_retry_v2_ddp8"
+    ),
 )
 
 config_doc["semantic_v6_open_vocab_da_pgr_train"] = (

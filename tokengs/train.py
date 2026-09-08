@@ -18,6 +18,8 @@ import time
 import os
 import json
 import datetime
+import shutil
+import subprocess
 from dataclasses import asdict
 
 import torch
@@ -2261,9 +2263,8 @@ def train_epoch(opt, accelerator, model, optimizer, scheduler, train_dataloader,
                     lr_str = f"{scheduler.get_last_lr()[0]:.10f}"
                 print(f"[INFO] step={completed_step} epoch={epoch} {i}/{epoch_iters} mem: {memory} lr: {lr_str} loss: {loss_value.item():.6f} {details} psnr={psnr_value.item():.4f} speed: {speed:.2f} it/s")
                 log_time = time.time()
-        if (
-            accelerator.is_main_process
-            and bool(getattr(opt, "instance_branch_abs_units", False))
+        checkpoint_due = (
+            bool(getattr(opt, "instance_branch_abs_units", False))
             and int(getattr(opt, "abs_ckpt_every", 0)) > 0
             and (
                 completed_step % int(opt.abs_ckpt_every) == 0
@@ -2272,7 +2273,8 @@ def train_epoch(opt, accelerator, model, optimizer, scheduler, train_dataloader,
                     opt, "abs_ckpt_steps_extra", ()
                 ))
             )
-        ):
+        )
+        if accelerator.is_main_process and checkpoint_due:
             # Intra-epoch periodic head checkpoints for recovery/staging
             # (optimizer state stays in the workspace-level saves).
             ckpt_dir = os.path.join(opt.workspace, "checkpoints")
@@ -2300,6 +2302,62 @@ def train_epoch(opt, accelerator, model, optimizer, scheduler, train_dataloader,
                     "per_gpu_batch_size": int(opt.batch_size),
                     "global_batch_size": gbs,
                 }
+                if bool(getattr(opt, "abs_ckpt_full_state", False)):
+                    torch.save(
+                        optimizer.state_dict(),
+                        os.path.join(
+                            ckpt_dir,
+                            f"optimizer_step_{completed_step:06d}.pth",
+                        ),
+                    )
+                    torch.save(
+                        scheduler.state_dict(),
+                        os.path.join(
+                            ckpt_dir,
+                            f"scheduler_step_{completed_step:06d}.pth",
+                        ),
+                    )
+                    config_path = os.path.join(opt.workspace, "config.yaml")
+                    if os.path.isfile(config_path):
+                        shutil.copy2(
+                            config_path,
+                            os.path.join(
+                                ckpt_dir,
+                                f"config_step_{completed_step:06d}.yaml",
+                            ),
+                        )
+                    try:
+                        git_commit = subprocess.check_output(
+                            ["git", "rev-parse", "HEAD"],
+                            cwd=os.getcwd(),
+                            text=True,
+                        ).strip()
+                    except Exception:
+                        git_commit = "unknown"
+                    intra_meta.update(
+                        {
+                            "git_commit": git_commit,
+                            "config_path": os.path.abspath(config_path),
+                            "optimizer_state": os.path.abspath(
+                                os.path.join(
+                                    ckpt_dir,
+                                    f"optimizer_step_{completed_step:06d}.pth",
+                                )
+                            ),
+                            "scheduler_state": os.path.abspath(
+                                os.path.join(
+                                    ckpt_dir,
+                                    f"scheduler_step_{completed_step:06d}.pth",
+                                )
+                            ),
+                            "rng_state_pattern": os.path.abspath(
+                                os.path.join(
+                                    ckpt_dir,
+                                    f"rng_step_{completed_step:06d}_rank*.pth",
+                                )
+                            ),
+                        }
+                    )
                 with open(
                     os.path.join(
                         ckpt_dir,
@@ -2313,6 +2371,31 @@ def train_epoch(opt, accelerator, model, optimizer, scheduler, train_dataloader,
                 f"[abs-ckpt] saved intra-epoch head checkpoint "
                 f"step={completed_step}"
             )
+        if checkpoint_due and bool(getattr(opt, "abs_ckpt_full_state", False)):
+            # Every rank writes its own RNG state.  This is intentionally a
+            # sidecar-only operation and does not alter model/loss semantics.
+            import random
+
+            ckpt_dir = os.path.join(opt.workspace, "checkpoints")
+            os.makedirs(ckpt_dir, exist_ok=True)
+            torch.save(
+                {
+                    "optimizer_step": int(completed_step),
+                    "epoch": int(epoch),
+                    "rank": int(getattr(accelerator, "process_index", -1)),
+                    "torch_rng": torch.get_rng_state(),
+                    "cuda_rng": torch.cuda.get_rng_state()
+                    if torch.cuda.is_available()
+                    else None,
+                    "python_random": random.getstate(),
+                },
+                os.path.join(
+                    ckpt_dir,
+                    f"rng_step_{completed_step:06d}_rank"
+                    f"{int(getattr(accelerator, 'process_index', -1)):02d}.pth",
+                ),
+            )
+            accelerator.wait_for_everyone()
 
     total_loss = accelerator.gather_for_metrics(total_loss).mean()
     total_psnr = accelerator.gather_for_metrics(total_psnr).mean()

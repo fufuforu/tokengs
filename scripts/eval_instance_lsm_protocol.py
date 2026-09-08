@@ -652,6 +652,20 @@ def _load_checkpoint_arch(args, opt) -> None:
         if meta.get(_field) is not None:
             setattr(opt, _field, _cast(meta[_field]))
     for _field, _cast in (
+        ("ta_riu_enabled", bool),
+        ("ta_riu_dim", int),
+        ("ta_riu_memory_latents", int),
+        ("ta_riu_heads", int),
+        ("ta_riu_xyz_scale", float),
+        ("ta_riu_log_scale_scale", float),
+        ("ta_riu_rot_scale", float),
+        ("ta_riu_opacity_scale", float),
+        ("ta_riu_color_scale", float),
+        ("ta_riu_gate_steps", int),
+    ):
+        if meta.get(_field) is not None:
+            setattr(opt, _field, _cast(meta[_field]))
+    for _field, _cast in (
         ("instance_branch_scene_slots", int),
         ("instance_branch_scene_slot_iters", int),
         ("instance_branch_scene_slot_temp", float),
@@ -856,6 +870,20 @@ def main() -> None:
         default="",
         help="Optional directory for exact pre-AP prediction/GT raw cache.",
     )
+    parser.add_argument(
+        "--ta_riu_memory_mode",
+        choices=("normal", "zero", "cross_scene"),
+        default="normal",
+        help="Diagnostic-only TA-RIU memory intervention.",
+    )
+    parser.add_argument("--ta_riu_gate", type=float, default=1.0)
+    parser.add_argument("--ta_riu_geo_gate", type=float, default=1.0)
+    parser.add_argument("--ta_riu_app_gate", type=float, default=1.0)
+    parser.add_argument(
+        "--ta_riu_compare_full",
+        action="store_true",
+        help="Run a same-input full TA-RIU reference for intervention diffs.",
+    )
     args = parser.parse_args()
     args.resume = remap_path(args.resume)
     args.workspace = remap_path(args.workspace)
@@ -964,6 +992,24 @@ def main() -> None:
         )
         assert abs_loaded == 24
         assert tsh_loaded == len(tsh_native)
+        decoder_tail_loaded = sum(
+            key.startswith("enc_dec_backbone.decoder_blocks.")
+            for key in resume_ckpt
+        )
+        print(
+            f"[lsm-eval] decoder_tail loaded {decoder_tail_loaded}/324 "
+            f"ta_riu_enabled={bool(getattr(opt, 'ta_riu_enabled', False))}"
+        )
+        assert decoder_tail_loaded == 324
+        ta_loaded = sum(key.startswith("ta_riu_") for key in resume_ckpt)
+        if bool(getattr(opt, "ta_riu_enabled", False)):
+            assert ta_loaded == 47, ta_loaded
+        else:
+            assert ta_loaded == 0, ta_loaded
+        assert not any(
+            key.startswith("tsh_slot_refine_head.") or "pgsr" in key.lower()
+            for key in resume_ckpt
+        )
     if not any(key.startswith("enc_dec_backbone.") for key in resume_ckpt):
         # Frozen-backbone recipe: the checkpoint intentionally excludes the
         # TokenGS backbone; load the backbone that training actually used.
@@ -998,6 +1044,11 @@ def main() -> None:
             )
     model.eval()
     model = model.cuda()
+    model.ta_riu_memory_mode = str(args.ta_riu_memory_mode)
+    model.ta_riu_memory_override = None
+    model.ta_riu_eval_gate_override = float(args.ta_riu_gate)
+    model.ta_riu_eval_geo_gate_override = float(args.ta_riu_geo_gate)
+    model.ta_riu_eval_app_gate_override = float(args.ta_riu_app_gate)
     num_groups = int(opt.instance_group_num_groups)
     # The void channel is always the last rendered channel; for models with
     # scene-adaptive cluster counts (e.g. unit-embedding clustering) the
@@ -1095,6 +1146,7 @@ def main() -> None:
     pooled_gt_masks = []
     pooled_gt_image_ids = []
     teacher_audit_calls = 0
+    cross_scene_memory = None
     ranking_audit_root = (
         Path(args.ranking_audit_dir) if args.ranking_audit_dir else None
     )
@@ -1111,8 +1163,52 @@ def main() -> None:
         if args.ttt_steps > 0:
             saved_head = _save_instance_head(model)
             _run_instance_ttt(model, data)
-        with torch.inference_mode():
-            out = model(data, compute_quality_metrics=True)
+        intervention_reference = None
+        donor_memory_for_scene = None
+        if args.ta_riu_compare_full and bool(
+            getattr(opt, "ta_riu_enabled", False)
+        ) and (
+            args.ta_riu_memory_mode != "normal"
+            or args.ta_riu_gate != 1.0
+            or args.ta_riu_geo_gate != 1.0
+            or args.ta_riu_app_gate != 1.0
+        ):
+            # First render the same input through the unmodified TA-RIU path.
+            # For cross-scene replacement, the donor is the preceding scene's
+            # raw encoder memory; the first scene is intentionally unchanged.
+            model.ta_riu_memory_mode = "normal"
+            model.ta_riu_memory_override = None
+            model.ta_riu_eval_gate_override = 1.0
+            model.ta_riu_eval_geo_gate_override = 1.0
+            model.ta_riu_eval_app_gate_override = 1.0
+            with torch.inference_mode():
+                full_out = model(data, compute_quality_metrics=True)
+            full_memory = getattr(model, "_last_encoder_values", None)
+            if full_memory is not None:
+                full_memory = full_memory.detach().clone()
+            intervention_reference = full_out
+            donor_memory_for_scene = cross_scene_memory
+            model.ta_riu_memory_mode = (
+                "normal" if args.ta_riu_memory_mode == "cross_scene" else args.ta_riu_memory_mode
+            )
+            model.ta_riu_memory_override = donor_memory_for_scene
+            model.ta_riu_eval_gate_override = float(args.ta_riu_gate)
+            model.ta_riu_eval_geo_gate_override = float(args.ta_riu_geo_gate)
+            model.ta_riu_eval_app_gate_override = float(args.ta_riu_app_gate)
+            with torch.inference_mode():
+                out = model(data, compute_quality_metrics=True)
+            if args.ta_riu_memory_mode == "cross_scene":
+                cross_scene_memory = full_memory
+        else:
+            with torch.inference_mode():
+                out = model(data, compute_quality_metrics=True)
+            if args.ta_riu_memory_mode == "cross_scene":
+                current_memory = getattr(model, "_last_encoder_values", None)
+                cross_scene_memory = (
+                    current_memory.detach().clone()
+                    if current_memory is not None
+                    else None
+                )
         if saved_head is not None:
             # Restore the original head weights so each scene's TTT starts
             # fresh (the eval above already used the TTT-adapted head).
@@ -1122,6 +1218,40 @@ def main() -> None:
             "ssim": float(out["ssim"].detach()),
             "lpips": float(out["lpips"].detach()),
         }
+        if intervention_reference is not None:
+            def _ta_metric(tensor):
+                return tensor.detach().float()
+
+            full_probability = intervention_reference[
+                "rendered_instance_group_probability"
+            ]
+            ablation_probability = out["rendered_instance_group_probability"]
+            scene_entry.update(
+                {
+                    "ablation_soft_mask_l1": float(
+                        (_ta_metric(full_probability) - _ta_metric(ablation_probability))
+                        .abs()
+                        .mean()
+                    ),
+                    "ablation_z_shared_l1": float(
+                        (
+                            _ta_metric(intervention_reference["ta_riu_z_shared"])
+                            - _ta_metric(out["ta_riu_z_shared"])
+                        )
+                        .abs()
+                        .mean()
+                    ),
+                    "ablation_g_joint_l1": float(
+                        (
+                            _ta_metric(intervention_reference["ta_riu_joint_gaussians"])
+                            - _ta_metric(out["ta_riu_joint_gaussians"])
+                        )
+                        .abs()
+                        .mean()
+                    ),
+                    "ablation_reference": "full_ta_riu_same_input",
+                }
+            )
         if args.audit_teacher:
             model_input, supervision = split_data(data, opt)
             calls_before = old_head_calls
@@ -1403,6 +1533,20 @@ def main() -> None:
         ),
         "per_scene": per_scene,
     }
+    if args.ta_riu_compare_full:
+        for key in (
+            "ablation_soft_mask_l1",
+            "ablation_z_shared_l1",
+            "ablation_g_joint_l1",
+        ):
+            payload[f"mean_{key}"] = _mean(key)
+        payload["ta_riu_intervention"] = {
+            "memory_mode": args.ta_riu_memory_mode,
+            "gate": float(args.ta_riu_gate),
+            "geo_gate": float(args.ta_riu_geo_gate),
+            "app_gate": float(args.ta_riu_app_gate),
+            "reference": "full_ta_riu_same_input",
+        }
     output_path = Path(args.workspace) / "instance_ap.json"
     output_path.write_text(
         json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8"

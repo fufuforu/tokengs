@@ -2695,6 +2695,12 @@ class SemanticTokenGSv4(PromptTokenGS):
                 encoder_values = getattr(self, "_last_encoder_values", None)
                 if encoder_values is None:
                     raise RuntimeError("TA-RIU requires encoder memory from the same forward")
+                memory_override = getattr(self, "ta_riu_memory_override", None)
+                if memory_override is not None:
+                    encoder_values = memory_override.to(
+                        device=encoder_values.device,
+                        dtype=encoder_values.dtype,
+                    )
                 memory_mode = str(getattr(self, "ta_riu_memory_mode", "normal"))
                 if memory_mode == "zero":
                     encoder_values = torch.zeros_like(encoder_values)
