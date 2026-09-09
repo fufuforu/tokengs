@@ -330,6 +330,31 @@ class Options:
         "/space/mawb/.cache/torch/hub/checkpoints/"
         "dinov2_vitb14_pretrain.pth"
     )
+    # TA-RIU v3: independently formed, index-aligned instance units paired
+    # with the existing reconstruction units.  This is opt-in and has no
+    # effect on v1/v2/GA-IDU/TSH historical presets.
+    ta_riu_v3_enabled: bool = False
+    ta_riu_v3_dim: int = 256
+    ta_riu_v3_context_views: int = 8
+    ta_riu_v3_units_per_view: int = 1024
+    ta_riu_v3_instance_depth: int = 2
+    ta_riu_v3_num_heads: int = 8
+    ta_riu_v3_mixer_hidden_dim: int = 512
+    ta_riu_v3_gate_ramp_steps: int = 25
+    ta_riu_v3_align_weight: float = 0.01
+    ta_riu_v3_dino_repo_path: str = (
+        "/space/mawb/.cache/torch/hub/facebookresearch_dinov2_main"
+    )
+    ta_riu_v3_dino_weight_path: str = (
+        "/space/mawb/.cache/torch/hub/checkpoints/dinov2_vitb14_pretrain.pth"
+    )
+    ta_riu_v3_tsh_lr: float = 3.0e-5
+    ta_riu_v3_dino_projection_lr: float = 1.0e-4
+    ta_riu_v3_instance_lr: float = 1.0e-4
+    ta_riu_v3_mixer_lr: float = 5.0e-5
+    ta_riu_v3_absolute_head_resume: str = (
+        "workspace/semantic_v6_absolute_units_recon_full3/model_best.safetensors"
+    )
     # Extra intra-epoch optimizer steps that also save head checkpoints
     # (ddp8 metadata included).  Empty by default.
     abs_ckpt_steps_extra: tuple[int, ...] = ()
@@ -737,6 +762,41 @@ class Options:
     # --- augmentation
     random_reflect: bool = True
 
+    # --- isolated GlobalSplat-Instance v2 (disabled for all legacy models)
+    globalsplat_instance_v2_phase: Literal["off", "reconstruction", "joint"] = "off"
+    gsi_v2_globalsplat_repo: str = "/space/mawb/globalsplat"
+    gsi_v2_globalsplat_commit: str = "feb3fd7f7a6a8a9fafcb0ede5c314cd995cdf55b"
+    gsi_v2_official_checkpoint: str = "/space/mawb/globalsplat/ckpts/globalsplat-re10k-16k-noopacity.ckpt"
+    gsi_v2_official_checkpoint_sha256: str = "7069e1e2c72c2d08ecdf68a544ea024d24bd33461c39fa389eb94bc7b34d047a"
+    gsi_v2_vgg_weight_path: str = "/space/mawb/tokengs/metric_checkpoint/imagenet-vgg-verydeep-19.mat"
+    gsi_v2_resume_mode: Literal["official", "phase_r_to_joint", "strict"] = "official"
+    gsi_v2_recon_loss_mode: Literal["mse_smoke", "official_vgg"] = "mse_smoke"
+    gsi_v2_scene_tokens: int = 2048
+    gsi_v2_slot_dim: int = 512
+    gsi_v2_patch_size: int = 8
+    gsi_v2_sh_degree: int = 3
+    gsi_v2_max_candidates: int = 16
+    gsi_v2_final_stage: int = 3
+    gsi_v2_instance_embedding_dim: int = 64
+    gsi_v2_num_object_queries: int = 100
+    gsi_v2_query_layers: int = 2
+    gsi_v2_query_heads: int = 8
+    gsi_v2_recon_to_instance_grad_scale: float = 0.1
+    gsi_v2_instance_loss_weight: float = 1.0
+    gsi_v2_match_bce_weight: float = 1.0
+    gsi_v2_match_dice_weight: float = 1.0
+    gsi_v2_void_weight: float = 0.1
+    gsi_v2_unmatched_weight: float = 0.1
+    gsi_v2_absent_view_weight: float = 0.25
+    gsi_v2_min_visible_pixels: int = 32
+    gsi_v2_reconstruction_lr: float = 1e-5
+    gsi_v2_joint_reconstruction_lr: float = 2e-6
+    gsi_v2_instance_lr: float = 1e-4
+    gsi_v2_lr_warmup_steps: int = 200
+    gsi_v2_lr_min_ratio: float = 0.02
+    gsi_v2_subset_consistency: bool = False
+    gsi_v2_return_debug_tensors: bool = False
+
     def __post_init__(self) -> None:
         if self.dec_patch_size is None:
             self.dec_patch_size = self.patch_size
@@ -795,6 +855,28 @@ class Options:
             )
         if any(step < 0 for step in self.prompt_visualization_steps):
             raise ValueError("prompt_visualization_steps must be non-negative")
+        if self.model_type == "globalsplat_instance_v2":
+            if self.globalsplat_instance_v2_phase == "off":
+                raise ValueError("GSI-v2 requires globalsplat_instance_v2_phase=reconstruction or joint")
+            if (self.num_input_views, self.num_views, self.img_size) != (8, 15, (256, 256)):
+                raise ValueError("GSI-v2 is fixed to 8 context + 7 target at 256x256")
+            if (self.patch_size, self.gsi_v2_patch_size, self.gsi_v2_scene_tokens,
+                    self.gsi_v2_slot_dim, self.gsi_v2_sh_degree, self.gsi_v2_max_candidates,
+                    self.gsi_v2_final_stage, self.gsi_v2_instance_embedding_dim,
+                    self.gsi_v2_num_object_queries) != (8, 8, 2048, 512, 3, 16, 3, 64, 100):
+                raise ValueError("GSI-v2 fixed architecture fields cannot be overridden")
+            if self.gsi_v2_resume_mode == "phase_r_to_joint" and self.globalsplat_instance_v2_phase != "joint":
+                raise ValueError("phase_r_to_joint is only valid for joint phase")
+            if self.deferred_bp or self.mean_of_grads != "none" or self.use_ttt_for_eval:
+                raise ValueError("GSI-v2 requires deferred_bp=False, mean_of_grads=none, use_ttt_for_eval=False")
+            if self.globalsplat_instance_v2_phase == "joint" and not self.use_instance_labels:
+                raise ValueError("GSI-v2 joint phase requires use_instance_labels=True")
+            if self.globalsplat_instance_v2_phase == "reconstruction" and self.use_instance_labels:
+                raise ValueError("GSI-v2 reconstruction phase requires use_instance_labels=False")
+            for name in ("gsi_v2_instance_loss_weight", "gsi_v2_match_bce_weight", "gsi_v2_match_dice_weight",
+                         "gsi_v2_void_weight", "gsi_v2_unmatched_weight", "gsi_v2_absent_view_weight"):
+                if getattr(self, name) < 0:
+                    raise ValueError(f"{name} must be non-negative")
 
     def evolve(self, **changes: Any) -> Options:
         """Return a deep copy with the given fields replaced."""
@@ -809,6 +891,31 @@ class Options:
 
 config_defaults: dict[str, Options] = {}
 config_doc: dict[str, str] = {}
+
+_GSI_V2_SCANNET8X7_COMMON = dict(
+    model_type="globalsplat_instance_v2",
+    data_mode=(("scannet_prompt_small", 1),),
+    dataset_kwargs={
+        "small_manifest_path": "/space/mawb/tokengs/data/scannet_prompt/scannet_prompt_full_wide_8x7.json",
+        "wide_target_subsample": 0,
+        "train_manifest_path": "/space/mawb/tokengs/data/scannet_prompt/scannet_c3g8_train_provisional.json",
+        "query_bank_path": "/space/mawb/tokengs/data/scannet_prompt/scannet_c3g8_query_bank.json",
+    },
+    num_input_views=8,
+    num_views=15,
+    img_size=(256, 256),
+    patch_size=8,
+    batch_size=1,
+    prompt_mode="manifest",
+    prompt_training=False,
+    deferred_bp=False,
+    mean_of_grads="none",
+    use_ttt_for_eval=False,
+    weight_decay=1e-6,
+    gradient_clip=1.0,
+    eval_before_training=True,
+    random_reflect=False,
+)
 
 config_doc["train_dl3dv_base"] = "DL3DV training defaults (long schedule, capped iters/epoch)."
 config_defaults["train_dl3dv_base"] = Options(
@@ -9161,6 +9268,79 @@ config_defaults["semantic_v6_absolute_units_true_shared_ta_riu_v2_dino_unit_shor
     experiment_name="semantic_v6_absolute_units_true_shared_ta_riu_v2_dino_unit_short355_ddp8",
 )
 
+config_doc["semantic_v6_absolute_units_true_shared_ta_riu_v3_dual_stream_ddp8"] = (
+    "TA-RIU-v3 dual-stream token-aligned reconstruction and instance "
+    "understanding.  This preset is diagnostic-only: it starts from the "
+    "reconstruction base8k plus the full3 absolute head, initializes TSH and "
+    "v3 fresh, and leaves the formal step budget to the audit scripts."
+)
+config_defaults["semantic_v6_absolute_units_true_shared_ta_riu_v3_dual_stream_ddp8"] = config_defaults[
+    "semantic_v6_absolute_units_true_shared_siu3r_mbm_both_w10_t3e6_ddp8"
+].evolve(
+    resume=(
+        "workspace/scannet_recon_finetune_base_8k/"
+        "tokengs_backbone_step_008000.safetensors"
+    ),
+    backbone_resume=(
+        "workspace/scannet_recon_finetune_base_8k/"
+        "tokengs_backbone_step_008000.safetensors"
+    ),
+    prompt_tokengs_checkpoint=(
+        "workspace/scannet_recon_finetune_base_8k/"
+        "tokengs_backbone_step_008000.safetensors"
+    ),
+    ta_riu_enabled=False,
+    ta_riu_v2_enabled=False,
+    ta_riu_v3_enabled=True,
+    ta_riu_v3_dim=256,
+    ta_riu_v3_context_views=8,
+    ta_riu_v3_units_per_view=1024,
+    ta_riu_v3_instance_depth=2,
+    ta_riu_v3_num_heads=8,
+    ta_riu_v3_mixer_hidden_dim=512,
+    ta_riu_v3_gate_ramp_steps=25,
+    ta_riu_v3_align_weight=0.01,
+    ta_riu_v3_dino_repo_path=(
+        "/space/mawb/.cache/torch/hub/facebookresearch_dinov2_main"
+    ),
+    ta_riu_v3_dino_weight_path=(
+        "/space/mawb/.cache/torch/hub/checkpoints/dinov2_vitb14_pretrain.pth"
+    ),
+    ta_riu_v3_tsh_lr=3.0e-5,
+    ta_riu_v3_dino_projection_lr=1.0e-4,
+    ta_riu_v3_instance_lr=1.0e-4,
+    ta_riu_v3_mixer_lr=5.0e-5,
+    ta_riu_v3_absolute_head_resume=(
+        "workspace/semantic_v6_absolute_units_recon_full3/model_best.safetensors"
+    ),
+    ga_idu_mode="off",
+    tsh_query_memory_refine=False,
+    tsh_query_memory_refine_probe=False,
+    tsh_query_memory_refine_head_joint_probe=False,
+    tsh_per_gs_refine=False,
+    instance_group_scene_level_matching=False,
+    tsh_mbm_mode="off",
+    tsh_mbm_u2r_weight=0.0,
+    tsh_mbm_decoder_tail_lr=0.0,
+    tsh_abs_lr=0.0,
+    tsh_instance_lr=3.0e-5,
+    tsh_unit_gradient_multiplier_max=0.0,
+    abs_bootstrap_steps=0,
+    abs_teacher_decay_steps=0,
+    abs_teacher_gs_weight=0.0,
+    abs_teacher_rgb_weight=0.0,
+    prompt_unfreeze_tokengs=False,
+    num_input_views=8,
+    num_views=15,
+    num_epochs=1,
+    max_iters_per_epoch=1,
+    abs_ckpt_every=0,
+    abs_ckpt_steps_extra=(),
+    abs_ckpt_full_state=False,
+    workspace="workspace/semantic_v6_absolute_units_true_shared_ta_riu_v3_dual_stream_ddp8",
+    experiment_name="semantic_v6_absolute_units_true_shared_ta_riu_v3_dual_stream_ddp8",
+)
+
 config_doc["semantic_v6_absolute_units_true_shared_ta_riu_v1_short250_ddp8"] = (
     "TA-RIU v1 short multi-scene generalization probe from Both@1420.  This "
     "keeps the fixed-batch-validated token-aligned coupling and frozen "
@@ -9241,6 +9421,59 @@ config_defaults["semantic_v6_open_vocab_da_pgr_train"] = Options(
     mixed_precision="bf16",
     workspace="workspace/semantic_v6_open_vocab_da_pgr_train_6000",
     experiment_name="semantic_v6_open_vocab_da_pgr_train_6000",
+)
+
+config_doc["gsi_v2_recon_official_smoke"] = "Official GlobalSplat R0 MSE-only diagnostic smoke; never a formal training preset."
+config_defaults["gsi_v2_recon_official_smoke"] = Options(
+    **_GSI_V2_SCANNET8X7_COMMON,
+    globalsplat_instance_v2_phase="reconstruction", gsi_v2_resume_mode="official", gsi_v2_recon_loss_mode="mse_smoke",
+    use_instance_labels=False, num_epochs=1, max_iters_per_epoch=3, num_workers=0, mixed_precision="no",
+    workspace="workspace/gsi_v2_recon_official_smoke", experiment_name="gsi_v2_recon_official_smoke",
+)
+
+config_doc["gsi_v2_recon_scannet_adapt"] = "Official-v2 reconstruction adaptation; blocked until the explicit VGG asset exists."
+config_defaults["gsi_v2_recon_scannet_adapt"] = Options(
+    **_GSI_V2_SCANNET8X7_COMMON,
+    globalsplat_instance_v2_phase="reconstruction", gsi_v2_resume_mode="official", gsi_v2_recon_loss_mode="official_vgg",
+    use_instance_labels=False, gsi_v2_subset_consistency=True, num_epochs=3, max_iters_per_epoch=710, num_workers=8,
+    gsi_v2_reconstruction_lr=1e-5, gsi_v2_lr_warmup_steps=200, mixed_precision="bf16",
+    workspace="workspace/gsi_v2_recon_scannet_adapt_ddp8", experiment_name="gsi_v2_recon_scannet_adapt_ddp8",
+)
+
+config_doc["gsi_v2_recon_scannet_eval"] = "Fixed-step GSI-v2 reconstruction evaluation."
+config_defaults["gsi_v2_recon_scannet_eval"] = Options(
+    **_GSI_V2_SCANNET8X7_COMMON,
+    globalsplat_instance_v2_phase="reconstruction", gsi_v2_resume_mode="strict", gsi_v2_recon_loss_mode="mse_smoke",
+    evaluating=True, use_instance_labels=False, num_workers=4, max_eval_iters=8, mixed_precision="bf16",
+    resume="workspace/gsi_v2_recon_scannet_adapt_ddp8/model.safetensors",
+    workspace="workspace/gsi_v2_recon_scannet_eval", experiment_name="gsi_v2_recon_scannet_eval",
+)
+
+config_doc["gsi_v2_joint_official_smoke"] = "Official GlobalSplat joint construction MSE-only diagnostic smoke."
+config_defaults["gsi_v2_joint_official_smoke"] = Options(
+    **_GSI_V2_SCANNET8X7_COMMON,
+    globalsplat_instance_v2_phase="joint", gsi_v2_resume_mode="official", gsi_v2_recon_loss_mode="mse_smoke",
+    use_instance_labels=True, num_epochs=1, max_iters_per_epoch=3, num_workers=0, mixed_precision="no",
+    workspace="workspace/gsi_v2_joint_official_smoke", experiment_name="gsi_v2_joint_official_smoke",
+)
+
+config_doc["gsi_v2_joint_scannet_train"] = "Official-v2 joint training; blocked until the explicit VGG asset exists."
+config_defaults["gsi_v2_joint_scannet_train"] = Options(
+    **_GSI_V2_SCANNET8X7_COMMON,
+    globalsplat_instance_v2_phase="joint", gsi_v2_resume_mode="phase_r_to_joint", gsi_v2_recon_loss_mode="official_vgg",
+    use_instance_labels=True, gsi_v2_subset_consistency=False, num_epochs=3, max_iters_per_epoch=710, num_workers=8,
+    gsi_v2_joint_reconstruction_lr=2e-6, gsi_v2_instance_lr=1e-4, gsi_v2_lr_warmup_steps=200, mixed_precision="bf16",
+    resume="workspace/gsi_v2_recon_scannet_adapt_ddp8/model.safetensors",
+    workspace="workspace/gsi_v2_joint_scannet_ddp8", experiment_name="gsi_v2_joint_scannet_ddp8",
+)
+
+config_doc["gsi_v2_joint_scannet_eval"] = "Fixed-step GSI-v2 joint evaluation."
+config_defaults["gsi_v2_joint_scannet_eval"] = Options(
+    **_GSI_V2_SCANNET8X7_COMMON,
+    globalsplat_instance_v2_phase="joint", gsi_v2_resume_mode="strict", gsi_v2_recon_loss_mode="mse_smoke",
+    use_instance_labels=True, evaluating=True, num_workers=4, max_eval_iters=8, mixed_precision="bf16",
+    resume="workspace/gsi_v2_joint_scannet_ddp8/model.safetensors",
+    workspace="workspace/gsi_v2_joint_scannet_eval", experiment_name="gsi_v2_joint_scannet_eval",
 )
 
 AllConfigs = tyro.extras.subcommand_type_from_defaults(config_defaults, config_doc)

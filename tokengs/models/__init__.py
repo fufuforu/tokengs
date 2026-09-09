@@ -41,6 +41,7 @@ from .semantic_tokengs_v4 import SemanticTokenGSv4
 from .semantic_tokengs_v5 import SemanticTokenGSv5
 from .semantic_tokengs_v6 import SemanticTokenGSv6
 from .conditional_prompt_tokengs import ConditionalPromptTokenGS
+from .globalsplat_instance_v2 import GlobalSplatInstanceV2
 
 # Model registry
 model_registry = {
@@ -52,6 +53,7 @@ model_registry = {
     'semantic_tokengs_v5': SemanticTokenGSv5,
     'semantic_tokengs_v6': SemanticTokenGSv6,
     'conditional_prompt_tokengs': ConditionalPromptTokenGS,
+    'globalsplat_instance_v2': GlobalSplatInstanceV2,
 }
 
 # Export for convenience
@@ -77,5 +79,6 @@ __all__ = [
     'SemanticTokenGSv5',
     'SemanticTokenGSv6',
     'ConditionalPromptTokenGS',
+    'GlobalSplatInstanceV2',
     'model_registry',
 ]

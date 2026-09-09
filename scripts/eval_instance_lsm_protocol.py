@@ -518,6 +518,23 @@ def _load_checkpoint_arch(args, opt) -> None:
     ):
         if meta.get(_field) is not None:
             setattr(opt, _field, _cast(meta[_field]))
+    # TA-RIU-v3 dual-stream architecture and explicit offline DINO paths.
+    # This is evaluation-side metadata restoration only; AP and mask
+    # post-processing remain unchanged.
+    for _field, _cast in (
+        ("ta_riu_v3_enabled", bool),
+        ("ta_riu_v3_dim", int),
+        ("ta_riu_v3_context_views", int),
+        ("ta_riu_v3_units_per_view", int),
+        ("ta_riu_v3_instance_depth", int),
+        ("ta_riu_v3_num_heads", int),
+        ("ta_riu_v3_mixer_hidden_dim", int),
+        ("ta_riu_v3_gate_ramp_steps", int),
+        ("ta_riu_v3_dino_repo_path", str),
+        ("ta_riu_v3_dino_weight_path", str),
+    ):
+        if meta.get(_field) is not None:
+            setattr(opt, _field, _cast(meta[_field]))
     for _field, _cast in (
         ("instance_branch_embed_center_push_margin", float),
         ("instance_branch_embed_center_push_weight", float),
@@ -1040,6 +1057,10 @@ def main() -> None:
             key.startswith("ta_riu_v2_unit_encoder.")
             for key in resume_ckpt
         )
+        ta_v3_loaded = sum(
+            key.startswith("ta_riu_v3_dual_stream.")
+            for key in resume_ckpt
+        )
         if bool(getattr(opt, "ta_riu_enabled", False)):
             assert ta_loaded == 47, ta_loaded
         else:
@@ -1048,6 +1069,14 @@ def main() -> None:
             assert ta_v2_loaded > 0, ta_v2_loaded
         else:
             assert ta_v2_loaded == 0, ta_v2_loaded
+        if bool(getattr(opt, "ta_riu_v3_enabled", False)):
+            assert ta_v3_loaded > 0, ta_v3_loaded
+        else:
+            assert ta_v3_loaded == 0, ta_v3_loaded
+        assert not any(
+            key.startswith(("_dino_model.", "ta_riu_v3_dual_stream.context_dino.dino_extractor."))
+            for key in resume_ckpt
+        )
         assert not any(
             key.startswith("tsh_slot_refine_head.") or "pgsr" in key.lower()
             for key in resume_ckpt

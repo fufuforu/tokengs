@@ -91,53 +91,72 @@ class AbsoluteUnitDecoder(nn.Module):
     def gaussians_per_token(self) -> int:
         return self.units_per_token * self.gaussians_per_unit
 
-    def forward(
-        self, gs_token_hidden: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Return (student_gaussians [B,N,14], unit_feat [B,T,K,F], unit_center
-        [B,T,K,3])."""
+    def form_units(self, gs_token_hidden: torch.Tensor) -> torch.Tensor:
+        """Form token-local units without running the Gaussian decoder."""
+        if gs_token_hidden.ndim != 3 or gs_token_hidden.shape[-1] != self.token_dim:
+            raise ValueError(
+                "AbsoluteUnitDecoder.form_units expects [B,T,"
+                f"{self.token_dim}], got {tuple(gs_token_hidden.shape)}"
+            )
         batch_size, token_count, _ = gs_token_hidden.shape
         hidden = gs_token_hidden.float()
-        hp = self.tok_proj(self.tok_norm(hidden))  # [B,T,F]
+        hp = self.tok_proj(self.tok_norm(hidden))
         k = self.units_per_token
-        g = self.gaussians_per_unit
         f = self.feat_dim
-
         q0 = self.unit_queries.unsqueeze(0).unsqueeze(0).expand(
             batch_size, token_count, k, f
-        )  # [B,T,K,F]
+        )
         hp_exp = hp.unsqueeze(2).expand(batch_size, token_count, k, f)
-        q = self.unit_readout(
-            torch.cat([q0, hp_exp], dim=-1)
-        )  # [B,T,K,F] shared prior + token content
-        center = self.center_mlp(q)  # [B,T,K,3]
+        return self.unit_readout(torch.cat([q0, hp_exp], dim=-1))
 
+    def decode_units(
+        self, unit_features: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Decode [B,T,K,F] units into complete Gaussians and centers."""
+        if unit_features.ndim != 4 or unit_features.shape[-1] != self.feat_dim:
+            raise ValueError(
+                "AbsoluteUnitDecoder.decode_units expects [B,T,K,"
+                f"{self.feat_dim}], got {tuple(unit_features.shape)}"
+            )
+        batch_size, token_count, units_per_token, feat_dim = unit_features.shape
+        if units_per_token != self.units_per_token:
+            raise ValueError(
+                f"decode_units expects K={self.units_per_token}, got "
+                f"{units_per_token}"
+            )
+        q = unit_features
+        center = self.center_mlp(q)
+        g = self.gaussians_per_unit
         slot = self.slot_emb.unsqueeze(0).unsqueeze(0).unsqueeze(0).expand(
-            batch_size, token_count, k, g, -1
-        )  # [B,T,K,G,32]
+            batch_size, token_count, units_per_token, g, -1
+        )
         q_exp = q.unsqueeze(3).expand(
-            batch_size, token_count, k, g, f
+            batch_size, token_count, units_per_token, g, feat_dim
         )
         c_exp = center.unsqueeze(3).expand(
-            batch_size, token_count, k, g, 3
+            batch_size, token_count, units_per_token, g, 3
         )
-        dec_in = torch.cat([q_exp, c_exp, slot], dim=-1)
-        raw = self.gs_decoder(dec_in)  # [B,T,K,G,14]
-
+        raw = self.gs_decoder(torch.cat([q_exp, c_exp, slot], dim=-1))
         pos = raw[..., :3]
         opacity = torch.sigmoid(raw[..., 3:4])
         log_scale = raw[..., 4:7].clamp(-8.0, 8.0)
         scale = log_scale.exp().clamp_min(1e-6)
         quat = F.normalize(raw[..., 7:11], dim=-1, eps=1e-6)
         color = torch.sigmoid(raw[..., 11:14])
-        new_gs = torch.cat(
-            [pos, opacity, scale, quat, color], dim=-1
-        ).reshape(batch_size, token_count, self.gaussians_per_token, 14)
+        new_gs = torch.cat([pos, opacity, scale, quat, color], dim=-1)
         return (
             new_gs.reshape(batch_size, token_count * self.gaussians_per_token, 14),
-            q,
             center,
         )
+
+    def forward(
+        self, gs_token_hidden: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Return (student_gaussians [B,N,14], unit_feat [B,T,K,F], unit_center
+        [B,T,K,3])."""
+        q = self.form_units(gs_token_hidden)
+        gaussians, center = self.decode_units(q)
+        return gaussians, q, center
 
 
 def pair_teacher_student(teacher_gs: torch.Tensor, student_gs: torch.Tensor) -> torch.Tensor:

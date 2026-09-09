@@ -172,6 +172,28 @@ def apply_checkpoint_architecture(opt):
 
 def load_model_checkpoint(opt, model, accelerator, epoch_start):
     """Load model checkpoint with tolerance for shape mismatches."""
+    if getattr(opt, "model_type", None) == "globalsplat_instance_v2":
+        mode = str(getattr(opt, "gsi_v2_resume_mode", "official"))
+        if mode == "official":
+            report = model.load_initial_state()
+            accelerator.print(f"[gsi-v2] official restore path={report['path']} sha256={report['sha256']} keys={report['keys']} numel={report['numel']}")
+        elif mode == "phase_r_to_joint":
+            if not opt.resume or not os.path.isfile(opt.resume):
+                raise RuntimeError(f"[gsi-v2] Phase R checkpoint missing: {opt.resume}")
+            state = load_file(opt.resume, device="cpu")
+            report = model.load_phase_r_state_dict(state)
+            accelerator.print(f"[gsi-v2] Phase R -> J restore path={os.path.abspath(opt.resume)} keys={report['loaded_reconstruction_keys']}/{report['reconstruction_keys']} missing={report['missing']}")
+        elif mode == "strict":
+            if not opt.resume or not os.path.isfile(opt.resume):
+                raise RuntimeError(f"[gsi-v2] strict checkpoint missing: {opt.resume}")
+            state = load_file(opt.resume, device="cpu")
+            incompatible = model.load_state_dict(state, strict=True)
+            if incompatible.missing_keys or incompatible.unexpected_keys:
+                raise RuntimeError(f"[gsi-v2] strict restore failed: {incompatible}")
+            accelerator.print(f"[gsi-v2] strict restore path={os.path.abspath(opt.resume)} keys={len(state)} missing=[] unexpected=[]")
+        else:
+            raise RuntimeError(f"[gsi-v2] unknown resume mode {mode}")
+        return
     if opt.resume is None or opt.resume == 'None':
         return
     
@@ -179,6 +201,7 @@ def load_model_checkpoint(opt, model, accelerator, epoch_start):
         ckpt = load_file(opt.resume, device='cpu')
     else:
         ckpt = torch.load(opt.resume, map_location='cpu')
+    source_checkpoint_keys = tuple(ckpt.keys())
 
     if getattr(opt, "prompt_training", False):
         checkpoint_label = (
@@ -210,6 +233,7 @@ def load_model_checkpoint(opt, model, accelerator, epoch_start):
             nn.Module.state_dict(model)
             if bool(getattr(opt, "tsh_query_memory_refine_probe", False))
             or bool(getattr(opt, "ta_riu_v2_enabled", False))
+            or bool(getattr(opt, "ta_riu_v3_enabled", False))
             else model.state_dict()
         )
         # Frozen-backbone recipes save prompt checkpoints without the
@@ -377,6 +401,121 @@ def load_model_checkpoint(opt, model, accelerator, epoch_start):
                 f"[{checkpoint_label}] resized {token_type}: "
                 f"{old_count} -> {new_count}"
             )
+        if bool(getattr(opt, "ta_riu_v3_enabled", False)):
+            v3_prefix = "ta_riu_v3_dual_stream."
+            forbidden_prefixes = (
+                "ta_riu_",
+                "ta_riu_v2_",
+                "tsh_slot_refine_head.",
+                "tsh_query_memory_refine",
+                "instance_branch.",
+            )
+            if any(
+                key.startswith(forbidden_prefixes)
+                and not key.startswith(v3_prefix)
+                for key in source_checkpoint_keys
+            ):
+                raise RuntimeError(
+                    "TA-RIU-v3 source contains an incompatible instance/refine "
+                    "module; use base8k, never Both or another instance fork"
+                )
+            ckpt_has_v3 = any(key.startswith(v3_prefix) for key in ckpt)
+            native_state = nn.Module.state_dict(model)
+            if ckpt_has_v3:
+                required_prefixes = ("absolute_gs_head.", "tsh_instance_head.", v3_prefix)
+                expected = [
+                    key for key in native_state
+                    if key.startswith(required_prefixes)
+                ]
+                loadable = {
+                    key: ckpt[key]
+                    for key in ckpt
+                    if key.startswith(required_prefixes)
+                    and key in native_state
+                    and native_state[key].shape == ckpt[key].shape
+                }
+                missing = [key for key in expected if key not in loadable]
+                unexpected = [
+                    key for key in ckpt
+                    if key.startswith(required_prefixes) and key not in loadable
+                ]
+                if missing or unexpected:
+                    raise RuntimeError(
+                        "TA-RIU-v3 strict continuation failed: "
+                        f"missing={missing[:5]} unexpected={unexpected[:5]}"
+                    )
+                nn.Module.load_state_dict(model, loadable, strict=False)
+                accelerator.print(
+                    "[ta-riu-v3] strict continuation: "
+                    f"absolute_gs_head loaded "
+                    f"{sum(k.startswith('absolute_gs_head.') for k in loadable)}/24, "
+                    f"tsh_instance_head loaded "
+                    f"{sum(k.startswith('tsh_instance_head.') for k in loadable)}/50, "
+                    f"v3 loaded "
+                    f"{sum(k.startswith(v3_prefix) for k in loadable)} keys, "
+                    "fresh reset=false"
+                )
+                return
+            full3_path = str(
+                getattr(opt, "ta_riu_v3_absolute_head_resume", "") or ""
+            )
+            if not full3_path:
+                raise RuntimeError(
+                    "TA-RIU-v3 requires ta_riu_v3_absolute_head_resume"
+                )
+            if not os.path.isfile(full3_path):
+                raise RuntimeError(
+                    f"TA-RIU-v3 absolute-head checkpoint missing: {full3_path}"
+                )
+            full3 = load_file(full3_path, device="cpu")
+            abs_expected = [
+                key for key in native_state
+                if key.startswith("absolute_gs_head.")
+            ]
+            abs_loadable = {
+                key: full3[key]
+                for key in full3
+                if key.startswith("absolute_gs_head.")
+                and key in native_state
+                and native_state[key].shape == full3[key].shape
+            }
+            abs_missing = [key for key in abs_expected if key not in abs_loadable]
+            abs_unexpected = [
+                key for key in full3
+                if key.startswith("absolute_gs_head.") and key not in abs_loadable
+            ]
+            if len(abs_loadable) != 24 or abs_missing or abs_unexpected:
+                raise RuntimeError(
+                    "TA-RIU-v3 full3 absolute head must load strict 24/24: "
+                    f"loaded={len(abs_loadable)} missing={abs_missing[:5]} "
+                    f"unexpected_or_shape={abs_unexpected[:5]}"
+                )
+            nn.Module.load_state_dict(model, abs_loadable, strict=False)
+            if any(
+                key.startswith(
+                    (
+                        "tsh_instance_head.",
+                        "ta_riu_v2_unit_encoder.",
+                        "tsh_slot_refine_head.",
+                    )
+                )
+                for key in source_checkpoint_keys
+            ):
+                raise RuntimeError(
+                    "TA-RIU-v3 initial source must not contain TSH/v2/PGSR keys"
+                )
+            fresh_seed = (int(opt.seed) + 987654321) % (2**31)
+            torch.manual_seed(fresh_seed)
+            tsh_head = getattr(model, "tsh_instance_head", None)
+            if tsh_head is None or not hasattr(tsh_head, "reset_parameters_fresh"):
+                raise RuntimeError("TA-RIU-v3 requires a fresh TSH head")
+            tsh_head.reset_parameters_fresh()
+            accelerator.print(
+                "[ta-riu-v3] initial lineage: base8k backbone loaded; "
+                f"full3 absolute_gs_head loaded 24/24; TSH fresh seed={fresh_seed}; "
+                "v3 fresh; fresh reset=false for imported modules"
+            )
+            return
         if bool(getattr(opt, "instance_branch_abs_units", False)):
             guarded = bool(getattr(opt, "abs_joint_guarded", False)) or bool(
                 getattr(opt, "abs_true_shared_units", False)
@@ -918,8 +1057,42 @@ def _initialize_dynamic_tokens_from_static(ckpt, state_dict, accelerator):
             dynamic_tokens.copy_(static_tokens[idx])
 
 
+def _setup_gsi_v2_optimizer(opt, model, accelerator, epoch_start):
+    reconstruction = list(model.reconstruction_named_parameters())
+    instance = list(model.instance_named_parameters())
+    instance_ids = {id(parameter) for _, parameter in instance}
+    reconstruction = [(name, parameter) for name, parameter in reconstruction if id(parameter) not in instance_ids]
+    seen = [id(parameter) for _, parameter in reconstruction + instance]
+    trainable = {id(parameter) for parameter in model.parameters() if parameter.requires_grad}
+    if len(seen) != len(set(seen)) or set(seen) != trainable:
+        raise RuntimeError("[gsi-v2] optimizer parameter groups are not a disjoint complete partition")
+    groups = []
+    def add(entries, lr):
+        decay = [p for _, p in entries if p.ndim != 1 and not getattr(p, "_no_weight_decay", False)]
+        nodecay = [p for _, p in entries if p.ndim == 1 or getattr(p, "_no_weight_decay", False)]
+        if decay:
+            groups.append({"params": decay, "lr": float(lr), "weight_decay": float(opt.weight_decay)})
+        if nodecay:
+            groups.append({"params": nodecay, "lr": float(lr), "weight_decay": 0.0})
+    if model.phase == "reconstruction":
+        add(reconstruction, opt.gsi_v2_reconstruction_lr)
+    else:
+        add(reconstruction, opt.gsi_v2_joint_reconstruction_lr)
+        add(instance, opt.gsi_v2_instance_lr)
+    try:
+        optimizer = torch.optim.AdamW(groups, betas=(0.9, 0.95), fused=True)
+    except (TypeError, RuntimeError):
+        optimizer = torch.optim.AdamW(groups, betas=(0.9, 0.95))
+    if epoch_start > 0 and os.path.isfile(os.path.join(opt.workspace, "optimizer.pth")):
+        optimizer.load_state_dict(torch.load(os.path.join(opt.workspace, "optimizer.pth"), map_location="cpu"))
+    accelerator.print("[gsi-v2] optimizer groups: " + ", ".join(f"{len(g['params'])} tensors lr={g['lr']} wd={g['weight_decay']}" for g in groups))
+    return optimizer
+
+
 def setup_optimizer(opt, model, accelerator, epoch_start):
     """Setup optimizer. Call before accelerator.prepare()."""
+    if getattr(opt, "model_type", None) == "globalsplat_instance_v2":
+        return _setup_gsi_v2_optimizer(opt, model, accelerator, epoch_start)
     decay_params, nodecay_params = [], []
     geometry_decay, geometry_nodecay = [], []
     guarded_abs_decay, guarded_abs_nodecay = [], []
@@ -929,6 +1102,14 @@ def setup_optimizer(opt, model, accelerator, epoch_start):
     ta_geo_decay, ta_geo_nodecay = [], []
     ta_app_decay, ta_app_nodecay = [], []
     ta_v2_decay, ta_v2_nodecay = [], []
+    v3_dino_decay, v3_dino_nodecay = [], []
+    v3_instance_decay, v3_instance_nodecay = [], []
+    v3_mixer_decay, v3_mixer_nodecay = [], []
+    v3_group_names = {
+        "dino_projection": [],
+        "instance_stream": [],
+        "pair_mixer": [],
+    }
     tsh = bool(getattr(opt, "abs_true_shared_units", False))
     guarded = bool(getattr(opt, "abs_joint_guarded", False)) or tsh
     if tsh:
@@ -985,6 +1166,31 @@ def setup_optimizer(opt, model, accelerator, epoch_start):
             "ta_riu_v2_unit_encoder."
         ):
             target = ta_v2_nodecay if (param.dim() == 1 or getattr(param, "_no_weight_decay", False)) else ta_v2_decay
+            target.append(param)
+            continue
+        if bool(getattr(opt, "ta_riu_v3_enabled", False)) and name.startswith(
+            "ta_riu_v3_dual_stream."
+        ):
+            if name.startswith("ta_riu_v3_dual_stream.context_dino."):
+                target_decay, target_nodecay = v3_dino_decay, v3_dino_nodecay
+                group_name = "dino_projection"
+            elif name.startswith(
+                (
+                    "ta_riu_v3_dual_stream.instance_query_embedding.",
+                    "ta_riu_v3_dual_stream.instance_unit_former.",
+                )
+            ):
+                target_decay, target_nodecay = v3_instance_decay, v3_instance_nodecay
+                group_name = "instance_stream"
+            elif name.startswith("ta_riu_v3_dual_stream.pair_mixer."):
+                target_decay, target_nodecay = v3_mixer_decay, v3_mixer_nodecay
+                group_name = "pair_mixer"
+            else:
+                raise RuntimeError(f"unclassified TA-RIU-v3 parameter: {name}")
+            v3_group_names[group_name].append(name)
+            target = target_nodecay if (
+                param.dim() == 1 or getattr(param, "_no_weight_decay", False)
+            ) else target_decay
             target.append(param)
             continue
         # Only the actual TokenGS reconstruction path belongs to the lower
@@ -1092,6 +1298,46 @@ def setup_optimizer(opt, model, accelerator, epoch_start):
                 optim_groups.append(
                     {"params": ta_v2_nodecay, "weight_decay": 0.0, "lr": v2_lr}
                 )
+        if bool(getattr(opt, "ta_riu_v3_enabled", False)):
+            v3_lr_groups = (
+                (
+                    "dino_projection",
+                    v3_dino_decay,
+                    v3_dino_nodecay,
+                    float(getattr(opt, "ta_riu_v3_dino_projection_lr", 1.0e-4)),
+                ),
+                (
+                    "instance_stream",
+                    v3_instance_decay,
+                    v3_instance_nodecay,
+                    float(getattr(opt, "ta_riu_v3_instance_lr", 1.0e-4)),
+                ),
+                (
+                    "pair_mixer",
+                    v3_mixer_decay,
+                    v3_mixer_nodecay,
+                    float(getattr(opt, "ta_riu_v3_mixer_lr", 5.0e-5)),
+                ),
+            )
+            for _, decay_list, nodecay_list, group_lr in v3_lr_groups:
+                if decay_list:
+                    optim_groups.append(
+                        {
+                            "params": decay_list,
+                            "weight_decay": opt.weight_decay,
+                            "lr": group_lr,
+                        }
+                    )
+                if nodecay_list:
+                    optim_groups.append(
+                        {"params": nodecay_list, "weight_decay": 0.0, "lr": group_lr}
+                    )
+            for group_name, names in v3_group_names.items():
+                accelerator.print(
+                    f"[optimizer] ta_riu_v3 group={group_name} "
+                    f"lr={dict((x[0], x[3]) for x in v3_lr_groups)[group_name]} "
+                    f"keys={len(names)} params={sum(p.numel() for n, p in model.named_parameters() if n in names)}"
+                )
         accelerator.print(
             f"[optimizer] guarded joint groups: "
             f"abs_lr={abs_group_lr} instance_lr={instance_group_lr} "
@@ -1142,6 +1388,19 @@ def setup_optimizer(opt, model, accelerator, epoch_start):
 
 def setup_scheduler(opt, optimizer, iters_per_epoch, accelerator, epoch_start):
     """Setup scheduler. Call after accelerator.prepare() with per-GPU iters_per_epoch."""
+    if getattr(opt, "model_type", None) == "globalsplat_instance_v2":
+        warmup = int(opt.gsi_v2_lr_warmup_steps)
+        total_steps = max(1, int(opt.num_epochs) * int(iters_per_epoch // max(1, opt.gradient_accumulation_steps)))
+        minimum = float(opt.gsi_v2_lr_min_ratio)
+        def multiplier(step):
+            if step < warmup:
+                return (step + 1) / max(1, warmup)
+            progress = min(1.0, max(0.0, (step - warmup) / max(1, total_steps - warmup)))
+            return minimum + 0.5 * (1.0 - minimum) * (1.0 + float(np.cos(np.pi * progress)))
+        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=multiplier)
+        if epoch_start > 0 and os.path.isfile(os.path.join(opt.workspace, "scheduler.pth")):
+            scheduler.load_state_dict(torch.load(os.path.join(opt.workspace, "scheduler.pth"), map_location="cpu"))
+        return scheduler
     if opt.lr_scheduler == "constant":
         scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lambda _: 1.0)
         fork_continue = bool(
@@ -1180,6 +1439,15 @@ def save_checkpoint(
         torch.save(scheduler.state_dict(), os.path.join(opt.workspace, 'scheduler.pth'))
         
         metadata = {'epoch': epoch, 'step': int(global_step)}
+        if getattr(opt, "model_type", None) == "globalsplat_instance_v2":
+            metadata.update(accelerator.unwrap_model(model).lineage_metadata())
+            metadata.update({
+                "optimizer_step": int(global_step),
+                "equivalent_samples": int(global_step) * int(opt.batch_size) * int(getattr(accelerator, "num_processes", 1)),
+                "world_size": int(getattr(accelerator, "num_processes", 1)),
+                "global_batch": int(opt.batch_size) * int(getattr(accelerator, "num_processes", 1)),
+                "gsi_v2_vgg_sha256": None,
+            })
         if bool(getattr(opt, "tsh_ddp8", False)):
             world = int(getattr(accelerator, "num_processes", 1))
             gbs = int(opt.batch_size) * world
@@ -1751,6 +2019,8 @@ def train_epoch(opt, accelerator, model, optimizer, scheduler, train_dataloader,
 
         global_step_for_aux = global_step
         unwrapped_model = accelerator.unwrap_model(model)
+        if getattr(opt, "model_type", None) == "globalsplat_instance_v2":
+            unwrapped_model.set_train_step(global_step_for_aux)
         if hasattr(unwrapped_model, "compute_lambda_dyn_aux_eff"):
             unwrapped_model.lambda_dyn_aux_eff = unwrapped_model.compute_lambda_dyn_aux_eff(
                 global_step_for_aux,
@@ -1786,7 +2056,9 @@ def train_epoch(opt, accelerator, model, optimizer, scheduler, train_dataloader,
         if bool(getattr(opt, "abs_true_shared_units", False)) and hasattr(
             unwrapped_model, "compute_tsh_effs"
         ):
-            if bool(getattr(opt, "ta_riu_enabled", False)):
+            if bool(getattr(opt, "ta_riu_enabled", False)) or bool(
+                getattr(opt, "ta_riu_v3_enabled", False)
+            ):
                 # TA-RIU's only warm-up is the explicit residual/mixer gate;
                 # the complete TSH head is trainable from the first forward.
                 unwrapped_model.tsh_instance_loss_weight_eff = 1.0
@@ -1842,6 +2114,14 @@ def train_epoch(opt, accelerator, model, optimizer, scheduler, train_dataloader,
         ):
             unwrapped_model.ta_riu_v2_gate_eff = (
                 unwrapped_model.compute_ta_riu_v2_gate_eff(
+                    global_step_for_aux, opt
+                )
+            )
+        if bool(getattr(opt, "ta_riu_v3_enabled", False)) and hasattr(
+            unwrapped_model, "compute_ta_riu_v3_gate_eff"
+        ):
+            unwrapped_model.ta_riu_v3_gate_eff = (
+                unwrapped_model.compute_ta_riu_v3_gate_eff(
                     global_step_for_aux, opt
                 )
             )
@@ -3088,6 +3368,12 @@ def evaluate_epoch(
 def main():    
     start_time = time.time()
     opt = tyro.cli(AllConfigs)
+
+    if getattr(opt, "model_type", None) == "globalsplat_instance_v2":
+        if getattr(opt, "gsi_v2_recon_loss_mode", "mse_smoke") == "official_vgg":
+            vgg_path = os.path.abspath(opt.gsi_v2_vgg_weight_path)
+            if not os.path.isfile(vgg_path) or os.path.getsize(vgg_path) <= 0:
+                raise RuntimeError(f"[gsi-v2] formal training is blocked: explicit VGG asset missing at {vgg_path}")
 
     torch.manual_seed(opt.seed)
 

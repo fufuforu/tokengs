@@ -18,6 +18,9 @@ bench/
 
 # Model checkpoints
 checkpoints/
+metric_ckeckpoint/
+
+docs/
 
 # Local dataset roots (tracked: data/DATA.md)
 data/dl3dv

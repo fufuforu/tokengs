@@ -32,6 +32,7 @@ from tokengs.models.ta_riu_v2 import (
     build_unit_soft_instance_targets,
     soft_unit_info_nce,
 )
+from tokengs.models.ta_riu_v3 import TARIUV3DualStream
 
 
 class SemanticTokenGSv6(SemanticTokenGSv4):
@@ -58,6 +59,7 @@ class SemanticTokenGSv6(SemanticTokenGSv4):
         self.ta_riu_geometry_head = None
         self.ta_riu_appearance_head = None
         self.ta_riu_v2_unit_encoder = None
+        self.ta_riu_v3_dual_stream = None
         super().__init__(opt)
         num_groups = int(getattr(self.opt, "instance_group_num_groups", 64))
         head_input_dim = int(self.opt.token_dim)
@@ -656,6 +658,50 @@ class SemanticTokenGSv6(SemanticTokenGSv4):
                 )
                 self.tsh_instance_head.requires_grad_(True)
                 self.ga_idu1_head = None
+                if bool(getattr(self.opt, "ta_riu_v3_enabled", False)):
+                    if bool(getattr(self.opt, "ta_riu_enabled", False)) or bool(
+                        getattr(self.opt, "ta_riu_v2_enabled", False)
+                    ):
+                        raise ValueError("TA-RIU-v3 excludes TA-RIU-v1/v2")
+                    if str(getattr(self.opt, "ga_idu_mode", "off")) != "off":
+                        raise ValueError("TA-RIU-v3 requires ga_idu_mode=off")
+                    if bool(getattr(self.opt, "tsh_query_memory_refine", False)):
+                        raise ValueError("TA-RIU-v3 excludes query-memory refiner")
+                    if bool(getattr(self.opt, "tsh_per_gs_refine", False)):
+                        raise ValueError("TA-RIU-v3 excludes PGSR/per-GS refinement")
+                    self.ta_riu_v3_dual_stream = TARIUV3DualStream(
+                        dino_repo_path=str(
+                            getattr(self.opt, "ta_riu_v3_dino_repo_path")
+                        ),
+                        dino_weight_path=str(
+                            getattr(self.opt, "ta_riu_v3_dino_weight_path")
+                        ),
+                        dim=int(getattr(self.opt, "ta_riu_v3_dim", 256)),
+                        context_views=int(
+                            getattr(self.opt, "ta_riu_v3_context_views", 8)
+                        ),
+                        units_per_view=int(
+                            getattr(self.opt, "ta_riu_v3_units_per_view", 1024)
+                        ),
+                        instance_depth=int(
+                            getattr(self.opt, "ta_riu_v3_instance_depth", 2)
+                        ),
+                        num_heads=int(getattr(self.opt, "ta_riu_v3_num_heads", 8)),
+                        mixer_hidden_dim=int(
+                            getattr(self.opt, "ta_riu_v3_mixer_hidden_dim", 512)
+                        ),
+                    )
+                    self.absolute_gs_head.requires_grad_(False)
+                    for name, param in self.named_parameters():
+                        param.requires_grad_(
+                            name.startswith("tsh_instance_head.")
+                            or name.startswith("ta_riu_v3_dual_stream.")
+                        )
+                    print(
+                        "[ta-riu-v3] enabled: dual-stream aligned unit "
+                        "path; TSH and v3 modules trainable, reconstruction "
+                        "backbone/absolute head frozen"
+                    )
                 if bool(getattr(self.opt, "ta_riu_v2_enabled", False)):
                     if bool(getattr(self.opt, "ta_riu_enabled", False)):
                         raise ValueError("TA-RIU v1 and v2 are mutually exclusive")

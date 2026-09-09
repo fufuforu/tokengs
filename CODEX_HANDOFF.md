@@ -226,3 +226,15 @@ CUDA_VISIBLE_DEVICES=0 python -u scripts/train_abs_single_overfit.py \
 
 ## 附：一份“最短起步检查单”
 1. `nvidia-smi` 找空卡；2. 确认 `workspace/scannet_recon_finetune_base_8k/tokengs_backbone_step_008000.safetensors` 与 `workspace/semantic_v6_absolute_units_recon_continue_4000/model_best.safetensors` 存在；3. 跑第 9 节 full3 训练命令；4. 每 1000/epoch 用 LSM eval 只读 `mean_psnr/ssim/lpips`（student）；5. 达标前不加 instance/semantic/MBM。
+
+---
+
+## 2026-09-09 Codex handoff: GlobalSplat-Instance v2 implementation
+
+- Implemented isolated `globalsplat_instance_v2` under `tokengs/models/globalsplat_instance_v2/`; legacy TokenGS/TA-RIU/GA-IDU/TSH paths were not intentionally changed.
+- External GlobalSplat remains read-only at commit `feb3fd7f7a6a8a9fafcb0ede5c314cd995cdf55b`; official checkpoint SHA256 is `7069e1e2c72c2d08ecdf68a544ea024d24bd33461c39fa389eb94bc7b34d047a`.
+- Official restore was runtime-verified as 454/454 tensors and 84,321,123/84,321,123 state numel. R0 identity on compute node was exact at the reported tensors; SH3 shape was `[1,16384,16,3]`.
+- J feature assignment is one FP32 dense 101-channel render (100 queries plus void). The gsplat packed feature kernel caused a reproducible multi-rank illegal-memory-access on 3090, so the isolated GSI call uses the supported dense path; no query loop/chunking/geometry detach was added.
+- Single-node 3-step J smoke, fixed-batch 100-step J diagnostic, final single-node R smoke, and final DDP8 3-step J preflight passed. Final DDP8 JSON: `workspace/gsi_v2_preflight_joint_ddp8_v4/preflight.json`; fixed diagnostic JSON: `workspace/gsi_v2_preflight_joint_single_fixed100_v3/preflight.json`.
+- Fixed batch hash: `9eb476b41d9e9049a7f0928f409daf07f3455b90c884c59d21390b3ce9b03343`; instance diagnostic loss fell about 79.2% by step 100, with finite values and approximately 8.32 GB peak allocation.
+- Formal R/J training remains blocked because `metric_checkpoint/imagenet-vgg-verydeep-19.mat` is absent. No formal training, 8-scene evaluation, or LSM-40 was started.
