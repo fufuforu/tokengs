@@ -305,6 +305,31 @@ class Options:
     ta_riu_rot_scale: float = 0.05
     ta_riu_opacity_scale: float = 0.05
     ta_riu_color_scale: float = 0.05
+    # TA-RIU v2: frozen local DINO evidence aligned to the absolute units.
+    # The paths are explicit because compute nodes do not share an inferred
+    # home/cache location.
+    ta_riu_v2_enabled: bool = False
+    ta_riu_v2_dino_model: str = "dinov2_vitb14"
+    ta_riu_v2_dino_dim: int = 768
+    ta_riu_v2_dino_proj_dim: int = 128
+    ta_riu_v2_position_dim: int = 32
+    ta_riu_v2_embedding_dim: int = 64
+    ta_riu_v2_gate_steps: int = 25
+    ta_riu_v2_fusion_lr: float = 1.0e-4
+    ta_riu_v2_instance_lr: float = 3.0e-5
+    ta_riu_v2_embedding_weight: float = 0.1
+    ta_riu_v2_embedding_temperature: float = 0.1
+    ta_riu_v2_embedding_max_units: int = 2048
+    ta_riu_v2_min_valid_votes: int = 8
+    ta_riu_v2_min_foreground_fraction: float = 0.25
+    ta_riu_v2_dino_repo_path: str = (
+        "/space/mawb/.cache/torch/hub/"
+        "facebookresearch_dinov2_main"
+    )
+    ta_riu_v2_dino_weight_path: str = (
+        "/space/mawb/.cache/torch/hub/checkpoints/"
+        "dinov2_vitb14_pretrain.pth"
+    )
     # Extra intra-epoch optimizer steps that also save head checkpoints
     # (ddp8 metadata included).  Empty by default.
     abs_ckpt_steps_extra: tuple[int, ...] = ()
@@ -9061,6 +9086,79 @@ config_defaults["semantic_v6_absolute_units_true_shared_ta_riu_v1_ddp8"] = confi
     abs_ckpt_full_state=False,
     workspace="workspace/semantic_v6_absolute_units_true_shared_ta_riu_v1_ddp8",
     experiment_name="semantic_v6_absolute_units_true_shared_ta_riu_v1_ddp8",
+)
+
+config_doc["semantic_v6_absolute_units_true_shared_ta_riu_v2_dino_unit_ddp8"] = (
+    "TA-RIU v2 geometry-aligned local DINO unit evidence from Both@1420. "
+    "Only the existing TSH head and the new unit evidence encoder train; "
+    "absolute reconstruction, RGB, and all backbone modules remain frozen."
+)
+config_defaults["semantic_v6_absolute_units_true_shared_ta_riu_v2_dino_unit_ddp8"] = config_defaults[
+    "semantic_v6_absolute_units_true_shared_siu3r_mbm_both_w10_t3e6_ddp8"
+].evolve(
+    ta_riu_enabled=False,
+    ta_riu_v2_enabled=True,
+    ta_riu_v2_dino_model="dinov2_vitb14",
+    ta_riu_v2_dino_repo_path=(
+        "/space/mawb/.cache/torch/hub/facebookresearch_dinov2_main"
+    ),
+    ta_riu_v2_dino_weight_path=(
+        "/space/mawb/.cache/torch/hub/checkpoints/dinov2_vitb14_pretrain.pth"
+    ),
+    ta_riu_v2_gate_steps=25,
+    ta_riu_v2_fusion_lr=1.0e-4,
+    ta_riu_v2_instance_lr=3.0e-5,
+    ta_riu_v2_embedding_weight=0.1,
+    ta_riu_v2_embedding_temperature=0.1,
+    ta_riu_v2_embedding_max_units=2048,
+    ta_riu_v2_min_valid_votes=8,
+    ta_riu_v2_min_foreground_fraction=0.25,
+    ga_idu_mode="off",
+    tsh_query_memory_refine=False,
+    tsh_query_memory_refine_probe=False,
+    tsh_query_memory_refine_head_joint_probe=False,
+    tsh_per_gs_refine=False,
+    instance_group_scene_level_matching=False,
+    tsh_mbm_mode="off",
+    tsh_mbm_u2r_weight=0.0,
+    tsh_mbm_decoder_tail_lr=0.0,
+    tsh_abs_lr=0.0,
+    tsh_instance_lr=3.0e-5,
+    tsh_unit_gradient_multiplier_max=0.0,
+    abs_bootstrap_steps=0,
+    abs_teacher_decay_steps=0,
+    abs_teacher_gs_weight=0.0,
+    abs_teacher_rgb_weight=0.0,
+    prompt_unfreeze_tokengs=False,
+    num_input_views=8,
+    num_views=15,
+    num_epochs=1,
+    max_iters_per_epoch=100,
+    abs_ckpt_every=100,
+    abs_ckpt_steps_extra=(1, 5, 25, 50, 100),
+    workspace="workspace/semantic_v6_absolute_units_true_shared_ta_riu_v2_dino_unit_ddp8",
+    experiment_name="semantic_v6_absolute_units_true_shared_ta_riu_v2_dino_unit_ddp8",
+    resume=(
+        "workspace/semantic_v6_absolute_units_true_shared_siu3r_mbm_both_"
+        "w10_t3e6_ddp8/checkpoints/model_step_001420.safetensors"
+    ),
+)
+
+config_doc["semantic_v6_absolute_units_true_shared_ta_riu_v2_dino_unit_short355_ddp8"] = (
+    "TA-RIU-v2 short-355 continuation prepared after the valid 8+7 fixed-"
+    "batch, single-card, and DDP8 audits. This preset is prepared only and "
+    "is not started by diagnostics."
+)
+config_defaults["semantic_v6_absolute_units_true_shared_ta_riu_v2_dino_unit_short355_ddp8"] = config_defaults[
+    "semantic_v6_absolute_units_true_shared_ta_riu_v2_dino_unit_ddp8"
+].evolve(
+    num_epochs=1,
+    max_iters_per_epoch=355,
+    abs_ckpt_every=355,
+    abs_ckpt_steps_extra=(125, 355),
+    abs_ckpt_full_state=True,
+    workspace="workspace/semantic_v6_absolute_units_true_shared_ta_riu_v2_dino_unit_short355_ddp8",
+    experiment_name="semantic_v6_absolute_units_true_shared_ta_riu_v2_dino_unit_short355_ddp8",
 )
 
 config_doc["semantic_v6_absolute_units_true_shared_ta_riu_v1_short250_ddp8"] = (

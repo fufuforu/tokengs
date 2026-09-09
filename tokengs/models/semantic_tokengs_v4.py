@@ -39,6 +39,10 @@ from tokengs.models.instance_group_loss import (
     hungarian_instance_group_loss,
     instance_group_3d_loss,
 )
+from tokengs.models.ta_riu_v2 import (
+    build_unit_soft_instance_targets,
+    soft_unit_info_nce,
+)
 from tokengs.models.tokengs import TokenGS
 from tokengs.utils.metrics import MetricsCalculator
 
@@ -700,6 +704,14 @@ class SemanticTokenGSv4(PromptTokenGS):
         if not bool(getattr(opt, "ta_riu_enabled", False)):
             return 0.0
         ramp = max(1, int(getattr(opt, "ta_riu_gate_steps", 25)))
+        return float(min(1.0, max(0, int(global_step) + 1) / float(ramp)))
+
+    @staticmethod
+    def compute_ta_riu_v2_gate_eff(global_step: int, opt) -> float:
+        """TA-RIU-v2 evidence gate; the pre-step-0 audit is exact identity."""
+        if not bool(getattr(opt, "ta_riu_v2_enabled", False)):
+            return 0.0
+        ramp = max(1, int(getattr(opt, "ta_riu_v2_gate_steps", 25)))
         return float(min(1.0, max(0, int(global_step) + 1) / float(ramp)))
 
     def _instance_group_head_forward(
@@ -2390,10 +2402,19 @@ class SemanticTokenGSv4(PromptTokenGS):
             if self.training
             else 1.0
         )
+        v2_instance_path = bool(
+            getattr(self.opt, "ta_riu_v2_enabled", False)
+        ) and getattr(self, "ta_riu_v2_unit_encoder", None) is not None
         max_mult = float(
             getattr(self.opt, "tsh_unit_gradient_multiplier_max", 1.0)
         )
-        if self.training:
+        if v2_instance_path:
+            # v2 consumes a detached q_abs and produces z_inst through its
+            # own trainable encoder.  The historical unit-producer
+            # multiplier must not detach this downstream semantic edge.
+            # q_abs itself remains detached at the v2 call site.
+            q_in = q_abs
+        elif self.training:
             # ``unit_eff`` already includes max_mult*gate; separate the
             # value-domain detach gate (<=1) from the producer-path gradient
             # multiplier (max_mult).  grad_scale creates a separate graph
@@ -2628,6 +2649,11 @@ class SemanticTokenGSv4(PromptTokenGS):
         ta_riu_app_raw = None
         ta_riu_base_gaussians = None
         ta_riu_joint_gaussians = None
+        ta_riu_v2_enabled = bool(
+            getattr(self.opt, "ta_riu_v2_enabled", False)
+        ) and getattr(self, "ta_riu_v2_unit_encoder", None) is not None
+        ta_riu_v2_outputs = None
+        ta_riu_v2_loss = torch.zeros((), device=next(self.parameters()).device)
         teacher_on = abs_mode and self.training and (
             float(getattr(self, "teacher_lambda_eff", 0.0)) > 0.0
         )
@@ -2777,6 +2803,46 @@ class SemanticTokenGSv4(PromptTokenGS):
             self._last_abs_student_gaussians = (
                 new_gaussians.detach().clone()
             )
+            if ta_riu_v2_enabled:
+                v2_gate = (
+                    float(getattr(self, "ta_riu_v2_gate_eff", 1.0))
+                    if self.training
+                    else float(getattr(self, "ta_riu_v2_eval_gate_override", 1.0))
+                )
+                if "images_input" not in data:
+                    raise RuntimeError("TA-RIU-v2 requires context images_input")
+                image_hw = tuple(int(x) for x in data["images_input"].shape[-2:])
+                ta_riu_v2_outputs = self.ta_riu_v2_unit_encoder(
+                    q_abs.detach(),
+                    new_gaussians.detach(),
+                    data["images_input"],
+                    data["cam_view_input"],
+                    data["intrinsics_input"],
+                    image_hw=image_hw,
+                    gate=v2_gate,
+                )
+                q_abs_for_instance = ta_riu_v2_outputs["z_inst"]
+                if self.training and "instance_label_output" in data:
+                    targets, valid_units, target_stats = build_unit_soft_instance_targets(
+                        new_gaussians.detach(),
+                        data,
+                        tuple(int(x) for x in data["instance_label_output"].shape[-2:]),
+                        num_tokens=int(self.opt.num_gs_tokens),
+                        units_per_token=int(self.absolute_gs_head.units_per_token),
+                        gaussians_per_unit=int(self.absolute_gs_head.gaussians_per_unit),
+                        min_valid_votes=int(getattr(self.opt, "ta_riu_v2_min_valid_votes", 8)),
+                        min_foreground_fraction=float(getattr(self.opt, "ta_riu_v2_min_foreground_fraction", .25)),
+                    )
+                    ta_riu_v2_loss, nce_stats = soft_unit_info_nce(
+                        ta_riu_v2_outputs["unit_embedding"],
+                        targets,
+                        valid_units,
+                        temperature=float(getattr(self.opt, "ta_riu_v2_embedding_temperature", .1)),
+                        max_units=int(getattr(self.opt, "ta_riu_v2_embedding_max_units", 2048)),
+                    )
+                    ta_riu_v2_outputs.update(target_stats)
+                    ta_riu_v2_outputs.update(nce_stats)
+                q_abs_for_instance = ta_riu_v2_outputs["z_inst"]
         else:
             reconstruction, gs_token_hidden, rgb_results = (
                 self._forward_prompt_reconstruction(model_input)
@@ -3093,6 +3159,10 @@ class SemanticTokenGSv4(PromptTokenGS):
             + loss_instance_contrastive
             + loss_boundary_rgb
         )
+        if self.training and ta_riu_v2_enabled:
+            joint_loss = joint_loss + ta_riu_v2_loss * float(
+                getattr(self.opt, "ta_riu_v2_embedding_weight", .1)
+            )
         loss_teacher_gs = torch.zeros((), device=joint_loss.device)
         loss_teacher_rgb = torch.zeros((), device=joint_loss.device)
         teacher_eff = float(getattr(self, "teacher_lambda_eff", 0.0))
@@ -3338,6 +3408,7 @@ class SemanticTokenGSv4(PromptTokenGS):
             "loss_instance_contrastive": loss_instance_contrastive,
             "loss_semantic_lifting": loss_semantic_lifting,
             "loss_semantic_v3": loss_semantic_v3,
+            "loss_ta_riu_v2_unit_embedding": ta_riu_v2_loss,
             "loss_teacher_gs": loss_teacher_gs,
             "loss_teacher_rgb": loss_teacher_rgb,
             "teacher_lambda_eff": torch.tensor(
@@ -3449,4 +3520,16 @@ class SemanticTokenGSv4(PromptTokenGS):
                 else {}
             ),
             **instance_outputs,
+            **(
+                {
+                    f"ta_riu_v2_{key}": value.detach()
+                    if torch.is_tensor(value) else value
+                    for key, value in ta_riu_v2_outputs.items()
+                    if key != "z_inst"
+                    and key != "delta"
+                }
+                if ta_riu_v2_outputs is not None
+                and bool(getattr(self, "ta_riu_v2_return_debug", False))
+                else {}
+            ),
         }

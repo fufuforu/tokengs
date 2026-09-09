@@ -26,6 +26,12 @@ from tokengs.models.ta_riu import (
     GeometryResidualHead,
     SharedUnitMixer,
 )
+from tokengs.models.ta_riu_v2 import (
+    FrozenDINOv2Extractor,
+    GeometryAlignedDINOUnitEncoder,
+    build_unit_soft_instance_targets,
+    soft_unit_info_nce,
+)
 
 
 class SemanticTokenGSv6(SemanticTokenGSv4):
@@ -51,6 +57,7 @@ class SemanticTokenGSv6(SemanticTokenGSv4):
         self.ta_riu_shared_mixer = None
         self.ta_riu_geometry_head = None
         self.ta_riu_appearance_head = None
+        self.ta_riu_v2_unit_encoder = None
         super().__init__(opt)
         num_groups = int(getattr(self.opt, "instance_group_num_groups", 64))
         head_input_dim = int(self.opt.token_dim)
@@ -649,6 +656,41 @@ class SemanticTokenGSv6(SemanticTokenGSv4):
                 )
                 self.tsh_instance_head.requires_grad_(True)
                 self.ga_idu1_head = None
+                if bool(getattr(self.opt, "ta_riu_v2_enabled", False)):
+                    if bool(getattr(self.opt, "ta_riu_enabled", False)):
+                        raise ValueError("TA-RIU v1 and v2 are mutually exclusive")
+                    if str(getattr(self.opt, "ga_idu_mode", "off")) != "off":
+                        raise ValueError("TA-RIU v2 requires ga_idu_mode=off")
+                    if bool(getattr(self.opt, "tsh_query_memory_refine", False)):
+                        raise ValueError("TA-RIU v2 excludes query-memory refiner")
+                    if bool(getattr(self.opt, "tsh_per_gs_refine", False)):
+                        raise ValueError("TA-RIU v2 excludes PGSR/per-GS refinement")
+                    dino = FrozenDINOv2Extractor(
+                        str(getattr(self.opt, "ta_riu_v2_dino_repo_path")),
+                        str(getattr(self.opt, "ta_riu_v2_dino_weight_path")),
+                        model_name=str(getattr(self.opt, "ta_riu_v2_dino_model", "dinov2_vitb14")),
+                    )
+                    self.ta_riu_v2_unit_encoder = GeometryAlignedDINOUnitEncoder(
+                        unit_dim=int(self.absolute_gs_head.feat_dim),
+                        dino_dim=int(getattr(self.opt, "ta_riu_v2_dino_dim", 768)),
+                        dino_proj_dim=int(getattr(self.opt, "ta_riu_v2_dino_proj_dim", 128)),
+                        position_dim=int(getattr(self.opt, "ta_riu_v2_position_dim", 32)),
+                        embedding_dim=int(getattr(self.opt, "ta_riu_v2_embedding_dim", 64)),
+                        num_tokens=int(self.opt.num_gs_tokens),
+                        units_per_token=int(self.absolute_gs_head.units_per_token),
+                        gaussians_per_unit=int(self.absolute_gs_head.gaussians_per_unit),
+                        dino_extractor=dino,
+                    )
+                    self.absolute_gs_head.requires_grad_(False)
+                    for name, param in self.named_parameters():
+                        param.requires_grad_(
+                            name.startswith("tsh_instance_head.")
+                            or name.startswith("ta_riu_v2_unit_encoder.")
+                        )
+                    print(
+                        "[ta-riu-v2] enabled: TSH + geometry-aligned DINO "
+                        "unit encoder trainable; reconstruction frozen"
+                    )
                 if bool(getattr(self.opt, "ta_riu_enabled", False)):
                     if str(getattr(self.opt, "ga_idu_mode", "off")) != "off":
                         raise ValueError("TA-RIU requires ga_idu_mode=off")

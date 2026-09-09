@@ -209,6 +209,7 @@ def load_model_checkpoint(opt, model, accelerator, epoch_start):
         state_dict = (
             nn.Module.state_dict(model)
             if bool(getattr(opt, "tsh_query_memory_refine_probe", False))
+            or bool(getattr(opt, "ta_riu_v2_enabled", False))
             else model.state_dict()
         )
         # Frozen-backbone recipes save prompt checkpoints without the
@@ -239,6 +240,7 @@ def load_model_checkpoint(opt, model, accelerator, epoch_start):
             if (
                 float(getattr(opt, "tsh_mbm_decoder_tail_lr", 0.0)) <= 0.0
                 and not bool(getattr(opt, "ta_riu_enabled", False))
+                and not bool(getattr(opt, "ta_riu_v2_enabled", False))
             ):
                 frozen_prefixes.append("enc_dec_backbone.")
             frozen_prefixes = tuple(frozen_prefixes)
@@ -400,8 +402,12 @@ def load_model_checkpoint(opt, model, accelerator, epoch_start):
                     "ta_riu_geometry_head.",
                     "ta_riu_appearance_head.",
                 )
+                ta_v2_prefix = "ta_riu_v2_unit_encoder."
                 ckpt_has_ta_riu = any(
                     key.startswith(ta_prefixes) for key in ckpt
+                )
+                ckpt_has_ta_riu_v2 = any(
+                    key.startswith(ta_v2_prefix) for key in ckpt
                 )
                 if tsh_mode:
                     reinit = not ckpt_has_tsh
@@ -414,6 +420,8 @@ def load_model_checkpoint(opt, model, accelerator, epoch_start):
                     # source is Both@1420, but are strict on continuation.
                     if bool(getattr(opt, "ta_riu_enabled", False)) and ckpt_has_ta_riu:
                         prefixes = prefixes + ta_prefixes
+                    if bool(getattr(opt, "ta_riu_v2_enabled", False)) and ckpt_has_ta_riu_v2:
+                        prefixes = prefixes + (ta_v2_prefix,)
                 else:
                     reinit = bool(
                         getattr(
@@ -428,7 +436,11 @@ def load_model_checkpoint(opt, model, accelerator, epoch_start):
                             "instance_branch.",
                         )
                     )
-                native_state = model.state_dict()
+                native_state = (
+                    nn.Module.state_dict(model)
+                    if bool(getattr(opt, "ta_riu_v2_enabled", False))
+                    else model.state_dict()
+                )
                 expected = [
                     key for key in native_state
                     if key.startswith(prefixes)
@@ -454,6 +466,9 @@ def load_model_checkpoint(opt, model, accelerator, epoch_start):
                         if key.startswith("tsh_instance_head.query_memory_refiner.")
                     ]
                     missing = [key for key in missing if key not in missing_refiner]
+                if bool(getattr(opt, "ta_riu_v2_enabled", False)) and not ckpt_has_ta_riu_v2:
+                    # First fork from Both@1420: v2 is intentionally fresh.
+                    missing = [key for key in missing if not key.startswith(ta_v2_prefix)]
                 if missing:
                     raise RuntimeError(
                         f"[{checkpoint_label}] guarded-joint resume failed: "
@@ -470,7 +485,7 @@ def load_model_checkpoint(opt, model, accelerator, epoch_start):
                 tail_lr = float(
                     getattr(opt, "tsh_mbm_decoder_tail_lr", 0.0)
                 )
-                if tail_lr > 0.0 or bool(getattr(opt, "ta_riu_enabled", False)):
+                if tail_lr > 0.0 or bool(getattr(opt, "ta_riu_enabled", False)) or bool(getattr(opt, "ta_riu_v2_enabled", False)):
                     tail_expected = [
                         key
                         for key in native_state
@@ -570,6 +585,9 @@ def load_model_checkpoint(opt, model, accelerator, epoch_start):
                 ta_keys = sum(
                     1 for key in loadable if key.startswith(ta_prefixes)
                 )
+                ta_v2_keys = sum(
+                    1 for key in loadable if key.startswith("ta_riu_v2_unit_encoder.")
+                )
                 accelerator.print(
                         f"[{checkpoint_label}] guarded-joint resume: "
                         f"true_shared={tsh_mode} "
@@ -577,7 +595,7 @@ def load_model_checkpoint(opt, model, accelerator, epoch_start):
                     f"(expected {sum(1 for k in expected if k.startswith('absolute_gs_head.'))}), "
                     f"instance_branch keys loaded {ins_keys}, "
                     f"tsh_instance_head keys loaded {tsh_keys} "
-                    f"ta_riu keys loaded {ta_keys}"
+                    f"ta_riu keys loaded {ta_keys} ta_riu_v2 keys loaded {ta_v2_keys}"
                     + (
                         (
                             "; first fork from full3: tsh head uses "
@@ -596,6 +614,12 @@ def load_model_checkpoint(opt, model, accelerator, epoch_start):
                 if bool(getattr(opt, "ta_riu_enabled", False)) and not ckpt_has_ta_riu:
                     accelerator.print(
                         f"[{checkpoint_label}] TA-RIU modules absent in source "
+                        "checkpoint: initialized fresh; abs/TSH continuation "
+                        "was not reset"
+                    )
+                if bool(getattr(opt, "ta_riu_v2_enabled", False)) and not ckpt_has_ta_riu_v2:
+                    accelerator.print(
+                        f"[{checkpoint_label}] TA-RIU-v2 modules absent in source "
                         "checkpoint: initialized fresh; abs/TSH continuation "
                         "was not reset"
                     )
@@ -904,6 +928,7 @@ def setup_optimizer(opt, model, accelerator, epoch_start):
     ta_shared_decay, ta_shared_nodecay = [], []
     ta_geo_decay, ta_geo_nodecay = [], []
     ta_app_decay, ta_app_nodecay = [], []
+    ta_v2_decay, ta_v2_nodecay = [], []
     tsh = bool(getattr(opt, "abs_true_shared_units", False))
     guarded = bool(getattr(opt, "abs_joint_guarded", False)) or tsh
     if tsh:
@@ -955,6 +980,12 @@ def setup_optimizer(opt, model, accelerator, epoch_start):
                 target_nodecay.append(param)
             else:
                 target_decay.append(param)
+            continue
+        if bool(getattr(opt, "ta_riu_v2_enabled", False)) and name.startswith(
+            "ta_riu_v2_unit_encoder."
+        ):
+            target = ta_v2_nodecay if (param.dim() == 1 or getattr(param, "_no_weight_decay", False)) else ta_v2_decay
+            target.append(param)
             continue
         # Only the actual TokenGS reconstruction path belongs to the lower
         # geometry learning-rate group. Instance/group heads are semantic
@@ -1051,6 +1082,16 @@ def setup_optimizer(opt, model, accelerator, epoch_start):
                             'lr': group_lr,
                         }
                     )
+        if bool(getattr(opt, "ta_riu_v2_enabled", False)):
+            v2_lr = float(getattr(opt, "ta_riu_v2_fusion_lr", 1.0e-4))
+            if ta_v2_decay:
+                optim_groups.append(
+                    {"params": ta_v2_decay, "weight_decay": opt.weight_decay, "lr": v2_lr}
+                )
+            if ta_v2_nodecay:
+                optim_groups.append(
+                    {"params": ta_v2_nodecay, "weight_decay": 0.0, "lr": v2_lr}
+                )
         accelerator.print(
             f"[optimizer] guarded joint groups: "
             f"abs_lr={abs_group_lr} instance_lr={instance_group_lr} "
@@ -1061,6 +1102,7 @@ def setup_optimizer(opt, model, accelerator, epoch_start):
             f"ta_shared_params={len(ta_shared_decay) + len(ta_shared_nodecay)} "
             f"ta_geo_params={len(ta_geo_decay) + len(ta_geo_nodecay)} "
             f"ta_app_params={len(ta_app_decay) + len(ta_app_nodecay)}"
+            f" ta_v2_params={len(ta_v2_decay) + len(ta_v2_nodecay)}"
         )
     if separate_geometry:
         if len(geometry_decay) > 0:
@@ -1795,6 +1837,14 @@ def train_epoch(opt, accelerator, model, optimizer, scheduler, train_dataloader,
             unwrapped_model.ta_riu_gate_eff = ta_gate
             unwrapped_model.ta_riu_geo_gate_eff = ta_gate
             unwrapped_model.ta_riu_app_gate_eff = ta_gate
+        if bool(getattr(opt, "ta_riu_v2_enabled", False)) and hasattr(
+            unwrapped_model, "compute_ta_riu_v2_gate_eff"
+        ):
+            unwrapped_model.ta_riu_v2_gate_eff = (
+                unwrapped_model.compute_ta_riu_v2_gate_eff(
+                    global_step_for_aux, opt
+                )
+            )
 
         completed_step = global_step + 1
         compute_quality_metrics = (

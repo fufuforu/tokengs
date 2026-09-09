@@ -753,6 +753,30 @@ def _load_checkpoint_arch(args, opt) -> None:
     ):
         if meta.get(_field) is not None:
             setattr(opt, _field, _cast(meta[_field]))
+    # TA-RIU-v2 checkpoints carry a registered trainable unit-evidence
+    # encoder plus an external, non-registered FrozenDINOv2Extractor.  The
+    # evaluator must reconstruct the v2 model before loading those keys;
+    # otherwise a v2 checkpoint would be silently evaluated through the
+    # legacy instance path.  Paths are restored verbatim from metadata and
+    # are intentionally explicit local paths; FrozenDINOv2Extractor itself
+    # enforces source="local" and never downloads.
+    for _field, _cast in (
+        ("ta_riu_v2_enabled", bool),
+        ("ta_riu_v2_dino_model", str),
+        ("ta_riu_v2_dino_repo_path", str),
+        ("ta_riu_v2_dino_weight_path", str),
+        ("ta_riu_v2_dino_dim", int),
+        ("ta_riu_v2_dino_proj_dim", int),
+        ("ta_riu_v2_gate_steps", int),
+        ("ta_riu_v2_embedding_dim", int),
+        ("ta_riu_v2_position_dim", int),
+        ("ta_riu_v2_embedding_temperature", float),
+        ("ta_riu_v2_embedding_weight", float),
+        ("ta_riu_v2_min_valid_votes", int),
+        ("ta_riu_v2_min_foreground_fraction", float),
+    ):
+        if meta.get(_field) is not None:
+            setattr(opt, _field, _cast(meta[_field]))
     print(
         f"[lsm-eval] arch from "
         f"{metadata_path.name if metadata_path.is_file() else 'config.yaml'}: "
@@ -998,14 +1022,32 @@ def main() -> None:
         )
         print(
             f"[lsm-eval] decoder_tail loaded {decoder_tail_loaded}/324 "
-            f"ta_riu_enabled={bool(getattr(opt, 'ta_riu_enabled', False))}"
+            f"ta_riu_enabled={bool(getattr(opt, 'ta_riu_enabled', False))} "
+            f"ta_riu_v2_enabled={bool(getattr(opt, 'ta_riu_v2_enabled', False))}"
         )
         assert decoder_tail_loaded == 324
-        ta_loaded = sum(key.startswith("ta_riu_") for key in resume_ckpt)
+        ta_loaded = sum(
+            key.startswith(
+                (
+                    "ta_riu_shared_mixer.",
+                    "ta_riu_geometry_head.",
+                    "ta_riu_appearance_head.",
+                )
+            )
+            for key in resume_ckpt
+        )
+        ta_v2_loaded = sum(
+            key.startswith("ta_riu_v2_unit_encoder.")
+            for key in resume_ckpt
+        )
         if bool(getattr(opt, "ta_riu_enabled", False)):
             assert ta_loaded == 47, ta_loaded
         else:
             assert ta_loaded == 0, ta_loaded
+        if bool(getattr(opt, "ta_riu_v2_enabled", False)):
+            assert ta_v2_loaded > 0, ta_v2_loaded
+        else:
+            assert ta_v2_loaded == 0, ta_v2_loaded
         assert not any(
             key.startswith("tsh_slot_refine_head.") or "pgsr" in key.lower()
             for key in resume_ckpt
