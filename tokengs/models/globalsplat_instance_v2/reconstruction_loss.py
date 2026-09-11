@@ -83,13 +83,21 @@ class GSIReconstructionLoss(nn.Module):
         else:
             raise ValueError(f"unknown reconstruction loss mode {mode}")
 
+    def train(self, mode: bool = True):
+        super().train(mode)
+        if self.perceptual_loss is not None:
+            self.perceptual_loss.eval()
+        return self
+
     def forward(self, gaussians, rendered_rgb: torch.Tensor, target_rgb: torch.Tensor,
                 context_K: torch.Tensor, context_w2c: torch.Tensor, *, target_cache=None):
         mse = F.mse_loss(rendered_rgb.float(), target_rgb.float())
         perc = rendered_rgb.new_zeros(())
         cache = target_cache
         if self.perceptual_loss is not None:
-            perc = self.perceptual_loss(rendered_rgb.flatten(0, 1), target_rgb.flatten(0, 1), target_cache=target_cache)
+            if cache is None:
+                cache = self.perceptual_loss.extract_target(target_rgb.flatten(0, 1))
+            perc = self.perceptual_loss(rendered_rgb.flatten(0, 1), target_rgb.flatten(0, 1), target_cache=cache)
         render_loss = self.rgb_outer_weight * (self.mse_weight * mse + self.perceptual_weight * perc)
         inview = self.symbols.frustum_soft_loss_w2c(
             means=gaussians.means, intrinsics=context_K, extrinsics=context_w2c,

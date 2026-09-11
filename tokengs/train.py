@@ -18,6 +18,7 @@ import time
 import os
 import json
 import datetime
+import glob
 import shutil
 import subprocess
 from dataclasses import asdict
@@ -1399,7 +1400,15 @@ def setup_scheduler(opt, optimizer, iters_per_epoch, accelerator, epoch_start):
             return minimum + 0.5 * (1.0 - minimum) * (1.0 + float(np.cos(np.pi * progress)))
         scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=multiplier)
         if epoch_start > 0 and os.path.isfile(os.path.join(opt.workspace, "scheduler.pth")):
-            scheduler.load_state_dict(torch.load(os.path.join(opt.workspace, "scheduler.pth"), map_location="cpu"))
+            scheduler_state = torch.load(
+                os.path.join(opt.workspace, "scheduler.pth"), map_location="cpu"
+            )
+            scheduler.load_state_dict(scheduler_state)
+            # LambdaLR restores last_epoch/_last_lr but does not update the
+            # optimizer param groups.  Explicitly restore the saved current
+            # LR so the first resumed update is continuous with step1000.
+            for group, lr in zip(optimizer.param_groups, scheduler_state["_last_lr"]):
+                group["lr"] = float(lr)
         return scheduler
     if opt.lr_scheduler == "constant":
         scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lambda _: 1.0)
@@ -1440,13 +1449,18 @@ def save_checkpoint(
         
         metadata = {'epoch': epoch, 'step': int(global_step)}
         if getattr(opt, "model_type", None) == "globalsplat_instance_v2":
+            try:
+                from tokengs.models.globalsplat_instance_v2.dependency import sha256_file
+                vgg_sha = sha256_file(opt.gsi_v2_vgg_weight_path)
+            except Exception:
+                vgg_sha = None
             metadata.update(accelerator.unwrap_model(model).lineage_metadata())
             metadata.update({
                 "optimizer_step": int(global_step),
                 "equivalent_samples": int(global_step) * int(opt.batch_size) * int(getattr(accelerator, "num_processes", 1)),
                 "world_size": int(getattr(accelerator, "num_processes", 1)),
                 "global_batch": int(opt.batch_size) * int(getattr(accelerator, "num_processes", 1)),
-                "gsi_v2_vgg_sha256": None,
+                "gsi_v2_vgg_sha256": vgg_sha,
             })
         if bool(getattr(opt, "tsh_ddp8", False)):
             world = int(getattr(accelerator, "num_processes", 1))
@@ -1478,6 +1492,55 @@ def save_checkpoint(
             
         with open(f'{opt.workspace}/metadata.json', 'w') as f:
             json.dump(metadata, f)
+
+
+def save_gsi_v2_step0_snapshot(opt, accelerator, model, optimizer, scheduler):
+    """Save the explicit R1 optimizer-step-0 sidecars on a fresh workspace."""
+    if getattr(opt, "model_type", None) != "globalsplat_instance_v2":
+        return
+    ckpt_dir = os.path.join(opt.workspace, "checkpoints")
+    os.makedirs(ckpt_dir, exist_ok=True)
+    unwrapped = accelerator.unwrap_model(model)
+    if accelerator.is_main_process:
+        state = {
+            key: value.detach().cpu().contiguous()
+            for key, value in unwrapped.state_dict().items()
+        }
+        save_file(state, os.path.join(ckpt_dir, "model_step_000000.safetensors"))
+        torch.save(optimizer.state_dict(), os.path.join(ckpt_dir, "optimizer_step_000000.pth"))
+        torch.save(scheduler.state_dict(), os.path.join(ckpt_dir, "scheduler_step_000000.pth"))
+        try:
+            from tokengs.models.globalsplat_instance_v2.dependency import sha256_file
+            vgg_sha = sha256_file(opt.gsi_v2_vgg_weight_path)
+        except Exception:
+            vgg_sha = None
+        metadata = {
+            "optimizer_step": 0,
+            "equivalent_global_samples": 0,
+            "epoch": 0,
+            "world_size": int(getattr(accelerator, "num_processes", 1)),
+            "per_gpu_batch_size": int(opt.batch_size),
+            "global_batch_size": int(opt.batch_size) * int(getattr(accelerator, "num_processes", 1)),
+            "gsi_v2_vgg_sha256": vgg_sha,
+            "checkpoint_keys": len(state),
+            "checkpoint_numel": int(sum(value.numel() for value in state.values())),
+            "lineage": unwrapped.lineage_metadata(),
+        }
+        with open(os.path.join(ckpt_dir, "metadata_step_000000.json"), "w", encoding="utf-8") as handle:
+            json.dump(metadata, handle, indent=2)
+    if bool(getattr(opt, "abs_ckpt_full_state", False)):
+        import random
+        torch.save(
+            {
+                "optimizer_step": 0, "epoch": 0,
+                "rank": int(getattr(accelerator, "process_index", -1)),
+                "torch_rng": torch.get_rng_state(),
+                "cuda_rng": torch.cuda.get_rng_state() if torch.cuda.is_available() else None,
+                "python_random": random.getstate(),
+            },
+            os.path.join(ckpt_dir, f"rng_step_000000_rank{int(getattr(accelerator, 'process_index', -1)):02d}.pth"),
+        )
+    accelerator.wait_for_everyone()
 
 
 def save_fork_rng_state(
@@ -1529,6 +1592,274 @@ def load_fork_rng_state(opt, accelerator):
         )
 
 
+def _atomic_touch(path: str) -> None:
+    """Create a shared-filesystem marker without exposing a partial file."""
+    temporary = f"{path}.tmp.{os.getpid()}"
+    with open(temporary, "w", encoding="utf-8") as handle:
+        handle.write("ok\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(temporary, path)
+
+
+def _atomic_write_text(path: str, text: str) -> None:
+    """Write a small diagnostic marker atomically on the shared filesystem."""
+    temporary = f"{path}.tmp.{os.getpid()}"
+    with open(temporary, "w", encoding="utf-8") as handle:
+        handle.write(text)
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(temporary, path)
+
+
+def _wait_for_shared_checkpoint(
+    ckpt_dir: str,
+    step: int,
+    required_names: tuple[str, ...],
+    rank: int,
+    timeout_seconds: int = 1800,
+) -> None:
+    """Wait for rank0's completed checkpoint using filesystem polling only."""
+    complete = os.path.join(ckpt_dir, f"step_{step:06d}.complete")
+    failed = os.path.join(ckpt_dir, f"step_{step:06d}.failed")
+    rank_failed = os.path.join(ckpt_dir, f"step_{step:06d}.rank*.failed")
+    deadline = time.monotonic() + timeout_seconds
+    while True:
+        if os.path.isfile(failed):
+            raise RuntimeError(
+                f"checkpoint step={step} failed; rank={rank}; see {failed}"
+            )
+        if glob.glob(rank_failed):
+            raise RuntimeError(
+                f"checkpoint step={step} has a failed rank; rank={rank}; "
+                f"markers={rank_failed}"
+            )
+        if os.path.isfile(complete):
+            missing = [
+                name for name in required_names
+                if not os.path.isfile(os.path.join(ckpt_dir, name))
+            ]
+            if missing:
+                raise RuntimeError(
+                    f"checkpoint sentinel appeared with missing files; "
+                    f"rank={rank} step={step} missing={missing}"
+                )
+            return
+        if time.monotonic() >= deadline:
+            missing = [
+                name for name in required_names
+                if not os.path.isfile(os.path.join(ckpt_dir, name))
+            ]
+            raise TimeoutError(
+                f"timed out waiting for checkpoint sentinel; rank={rank} "
+                f"step={step} missing={missing} timeout={timeout_seconds}s"
+            )
+        time.sleep(1.0)
+
+
+def _wait_for_rank_markers(
+    ckpt_dir: str, step: int, marker_names: tuple[str, ...], rank: int,
+    timeout_seconds: int = 1800,
+) -> None:
+    """Wait for all per-rank RNG markers before rank0 starts long I/O."""
+    failed = os.path.join(ckpt_dir, f"step_{step:06d}.failed")
+    deadline = time.monotonic() + timeout_seconds
+    while True:
+        if os.path.isfile(failed) or glob.glob(
+            os.path.join(ckpt_dir, f"step_{step:06d}.rank*.failed")
+        ):
+            raise RuntimeError(
+                f"checkpoint step={step} has a failed rank before rank0 save; "
+                f"rank={rank}"
+            )
+        missing = [
+            name for name in marker_names
+            if not os.path.isfile(os.path.join(ckpt_dir, name))
+        ]
+        if not missing:
+            return
+        if time.monotonic() >= deadline:
+            raise TimeoutError(
+                f"timed out waiting for rank RNG markers; rank={rank} "
+                f"step={step} missing={missing} timeout={timeout_seconds}s"
+            )
+        time.sleep(1.0)
+
+
+def save_gsi_v2_intra_epoch_checkpoint_synchronized(
+    opt, accelerator, model, optimizer, scheduler, epoch, completed_step
+):
+    """Save a resumable GSI checkpoint without a barrier during rank0 I/O.
+
+    Every rank enters this function and writes its own RNG sidecar.  Rank0
+    waits for the per-rank sidecars using the shared filesystem, writes the
+    model/optimizer/scheduler/config/metadata atomically, then publishes one
+    completion sentinel.  Only after that sentinel exists do all ranks use a
+    short matching Accelerator barrier.
+    """
+    if not bool(getattr(opt, "abs_ckpt_full_state", False)):
+        raise RuntimeError(
+            "synchronized GSI intra-epoch save requires abs_ckpt_full_state=true"
+        )
+    ckpt_dir = os.path.join(opt.workspace, "checkpoints")
+    os.makedirs(ckpt_dir, exist_ok=True)
+    step = int(completed_step)
+    rank = int(getattr(accelerator, "process_index", -1))
+    world = int(getattr(accelerator, "num_processes", 1))
+    prefix = f"step_{step:06d}"
+    model_name = f"model_{prefix}.safetensors"
+    optimizer_name = f"optimizer_{prefix}.pth"
+    scheduler_name = f"scheduler_{prefix}.pth"
+    metadata_name = f"metadata_{prefix}.json"
+    config_name = f"config_{prefix}.yaml"
+    required = (model_name, optimizer_name, scheduler_name, metadata_name)
+    config_path = os.path.join(opt.workspace, "config.yaml")
+    if os.path.isfile(config_path):
+        required += (config_name,)
+
+    final_paths = [os.path.join(ckpt_dir, name) for name in required]
+    for path in final_paths + [
+        os.path.join(ckpt_dir, f"{prefix}.complete"),
+        os.path.join(ckpt_dir, f"{prefix}.failed"),
+    ]:
+        if os.path.exists(path):
+            raise FileExistsError(
+                f"refusing to overwrite existing GSI checkpoint artifact: {path}"
+            )
+
+    import random
+    rng_name = f"rng_{prefix}_rank{rank:02d}.pth"
+    rng_done_name = f"rng_{prefix}_rank{rank:02d}.complete"
+    rng_path = os.path.join(ckpt_dir, rng_name)
+    rng_tmp = f"{rng_path}.tmp.{os.getpid()}"
+    try:
+        torch.save(
+            {
+                "optimizer_step": step,
+                "epoch": int(epoch),
+                "rank": rank,
+                "torch_rng": torch.get_rng_state(),
+                "cuda_rng": torch.cuda.get_rng_state()
+                if torch.cuda.is_available()
+                else None,
+                "python_random": random.getstate(),
+            },
+            rng_tmp,
+        )
+        os.replace(rng_tmp, rng_path)
+        _atomic_touch(os.path.join(ckpt_dir, rng_done_name))
+    except Exception as exc:
+        try:
+            _atomic_write_text(
+                os.path.join(ckpt_dir, f"{prefix}.rank{rank:02d}.failed"),
+                f"rank={rank} step={step} rng save failed: {exc!r}\n",
+            )
+        finally:
+            if os.path.exists(rng_tmp):
+                os.unlink(rng_tmp)
+        raise
+
+    rank_done_names = tuple(
+        f"rng_{prefix}_rank{value:02d}.complete" for value in range(world)
+    )
+    try:
+        if accelerator.is_main_process:
+            _wait_for_rank_markers(
+                ckpt_dir, step, rank_done_names, rank, timeout_seconds=1800
+            )
+            from safetensors.torch import save_file
+
+            unwrapped = accelerator.unwrap_model(model)
+            state = {
+                key: value.detach().cpu().contiguous()
+                for key, value in unwrapped.state_dict().items()
+            }
+            model_path = os.path.join(ckpt_dir, model_name)
+            model_tmp = f"{model_path}.tmp.{os.getpid()}"
+            save_file(state, model_tmp)
+            os.replace(model_tmp, model_path)
+            del state
+
+            optimizer_path = os.path.join(ckpt_dir, optimizer_name)
+            optimizer_tmp = f"{optimizer_path}.tmp.{os.getpid()}"
+            optimizer_state = optimizer.state_dict()
+            torch.save(optimizer_state, optimizer_tmp)
+            del optimizer_state
+            os.replace(optimizer_tmp, optimizer_path)
+
+            scheduler_path = os.path.join(ckpt_dir, scheduler_name)
+            scheduler_tmp = f"{scheduler_path}.tmp.{os.getpid()}"
+            scheduler_state = scheduler.state_dict()
+            torch.save(scheduler_state, scheduler_tmp)
+            del scheduler_state
+            os.replace(scheduler_tmp, scheduler_path)
+
+            if os.path.isfile(config_path):
+                config_dst = os.path.join(ckpt_dir, config_name)
+                config_tmp = f"{config_dst}.tmp.{os.getpid()}"
+                shutil.copy2(config_path, config_tmp)
+                os.replace(config_tmp, config_dst)
+
+            try:
+                git_commit = subprocess.check_output(
+                    ["git", "rev-parse", "HEAD"],
+                    cwd=os.getcwd(),
+                    text=True,
+                ).strip()
+            except Exception:
+                git_commit = "unknown"
+            gbs = int(opt.batch_size) * world
+            metadata = {
+                "optimizer_step": step,
+                "equivalent_global_samples": step * gbs,
+                "epoch": int(epoch),
+                "world_size": world,
+                "per_gpu_batch_size": int(opt.batch_size),
+                "global_batch_size": gbs,
+                "git_commit": git_commit,
+                "config_path": os.path.abspath(config_path),
+                "optimizer_state": os.path.abspath(optimizer_path),
+                "scheduler_state": os.path.abspath(scheduler_path),
+                "rng_state_pattern": os.path.abspath(
+                    os.path.join(ckpt_dir, f"rng_{prefix}_rank*.pth")
+                ),
+                "checkpoint_protocol": "shared_fs_sentinel_v1",
+            }
+            metadata_path = os.path.join(ckpt_dir, metadata_name)
+            metadata_tmp = f"{metadata_path}.tmp.{os.getpid()}"
+            with open(metadata_tmp, "w", encoding="utf-8") as handle:
+                json.dump(metadata, handle, indent=2)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(metadata_tmp, metadata_path)
+            _atomic_touch(os.path.join(ckpt_dir, f"{prefix}.complete"))
+        else:
+            _wait_for_shared_checkpoint(ckpt_dir, step, required, rank)
+    except Exception as exc:
+        if accelerator.is_main_process:
+            try:
+                _atomic_write_text(
+                    os.path.join(ckpt_dir, f"{prefix}.failed"),
+                    f"rank={rank} step={step} checkpoint save failed: {exc!r}\n",
+                )
+            except Exception:
+                pass
+        raise
+    finally:
+        for temporary in glob.glob(os.path.join(ckpt_dir, f"{prefix}*.tmp.*")):
+            try:
+                os.unlink(temporary)
+            except FileNotFoundError:
+                pass
+
+    # This is intentionally the only NCCL synchronization after rank0's
+    # long file I/O.  The published sentinel makes entry symmetric.
+    accelerator.wait_for_everyone()
+    if accelerator.is_main_process:
+        accelerator.print(
+            f"[abs-ckpt] saved synchronized intra-epoch full-state checkpoint "
+            f"step={step} sentinel={os.path.join(ckpt_dir, f'{prefix}.complete')}"
+        )
 def save_prompt_validation_checkpoint(
     opt, accelerator, model, epoch, global_step, validation_metrics, is_best
 ):
@@ -2018,9 +2349,15 @@ def train_epoch(opt, accelerator, model, optimizer, scheduler, train_dataloader,
         optimizer.zero_grad()
 
         global_step_for_aux = global_step
+        completed_step = global_step + 1
         unwrapped_model = accelerator.unwrap_model(model)
         if getattr(opt, "model_type", None) == "globalsplat_instance_v2":
-            unwrapped_model.set_train_step(global_step_for_aux)
+            schedule_step = (
+                completed_step
+                if bool(getattr(opt, "gsi_v2_schedule_uses_completed_step", False))
+                else global_step_for_aux
+            )
+            unwrapped_model.set_train_step(schedule_step)
         if hasattr(unwrapped_model, "compute_lambda_dyn_aux_eff"):
             unwrapped_model.lambda_dyn_aux_eff = unwrapped_model.compute_lambda_dyn_aux_eff(
                 global_step_for_aux,
@@ -2126,7 +2463,6 @@ def train_epoch(opt, accelerator, model, optimizer, scheduler, train_dataloader,
                 )
             )
 
-        completed_step = global_step + 1
         compute_quality_metrics = (
             save_after_step or completed_step % opt.print_freq == 0
         )
@@ -2468,7 +2804,7 @@ def train_epoch(opt, accelerator, model, optimizer, scheduler, train_dataloader,
         if accelerator.is_main_process:
             print(
                 f"[fork] skipping first {sample_skip} local samples "
-                "to continue from step 125"
+                f"to continue from step {global_step_offset}"
             )
         for _ in range(sample_skip):
             next(iterator)
@@ -2497,8 +2833,10 @@ def train_epoch(opt, accelerator, model, optimizer, scheduler, train_dataloader,
                     f"query_class={query_class}"
                 )
         else:
-            save_after_step = accelerator.is_main_process and (
-                completed_step % opt.log_image_freq == 0
+            save_after_step = (
+                opt.log_image_freq > 0
+                and accelerator.is_main_process
+                and completed_step % opt.log_image_freq == 0
             )
             
         with accelerator.accumulate(model):
@@ -2547,12 +2885,17 @@ def train_epoch(opt, accelerator, model, optimizer, scheduler, train_dataloader,
                 "absolute_gs_head.",
                 "tsh_instance_head.",
             )
+            if os.environ.get("TOKENG_DDP_TRACE_FULL_HASH", "0") == "1":
+                # GSI-v2 has a reconstruction namespace rather than the
+                # historical absolute/TSH head prefixes.  An empty prefix
+                # tuple means the complete registered model is hashed.
+                hash_prefixes = ()
             if bool(getattr(opt, "tsh_per_gs_refine", False)):
                 hash_prefixes = hash_prefixes + (
                     "tsh_slot_refine_head.",
                 )
             for name, param in unwrapped.named_parameters():
-                if name.startswith(hash_prefixes):
+                if not hash_prefixes or name.startswith(hash_prefixes):
                     digest.update(
                         name.encode()
                         + param.detach().float().cpu().contiguous()
@@ -2594,7 +2937,10 @@ def train_epoch(opt, accelerator, model, optimizer, scheduler, train_dataloader,
                 print(f"[INFO] step={completed_step} epoch={epoch} {i}/{epoch_iters} mem: {memory} lr: {lr_str} loss: {loss_value.item():.6f} {details} psnr={psnr_value.item():.4f} speed: {speed:.2f} it/s")
                 log_time = time.time()
         checkpoint_due = (
-            bool(getattr(opt, "instance_branch_abs_units", False))
+            (
+                bool(getattr(opt, "instance_branch_abs_units", False))
+                or getattr(opt, "model_type", None) == "globalsplat_instance_v2"
+            )
             and int(getattr(opt, "abs_ckpt_every", 0)) > 0
             and (
                 completed_step % int(opt.abs_ckpt_every) == 0
@@ -2604,7 +2950,11 @@ def train_epoch(opt, accelerator, model, optimizer, scheduler, train_dataloader,
                 ))
             )
         )
-        if accelerator.is_main_process and checkpoint_due:
+        if checkpoint_due and not (
+            bool(getattr(opt, "tsh_ddp8", False))
+            and bool(getattr(opt, "abs_ckpt_full_state", False))
+            and getattr(opt, "model_type", None) == "globalsplat_instance_v2"
+        ) and accelerator.is_main_process:
             # Intra-epoch periodic head checkpoints for recovery/staging
             # (optimizer state stays in the workspace-level saves).
             ckpt_dir = os.path.join(opt.workspace, "checkpoints")
@@ -2701,7 +3051,10 @@ def train_epoch(opt, accelerator, model, optimizer, scheduler, train_dataloader,
                 f"[abs-ckpt] saved intra-epoch head checkpoint "
                 f"step={completed_step}"
             )
-        if checkpoint_due and bool(getattr(opt, "abs_ckpt_full_state", False)):
+        if checkpoint_due and bool(getattr(opt, "abs_ckpt_full_state", False)) and not (
+            bool(getattr(opt, "tsh_ddp8", False))
+            and getattr(opt, "model_type", None) == "globalsplat_instance_v2"
+        ):
             # Every rank writes its own RNG state.  This is intentionally a
             # sidecar-only operation and does not alter model/loss semantics.
             import random
@@ -2726,6 +3079,22 @@ def train_epoch(opt, accelerator, model, optimizer, scheduler, train_dataloader,
                 ),
             )
             accelerator.wait_for_everyone()
+
+        if (
+            checkpoint_due
+            and bool(getattr(opt, "tsh_ddp8", False))
+            and bool(getattr(opt, "abs_ckpt_full_state", False))
+            and getattr(opt, "model_type", None) == "globalsplat_instance_v2"
+        ):
+            save_gsi_v2_intra_epoch_checkpoint_synchronized(
+                opt,
+                accelerator,
+                model,
+                optimizer,
+                scheduler,
+                epoch,
+                completed_step,
+            )
 
     total_loss = accelerator.gather_for_metrics(total_loss).mean()
     total_psnr = accelerator.gather_for_metrics(total_psnr).mean()
@@ -3024,7 +3393,10 @@ def evaluate_epoch(
             
             # Collect gaussians for histogram logging
             if accelerator.is_main_process:
-                if not getattr(opt, "prompt_training", False):
+                if (
+                    not getattr(opt, "prompt_training", False)
+                    and getattr(opt, "model_type", None) != "globalsplat_instance_v2"
+                ):
                     all_gaussians.append(out['gaussians'].detach().cpu())
             
             # save some images
@@ -3397,6 +3769,18 @@ def main():
             find_unused_parameters=True
         )
 
+    if getattr(opt, "model_type", None) == "globalsplat_instance_v2":
+        # GSI-v2 has deliberately gated branches during Phase-J warm-up:
+        # instance-to-reconstruction paths are unused while their gate is
+        # zero.  Match the validated preflight reducer configuration so DDP
+        # handles those intentional per-step unused parameters without
+        # changing any forward, loss, or optimizer semantics.
+        from accelerate.utils import DistributedDataParallelKwargs
+
+        ddp_kwargs = DistributedDataParallelKwargs(
+            find_unused_parameters=True
+        )
+
     accelerator = Accelerator(
         mixed_precision=opt.mixed_precision,
         gradient_accumulation_steps=opt.gradient_accumulation_steps,
@@ -3509,8 +3893,18 @@ def main():
     os.makedirs(opt.workspace, exist_ok=True)
 
     if (
+        getattr(opt, "model_type", None) == "globalsplat_instance_v2"
+        and epoch_start == 0
+        and not os.path.exists(os.path.join(opt.workspace, "checkpoints", "model_step_000000.safetensors"))
+    ):
+        save_gsi_v2_step0_snapshot(opt, accelerator, model, optimizer, scheduler)
+        if accelerator.is_main_process:
+            print("[gsi-v2] saved explicit optimizer-step-0 snapshot")
+
+    if (
         not getattr(opt, "prompt_overfit_single_batch", False)
         and opt.eval_before_training
+        and not bool(getattr(opt, "gsi_v2_disable_training_eval", False))
     ):
         evaluate_epoch(
             opt,
@@ -3536,11 +3930,14 @@ def main():
     epoch = epoch_start
     fork_step = int(getattr(opt, "tsh_fork_continue_step", 0))
     fork_pending = fork_step > 0
+    fork_epoch = fork_step // max(1, iters_per_epoch)
+    fork_step_in_epoch = fork_step % max(1, iters_per_epoch)
     if fork_pending:
-        # Common warm-up workspace saved metadata epoch=0/step=125; resume
-        # mid-epoch instead of jumping to epoch 1.
-        epoch_start = 0
-        epoch = 0
+        # Resume from an arbitrary optimizer step.  The earlier fork logic
+        # only handled step<iters_per_epoch; step1000 is epoch 1, batch 290
+        # for the 710-step R1 schedule.
+        epoch_start = fork_epoch
+        epoch = fork_epoch
         load_fork_rng_state(opt, accelerator)
     while epoch < opt.num_epochs:
         # train
@@ -3549,7 +3946,7 @@ def main():
             if fork_pending
             else epoch * iters_per_epoch
         )
-        sample_skip = fork_step if fork_pending else 0
+        sample_skip = fork_step_in_epoch if fork_pending else 0
         train_epoch(opt, accelerator, model, optimizer, scheduler, train_dataloader, 
                     iters_per_epoch, epoch, writer, start_time, train_dataset,
                     global_step_offset=offset,
@@ -3571,7 +3968,10 @@ def main():
         save_fork_rng_state(opt, accelerator, epoch, global_step)
 
         # eval
-        if not getattr(opt, "prompt_overfit_single_batch", False):
+        if (
+            not getattr(opt, "prompt_overfit_single_batch", False)
+            and not bool(getattr(opt, "gsi_v2_disable_training_eval", False))
+        ):
             validation_metrics = evaluate_epoch(
                 opt,
                 accelerator,

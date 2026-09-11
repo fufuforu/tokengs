@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import hashlib
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -11,7 +12,10 @@ import torch.nn.functional as F
 
 from tokengs.models.input_types import split_data
 
-from .camera_adapter import make_official_context_frustum_meta, make_official_context_input, make_official_target_meta
+from .camera_adapter import (make_official_context_frustum_meta,
+                              make_official_context_input,
+                              make_official_target_meta,
+                              split_eight_context_anchor_alternating)
 from .candidate_layout import capture_candidate_layout
 from .dependency import load_globalsplat_symbols, load_official_state_strict
 from .instance_head import SceneGlobalInstanceHead
@@ -48,7 +52,14 @@ class GlobalSplatInstanceV2(nn.Module):
         self.instance_head = None
         if self.phase == "joint":
             dual_state = dict(self.reconstruction.slot_encoder.state_dict())
-            tri = build_tri_stream_slot_encoder(self.symbols, dual_state)
+            tri = build_tri_stream_slot_encoder(
+                self.symbols,
+                dual_state,
+                initialize_instance_from_geometry=(
+                    str(getattr(opt, "gsi_v2_joint_instance_stream_init", "copy_geometry"))
+                    == "copy_geometry"
+                ),
+            )
             self.reconstruction.slot_encoder = tri
             self.instance_head = SceneGlobalInstanceHead(
                 slot_dim=512, embedding_dim=64, num_queries=100, max_candidates=16,
@@ -95,8 +106,9 @@ class GlobalSplatInstanceV2(nn.Module):
         if missing or unexpected or mismatch:
             raise RuntimeError(f"Phase R restore failed: missing={missing[:8]} unexpected={unexpected[:8]} mismatch={mismatch[:8]}")
         nn.Module.load_state_dict(self, {key: value for key, value in state_dict.items() if key in current and not key.startswith(tri_only)}, strict=False)
-        self.reconstruction.slot_encoder.slot_to_ins = copy.deepcopy(self.reconstruction.slot_encoder.slot_to_geo)
-        self.reconstruction.slot_encoder.ins_rounds = copy.deepcopy(self.reconstruction.slot_encoder.geo_rounds)
+        if str(getattr(self.opt, "gsi_v2_joint_instance_stream_init", "copy_geometry")) == "copy_geometry":
+            self.reconstruction.slot_encoder.slot_to_ins = copy.deepcopy(self.reconstruction.slot_encoder.slot_to_geo)
+            self.reconstruction.slot_encoder.ins_rounds = copy.deepcopy(self.reconstruction.slot_encoder.geo_rounds)
         return {"reconstruction_keys": len(recon_keys), "loaded_reconstruction_keys": len(recon_keys), "missing": (), "unexpected": (), "shape_mismatch": ()}
 
     def set_train_step(self, optimizer_step: int) -> None:
@@ -106,9 +118,16 @@ class GlobalSplatInstanceV2(nn.Module):
             self._gate_gradient_scale = 0.0
             self._instance_weight = 0.0
         else:
-            self._gate = 0.0 if optimizer_step < 500 else min(1.0, (optimizer_step - 500) / 1000.0)
-            self._gate_gradient_scale = 0.0 if optimizer_step < 500 else min(0.1, 0.1 * (optimizer_step - 500) / 1000.0)
-            self._instance_weight = 0.0 if optimizer_step < 500 else min(1.0, (optimizer_step - 500) / 500.0)
+            instance_warmup = max(1, int(getattr(self.opt, "gsi_v2_instance_loss_warmup_steps", 500)))
+            injection_start = int(getattr(self.opt, "gsi_v2_instance_to_reconstruction_start_step", 500))
+            injection_ramp = max(1, int(getattr(self.opt, "gsi_v2_instance_to_reconstruction_ramp_steps", 500)))
+            injection_max = float(getattr(self.opt, "gsi_v2_instance_to_reconstruction_max", 0.1))
+            self._gate = (
+                0.0 if optimizer_step < injection_start
+                else min(1.0, (optimizer_step - injection_start) / injection_ramp)
+            )
+            self._gate_gradient_scale = injection_max * self._gate
+            self._instance_weight = min(1.0, max(0.0, optimizer_step / instance_warmup))
 
     def set_eval_stage(self) -> None:
         self.reconstruction.set_stage(3, mix=1.0)
@@ -142,12 +161,16 @@ class GlobalSplatInstanceV2(nn.Module):
         )
         return gaussians, scene_geo, scene_ins
 
-    def forward_core(self, data: dict, *, compute_instance: bool) -> GSIModelOutput:
+    def forward_core(self, data: dict, *, compute_instance: bool,
+                     context_override=None, target_meta_override=None) -> GSIModelOutput:
         model_input, _supervision = split_data(data, self.opt)
-        context = make_official_context_input(model_input)
+        context = make_official_context_input(model_input) if context_override is None else context_override
         gaussians, scene_geo, scene_ins = self._official_gaussians(model_input, context)
         layout = capture_candidate_layout(self.reconstruction.gaussian_decoder, scene_geo)
-        target_meta = make_official_target_meta(model_input, (int(self.opt.img_size[0]), int(self.opt.img_size[1])))
+        target_meta = (
+            make_official_target_meta(model_input, (int(self.opt.img_size[0]), int(self.opt.img_size[1])))
+            if target_meta_override is None else target_meta_override
+        )
         rgb = render_rgb_sh(self.symbols, gaussians, target_meta, render_depth=True)
         instance = None
         rendered_assignment = None
@@ -159,15 +182,56 @@ class GlobalSplatInstanceV2(nn.Module):
             # queries plus the head's channel-100 void probability.  The
             # normalizer preserves that void channel and only overrides it at
             # pixels with no accumulated Gaussian alpha.
+            # The instance rasterizer has a direct derivative through Gaussian
+            # projection/alpha, in addition to the explicit tri-stream return
+            # path.  Keep that path fully detached during the instance-only
+            # warm-up (gate=0), while preserving the exact forward values; once
+            # the configured return gate opens, the original geometry gradient
+            # path is enabled again.
+            instance_gaussians = gaussians
+            if float(self._gate) == 0.0:
+                instance_gaussians = replace(
+                    gaussians,
+                    means=gaussians.means.detach(),
+                    scales=gaussians.scales.detach(),
+                    rotations=gaussians.rotations.detach(),
+                    opacities=gaussians.opacities.detach(),
+                )
             composed, alpha = render_feature_channels_sh_geometry(
-                self.symbols, gaussians, instance.assignment_probabilities, target_meta, packed=False
+                self.symbols, instance_gaussians, instance.assignment_probabilities, target_meta, packed=False
             )
             rendered_assignment = normalize_rendered_assignment(composed, alpha)
         return GSIModelOutput(gaussians, rgb["images_pred"], rgb["alphas_pred"], rgb["depths_pred"], layout, instance, rendered_assignment)
 
     def forward(self, data: dict, skip_loss: bool = False) -> dict[str, torch.Tensor]:
         compute_instance = self.instance_enabled
-        output = self.forward_core(data, compute_instance=compute_instance)
+        model_input, supervision = split_data(data, self.opt)
+        full_context = make_official_context_input(model_input)
+        target_meta = make_official_target_meta(
+            model_input, (int(self.opt.img_size[0]), int(self.opt.img_size[1]))
+        )
+        use_subset = bool(
+            self.training and self.phase == "reconstruction"
+            and getattr(self.opt, "gsi_v2_subset_consistency", False)
+        )
+        subset_outputs = None
+        if use_subset:
+            context_a, context_b = split_eight_context_anchor_alternating(full_context, False)
+            output_a = self.forward_core(
+                data, compute_instance=False, context_override=context_a,
+                target_meta_override=target_meta,
+            )
+            output_b = self.forward_core(
+                data, compute_instance=False, context_override=context_b,
+                target_meta_override=target_meta,
+            )
+            output = output_a
+            subset_outputs = (output_a, output_b)
+        else:
+            output = self.forward_core(
+                data, compute_instance=compute_instance,
+                context_override=full_context, target_meta_override=target_meta,
+            )
         pred = output.rendered_rgb
         zero = pred.sum() * 0.0
         if skip_loss:
@@ -176,12 +240,54 @@ class GlobalSplatInstanceV2(nn.Module):
             instance_loss = zero
             stats = {}
         else:
-            model_input, supervision = split_data(data, self.opt)
             context_K, context_w2c = make_official_context_frustum_meta(model_input)
             target_rgb = supervision.images_output.reshape_as(pred)
-            reconstruction_total, loss_stats, _cache = self.reconstruction_loss(
-                output.gaussians, pred, target_rgb, context_K, context_w2c
-            )
+            if subset_outputs is None:
+                reconstruction_total, loss_stats, _cache = self.reconstruction_loss(
+                    output.gaussians, pred, target_rgb, context_K, context_w2c
+                )
+            else:
+                output_a, output_b = subset_outputs
+                context_a, context_b = split_eight_context_anchor_alternating(full_context, False)
+                loss_a, stats_a, target_cache = self.reconstruction_loss(
+                    output_a.gaussians, output_a.rendered_rgb, target_rgb,
+                    context_a["intrinsic"], torch.linalg.inv(context_a["c2w"]),
+                )
+                loss_b, stats_b, _ = self.reconstruction_loss(
+                    output_b.gaussians, output_b.rendered_rgb, target_rgb,
+                    context_b["intrinsic"], torch.linalg.inv(context_b["c2w"]),
+                    target_cache=target_cache,
+                )
+                alpha_a, alpha_b = output_a.rendered_alpha, output_b.rendered_alpha
+                depth_a, depth_b = output_a.rendered_depth, output_b.rendered_depth
+                subset_alpha = 0.5 * (
+                    (alpha_a - alpha_b.detach()).abs().mean()
+                    + (alpha_b - alpha_a.detach()).abs().mean()
+                )
+                valid = (alpha_a > 1e-2) & (alpha_b > 1e-2)
+                if depth_a is None or depth_b is None or not valid.any():
+                    subset_depth = pred.new_zeros(())
+                else:
+                    count = valid.float().sum().clamp_min(1.0)
+                    subset_depth = (
+                        ((depth_a - depth_b.detach()).abs() * valid.float()).sum()
+                        + ((depth_b - depth_a.detach()).abs() * valid.float()).sum()
+                    ) / (2.0 * count)
+                reconstruction_total = (
+                    0.5 * (loss_a + loss_b) + 1e-3 * subset_alpha
+                    + 1e-2 * subset_depth
+                )
+                loss_stats = {
+                    "loss_rgb": 0.5 * (stats_a["loss_rgb"] + stats_b["loss_rgb"]),
+                    "loss_mse": 0.5 * (stats_a["loss_mse"] + stats_b["loss_mse"]),
+                    "loss_perceptual": 0.5 * (stats_a["loss_perceptual"] + stats_b["loss_perceptual"]),
+                    "loss_inview": 0.5 * (stats_a["loss_inview"] + stats_b["loss_inview"]),
+                    "loss_decoder_reg": 0.5 * (stats_a["loss_decoder_reg"] + stats_b["loss_decoder_reg"]),
+                    "gsi_v2_subset_alpha": subset_alpha.detach(),
+                    "gsi_v2_subset_depth": subset_depth.detach(),
+                    "gsi_v2_subset_alpha_finite": torch.isfinite(subset_alpha.detach()).float(),
+                    "gsi_v2_subset_depth_finite": torch.isfinite(subset_depth.detach()).float(),
+                }
             loss = reconstruction_total
             rgb_loss = loss_stats["loss_rgb"]
             instance_loss = zero
@@ -218,6 +324,16 @@ class GlobalSplatInstanceV2(nn.Module):
                 "loss_instance_group": instance_loss,
                 "tsh_instance_loss_weight": torch.as_tensor(getattr(self, "_instance_weight", 1.0), device=pred.device),
             })
+            # Diagnostics may request the pre-render tensors needed to audit
+            # visible-unit/assignment changes.  Keep these opt-in so the
+            # normal forward/checkpoint interface and memory footprint are
+            # unchanged for formal training and evaluation.
+            if bool(getattr(self.opt, "gsi_v2_return_debug_tensors", False)):
+                result.update({
+                    "gsi_v2_instance_assignment_logits": output.instance.assignment_logits,
+                    "gsi_v2_instance_assignment_probabilities": output.instance.assignment_probabilities,
+                    "gsi_v2_candidate_gate_logits": output.layout.gate_logits_full,
+                })
         result.update(stats)
         return result
 

@@ -29,6 +29,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--steps", type=int, default=3)
     parser.add_argument("--fixed_batch_steps", type=int, default=0)
     parser.add_argument("--allow_mse_smoke", action="store_true")
+    parser.add_argument("--use_official_vgg", action="store_true")
     return parser.parse_args()
 
 
@@ -78,7 +79,7 @@ def _batch_hash(batch: dict) -> str:
 def _output_stats(output: dict[str, torch.Tensor]) -> dict[str, object]:
     stats = {}
     for key, value in output.items():
-        if key.startswith("gsi_v2_") and torch.is_tensor(value):
+        if (key.startswith("gsi_v2_") or key.startswith("loss_")) and torch.is_tensor(value):
             stats[key] = float(value.detach().float().item())
     if "rendered_instance_group_probability" in output:
         probability = output["rendered_instance_group_probability"]
@@ -166,10 +167,21 @@ def main() -> None:
     if args.preset not in config_defaults:
         raise KeyError(f"unknown preset {args.preset}")
     opt = config_defaults[args.preset].evolve()
+    if args.allow_mse_smoke and args.use_official_vgg:
+        raise ValueError("--allow_mse_smoke and --use_official_vgg are mutually exclusive")
+    if args.use_official_vgg:
+        if opt.globalsplat_instance_v2_phase != "reconstruction":
+            raise ValueError("official VGG preflight requires reconstruction phase")
+        opt = opt.evolve(
+            gsi_v2_recon_loss_mode="official_vgg",
+            gsi_v2_subset_consistency=True,
+        )
     if opt.gsi_v2_recon_loss_mode == "mse_smoke" and not args.allow_mse_smoke:
         raise RuntimeError("mse_smoke requires --allow_mse_smoke")
     if opt.gsi_v2_recon_loss_mode == "official_vgg":
-        raise RuntimeError("VGG asset is required for official_vgg preflight")
+        vgg_path = Path(opt.gsi_v2_vgg_weight_path).resolve()
+        if not vgg_path.is_file() or vgg_path.stat().st_size <= 0:
+            raise RuntimeError(f"VGG asset is required for official_vgg preflight: {vgg_path}")
     output_path = Path(args.output_json).resolve()
     output_path.parent.mkdir(parents=True, exist_ok=True)
     # The diagnostic deliberately performs independent instance-only and
@@ -199,6 +211,8 @@ def main() -> None:
         "official_checkpoint_sha256": opt.gsi_v2_official_checkpoint_sha256,
         "dino_or_teacher_called": False, "teacher_called": False,
         "u_to_r": 0.0, "unit_multiplier": 0.0,
+        "gsi_v2_subset_consistency": bool(opt.gsi_v2_subset_consistency),
+        "gsi_v2_recon_loss_mode": str(opt.gsi_v2_recon_loss_mode),
     }
     official_report = getattr(unwrapped, "_official_checkpoint_report", None)
     if official_report is not None:
@@ -368,8 +382,21 @@ def main() -> None:
         report["scene_hungarian_once"] = True
         report["same_assignment_all_7_views"] = True
         report["no_target_leakage"] = True
-        report["vgg_asset_present"] = False
-        report["training_ready"] = False
+        vgg_path = Path(opt.gsi_v2_vgg_weight_path).resolve()
+        report["vgg_asset_present"] = bool(vgg_path.is_file() and vgg_path.stat().st_size > 0)
+        report["vgg_weight_path"] = str(vgg_path)
+        report["vgg_weight_sha256"] = sha256_file(vgg_path) if report["vgg_asset_present"] else None
+        perceptual = getattr(unwrapped.reconstruction_loss, "perceptual_loss", None)
+        vgg_parameters = [] if perceptual is None else list(perceptual.parameters())
+        trainable_ids = {id(parameter) for parameter in unwrapped.parameters() if parameter.requires_grad}
+        optimizer_ids = {id(parameter) for group in optimizer.param_groups for parameter in group["params"]}
+        report["vgg_parameter_count"] = int(sum(parameter.numel() for parameter in vgg_parameters))
+        report["vgg_grad_tensors"] = int(sum(parameter.grad is not None for parameter in vgg_parameters))
+        report["vgg_in_optimizer"] = bool(optimizer_ids.intersection({id(parameter) for parameter in vgg_parameters}))
+        report["vgg_in_trainable_parameters"] = bool(trainable_ids.intersection({id(parameter) for parameter in vgg_parameters}))
+        report["vgg_offline"] = True
+        report["vgg_strict_load"] = bool(perceptual is not None)
+        report["training_ready"] = bool(args.use_official_vgg and perceptual is not None and not report["vgg_in_optimizer"])
         identity = report.get("step0_identity", {})
         instance_records = report.get("instance_only_gradients", [])
         report.update({
@@ -413,8 +440,22 @@ def main() -> None:
             ),
             "NO_TARGET_LEAKAGE": True,
             "DDP_HASH_SYNC": bool(report.get("ddp_hash_sync", False)),
-            "VGG_ASSET_PRESENT": False,
-            "TRAINING_READY": False,
+            "VGG_ASSET_PRESENT": bool(report.get("vgg_asset_present", False)),
+            "VGG_OFFLINE_FROZEN": bool(
+                report.get("vgg_strict_load", False)
+                and report.get("vgg_grad_tensors", 0) == 0
+                and not report.get("vgg_in_optimizer", True)
+                and not report.get("vgg_in_trainable_parameters", True)
+            ),
+            "SUBSET_CONSISTENCY": bool(
+                report.get("gsi_v2_subset_consistency", False)
+                and all(
+                    "gsi_v2_subset_alpha" in record.get("stats", {})
+                    and "gsi_v2_subset_depth" in record.get("stats", {})
+                    for record in report.get("total_steps", [])
+                )
+            ),
+            "TRAINING_READY": bool(report.get("training_ready", False)),
         })
         output_path.write_text(json.dumps(report, indent=2, default=float), encoding="utf-8")
         print(json.dumps(report, indent=2, default=float))

@@ -73,13 +73,25 @@ def _tri_class(symbols_class: type[nn.Module]):
             slots0, cls_size, reg_start, reg_end = self._build_slots(batch_size, state)
             geo = self.slot_to_geo(slots0)
             tex = self.slot_to_tex(slots0)
-            ins = self.slot_to_ins(slots0)
+            # The instance-to-reconstruction scale is exactly zero during
+            # steps 1--50.  Keep the instance forward identical, but prevent
+            # its loss from reaching shared slot initialization parameters
+            # (scene tokens, slot registers, auxiliary queries, and scale
+            # embedding) through the fresh instance stream.
+            instance_slots0 = slots0 if float(instance_to_reconstruction_gate) > 0.0 else slots0.detach()
+            ins = self.slot_to_ins(instance_slots0)
             mem = self._build_memory(x, camera_motion_tokens, mem_drop_p)
             mask = self._make_reg_mask(geo.size(1), reg_start, reg_end, geo.device, geo.dtype)
+            # During the initial instance warm-up, the instance stream must
+            # learn from its own fresh parameters without sending gradients
+            # into the shared token memory.  Detaching only this input keeps
+            # the forward values identical; after the return gate opens, the
+            # normal shared-memory path is restored.
+            instance_mem = mem if float(instance_to_reconstruction_gate) > 0.0 else mem.detach()
             for round_idx in range(self.rounds):
                 geo1 = self.geo_rounds[round_idx](geo, mem, reg_mask=mask)
                 tex1 = self.tex_rounds[round_idx](tex, mem, reg_mask=mask)
-                ins1 = self.ins_rounds[round_idx](ins, mem, reg_mask=mask)
+                ins1 = self.ins_rounds[round_idx](ins, instance_mem, reg_mask=mask)
                 geo2, tex2 = self.pair_adapters[round_idx](geo1, tex1)
                 geo, tex, ins = self.tri_adapters[round_idx](
                     geo2, tex2, ins1,
@@ -103,7 +115,9 @@ def _tri_class(symbols_class: type[nn.Module]):
 
 
 def build_tri_stream_slot_encoder(symbols: GlobalSplatSymbols,
-                                  pretrained_dual_state: dict[str, torch.Tensor]) -> nn.Module:
+                                  pretrained_dual_state: dict[str, torch.Tensor],
+                                  *,
+                                  initialize_instance_from_geometry: bool = True) -> nn.Module:
     cls = _tri_class(symbols.DualStreamSlotEncoder)
     encoder = cls(
         dim_latent=512, dim_token=768, heads=8, rounds=4,
@@ -123,8 +137,13 @@ def build_tri_stream_slot_encoder(symbols: GlobalSplatSymbols,
     if missing or unexpected:
         raise RuntimeError(f"tri-stream base restore mismatch: missing={missing[:8]} unexpected={unexpected[:8]}")
     encoder.load_state_dict(provided, strict=False)
-    encoder.slot_to_ins = copy.deepcopy(encoder.slot_to_geo)
-    encoder.ins_rounds = copy.deepcopy(encoder.geo_rounds)
+    if initialize_instance_from_geometry:
+        encoder.slot_to_ins = copy.deepcopy(encoder.slot_to_geo)
+        encoder.ins_rounds = copy.deepcopy(encoder.geo_rounds)
+    # When the short Phase-J recipe requests fresh instance initialization,
+    # the constructor-created slot_to_ins/ins_rounds remain independent
+    # random parameters.  They are still registered and trainable, while the
+    # geometry/appearance streams retain the strictly restored Phase-R state.
     for left, right in zip(encoder.slot_to_ins.parameters(), encoder.slot_to_geo.parameters()):
         if left is right or left.data_ptr() == right.data_ptr():
             raise RuntimeError("instance stream must not share Parameter storage with geometry stream")

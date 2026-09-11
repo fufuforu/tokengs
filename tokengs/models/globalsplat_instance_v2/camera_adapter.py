@@ -43,6 +43,22 @@ def make_official_context_input(model_input: Any) -> dict[str, torch.Tensor]:
     return {"images": images, "intrinsic": K, "c2w": c2w}
 
 
+def split_eight_context_anchor_alternating(
+    context: dict[str, torch.Tensor], flip: bool = False,
+) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
+    """Build the fixed R1 two-branch context split from the formal 8 views."""
+    if context["images"].ndim != 5 or context["images"].shape[1] != 8:
+        raise ValueError("subset consistency requires an 8-view context")
+    a = [0, 7, 1, 3, 5]
+    b = [0, 7, 2, 4, 6]
+    if flip:
+        a, b = b, a
+    return (
+        {key: value[:, a] for key, value in context.items()},
+        {key: value[:, b] for key, value in context.items()},
+    )
+
+
 def make_official_target_meta(model_input: Any, image_hw: tuple[int, int]) -> dict[str, torch.Tensor]:
     decoder = _field(model_input, "decoder")
     cam_view = _field(decoder, "cam_view")

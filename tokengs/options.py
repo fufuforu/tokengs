@@ -739,6 +739,10 @@ class Options:
     eval_n_media_dumps: int = 0
     max_eval_iters: int = 0
     eval_before_training: bool = True
+    # GSI R1 reconstruction continuation can disable the expensive training-
+    # time validation path while retaining scalar logging.  This is opt-in
+    # and does not alter evaluation mode or any model/loss behavior.
+    gsi_v2_disable_training_eval: bool = False
     strict_checkpoint_loading: bool = True
 
     # --- test-time training (eval)
@@ -783,6 +787,15 @@ class Options:
     gsi_v2_query_heads: int = 8
     gsi_v2_recon_to_instance_grad_scale: float = 0.1
     gsi_v2_instance_loss_weight: float = 1.0
+    # Joint Phase-J schedules are configurable so the short355 probe can use
+    # its specified early adaptation window without changing the legacy joint
+    # preset defaults.
+    gsi_v2_instance_loss_warmup_steps: int = 500
+    gsi_v2_instance_to_reconstruction_start_step: int = 500
+    gsi_v2_instance_to_reconstruction_ramp_steps: int = 500
+    gsi_v2_instance_to_reconstruction_max: float = 0.1
+    gsi_v2_joint_instance_stream_init: Literal["copy_geometry", "fresh"] = "copy_geometry"
+    gsi_v2_schedule_uses_completed_step: bool = False
     gsi_v2_match_bce_weight: float = 1.0
     gsi_v2_match_dice_weight: float = 1.0
     gsi_v2_void_weight: float = 0.1
@@ -9437,7 +9450,28 @@ config_defaults["gsi_v2_recon_scannet_adapt"] = Options(
     globalsplat_instance_v2_phase="reconstruction", gsi_v2_resume_mode="official", gsi_v2_recon_loss_mode="official_vgg",
     use_instance_labels=False, gsi_v2_subset_consistency=True, num_epochs=3, max_iters_per_epoch=710, num_workers=8,
     gsi_v2_reconstruction_lr=1e-5, gsi_v2_lr_warmup_steps=200, mixed_precision="bf16",
+    tsh_ddp8=True, abs_ckpt_every=2130,
+    abs_ckpt_steps_extra=(250, 500, 1000, 1500, 2000, 2130),
+    abs_ckpt_full_state=True,
     workspace="workspace/gsi_v2_recon_scannet_adapt_ddp8", experiment_name="gsi_v2_recon_scannet_adapt_ddp8",
+)
+
+config_doc["gsi_v2_recon_scannet_adapt_resume1000"] = (
+    "Non-destructive GSI-v2 R1 continuation from the completed step-1000 "
+    "checkpoint.  Uses the same reconstruction/data/LR schedule, two data "
+    "workers per rank, and disables training-time media/validation only."
+)
+config_defaults["gsi_v2_recon_scannet_adapt_resume1000"] = (
+    config_defaults["gsi_v2_recon_scannet_adapt"].evolve(
+        gsi_v2_resume_mode="strict",
+        gsi_v2_disable_training_eval=True,
+        num_workers=2,
+        log_image_freq=0,
+        eval_n_media_dumps=0,
+        eval_before_training=False,
+        workspace="workspace/gsi_v2_recon_scannet_adapt_ddp8_resume1000",
+        experiment_name="gsi_v2_recon_scannet_adapt_ddp8_resume1000",
+    )
 )
 
 config_doc["gsi_v2_recon_scannet_eval"] = "Fixed-step GSI-v2 reconstruction evaluation."
@@ -9465,6 +9499,59 @@ config_defaults["gsi_v2_joint_scannet_train"] = Options(
     gsi_v2_joint_reconstruction_lr=2e-6, gsi_v2_instance_lr=1e-4, gsi_v2_lr_warmup_steps=200, mixed_precision="bf16",
     resume="workspace/gsi_v2_recon_scannet_adapt_ddp8/model.safetensors",
     workspace="workspace/gsi_v2_joint_scannet_ddp8", experiment_name="gsi_v2_joint_scannet_ddp8",
+)
+
+config_doc["gsi_v2_joint_scannet_short355_ddp8"] = (
+    "Short Phase-J geometry/appearance/instance three-branch probe from the "
+    "selected R1@250 reconstruction mother.  The legacy joint preset remains "
+    "unchanged; this preset uses the specified short schedule and fresh "
+    "instance/tri-stream initialization."
+)
+config_defaults["gsi_v2_joint_scannet_short355_ddp8"] = config_defaults[
+    "gsi_v2_joint_scannet_train"
+].evolve(
+    resume=(
+        "workspace/gsi_v2_recon_scannet_adapt_ddp8/checkpoints/"
+        "model_step_000250.safetensors"
+    ),
+    gsi_v2_resume_mode="phase_r_to_joint",
+    gsi_v2_recon_loss_mode="official_vgg",
+    instance_group_scene_level_matching=True,
+    num_epochs=1,
+    max_iters_per_epoch=355,
+    num_workers=2,
+    tsh_ddp8=True,
+    abs_ckpt_every=355,
+    abs_ckpt_steps_extra=(25, 50, 100, 200, 355),
+    abs_ckpt_full_state=True,
+    log_image_freq=0,
+    eval_n_media_dumps=0,
+    eval_before_training=False,
+    gsi_v2_disable_training_eval=True,
+    gsi_v2_joint_reconstruction_lr=2e-6,
+    gsi_v2_instance_lr=1e-4,
+    gsi_v2_lr_warmup_steps=25,
+    gsi_v2_lr_min_ratio=0.1,
+    gsi_v2_instance_loss_warmup_steps=50,
+    gsi_v2_instance_to_reconstruction_start_step=50,
+    gsi_v2_instance_to_reconstruction_ramp_steps=50,
+    gsi_v2_instance_to_reconstruction_max=0.1,
+    gsi_v2_joint_instance_stream_init="fresh",
+    gsi_v2_schedule_uses_completed_step=True,
+    # Keep the fresh instance stream independent during the initial 50-step
+    # instance warm-up.  Shared/geometry return flow is enabled separately by
+    # gsi_v2_instance_to_reconstruction_* after step 50.
+    gsi_v2_recon_to_instance_grad_scale=0.0,
+    gsi_v2_instance_loss_weight=1.0,
+    gsi_v2_match_bce_weight=1.0,
+    gsi_v2_match_dice_weight=1.0,
+    gsi_v2_void_weight=0.1,
+    gsi_v2_unmatched_weight=0.1,
+    gsi_v2_absent_view_weight=0.25,
+    gsi_v2_min_visible_pixels=32,
+    use_wandb=False,
+    workspace="workspace/gsi_v2_joint_scannet_short355_ddp8",
+    experiment_name="gsi_v2_joint_scannet_short355_ddp8",
 )
 
 config_doc["gsi_v2_joint_scannet_eval"] = "Fixed-step GSI-v2 joint evaluation."
