@@ -65,4 +65,11 @@ class SceneGlobalInstanceHead(nn.Module):
             assignment_probabilities.sum(-1), torch.ones_like(assignment_probabilities[..., 0]), atol=1e-5, rtol=1e-5
         ):
             raise RuntimeError("invalid instance assignment probabilities")
-        return InstanceDecode(e, objectness, queries, assignment_logits, assignment_probabilities)
+        return InstanceDecode(
+            gaussian_embeddings=e,
+            gaussian_objectness_logits=objectness,
+            object_queries=queries,
+            assignment_logits=assignment_logits,
+            assignment_probabilities=assignment_probabilities,
+            query_features=queries,
+        )

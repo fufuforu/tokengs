@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 from pathlib import Path
 
 import torch
@@ -33,6 +34,7 @@ from tokengs.models.ta_riu_v2 import (
     soft_unit_info_nce,
 )
 from tokengs.models.ta_riu_v3 import TARIUV3DualStream
+from tokengs.models.token_eru import TokenGSEarlyDualStreamDecoder
 
 
 class SemanticTokenGSv6(SemanticTokenGSv4):
@@ -60,6 +62,8 @@ class SemanticTokenGSv6(SemanticTokenGSv4):
         self.ta_riu_appearance_head = None
         self.ta_riu_v2_unit_encoder = None
         self.ta_riu_v3_dual_stream = None
+        self.token_eru_decoder = None
+        self.token_eru_unit_formation = None
         super().__init__(opt)
         num_groups = int(getattr(self.opt, "instance_group_num_groups", 64))
         head_input_dim = int(self.opt.token_dim)
@@ -1250,7 +1254,132 @@ class SemanticTokenGSv6(SemanticTokenGSv4):
                         _make_dense_cache("mid")
                     )
                 )
+        self._configure_token_eru()
         self.train(True)
+
+    def _configure_token_eru(self) -> None:
+        enabled = bool(getattr(self.opt, "token_eru_enabled", False))
+        mode = str(getattr(self.opt, "token_eru_mode", "disabled"))
+        if not enabled or mode in ("disabled", "identity"):
+            if enabled and mode not in ("identity", "disabled"):
+                raise ValueError(f"Unknown TokenGS-ERU mode: {mode}")
+            return
+        if mode != "early_dual_stream":
+            raise ValueError(f"Unknown TokenGS-ERU mode: {mode}")
+        if self.absolute_gs_head is None or self.tsh_instance_head is None:
+            raise RuntimeError(
+                "TokenGS-ERU requires the existing absolute unit and TSH heads"
+            )
+        self.token_eru_decoder = TokenGSEarlyDualStreamDecoder(
+            self.enc_dec_backbone.decoder_blocks,
+            decoder_dim=int(self.opt.enc_embed_dim),
+            num_blocks=int(self.opt.dec_depth),
+            adapter_bottleneck_dim=int(
+                getattr(self.opt, "token_eru_adapter_bottleneck_dim", 128)
+            ),
+        )
+        # This copy is deliberately created before loading the old checkpoint;
+        # train.py calls initialize_token_eru_from_reconstruction() after the
+        # old 24/50/324 namespaces have been restored.
+        self.token_eru_unit_formation = copy.deepcopy(self.absolute_gs_head)
+        self.requires_grad_(False)
+        self.tsh_instance_head.requires_grad_(True)
+        self.token_eru_decoder.understanding_decoder_blocks.requires_grad_(True)
+        self.token_eru_decoder.reconstruction_to_understanding.requires_grad_(True)
+        self.token_eru_decoder.understanding_to_reconstruction.requires_grad_(True)
+        self.token_eru_unit_formation.requires_grad_(True)
+        self.token_eru_decoder.set_gates(
+            reconstruction_to_understanding=0.0,
+            understanding_to_reconstruction=0.0,
+        )
+        print(
+            "[token-eru] early dual stream constructed: "
+            f"blocks={len(self.enc_dec_backbone.decoder_blocks)} "
+            f"decoder_dim={self.opt.enc_embed_dim}"
+        )
+
+    def initialize_token_eru_from_reconstruction(self) -> dict[str, int]:
+        """Copy loaded reconstruction modules into the fresh ERU branches."""
+        if self.token_eru_decoder is None:
+            return {"decoder_blocks": 0, "unit_keys": 0}
+        self.token_eru_decoder.initialize_understanding_from_reconstruction()
+        result = self.token_eru_unit_formation.load_state_dict(
+            self.absolute_gs_head.state_dict(), strict=True
+        )
+        if result.missing_keys or result.unexpected_keys:
+            raise RuntimeError(
+                "TokenGS-ERU strict unit-formation copy failed: "
+                f"missing={result.missing_keys}, "
+                f"unexpected={result.unexpected_keys}"
+            )
+        return {
+            "decoder_blocks": len(self.token_eru_decoder.understanding_decoder_blocks),
+            "unit_keys": len(self.absolute_gs_head.state_dict()),
+        }
+
+    @staticmethod
+    def token_eru_gates(step: int, opt) -> tuple[float, float]:
+        if int(step) < 0:
+            raise ValueError("TokenGS-ERU step must be non-negative")
+        r2u_steps = max(1, int(getattr(opt, "token_eru_r2u_ramp_steps", 25)))
+        u2r_start = int(getattr(opt, "token_eru_u2r_start_step", 25))
+        u2r_steps = max(1, int(getattr(opt, "token_eru_u2r_ramp_steps", 25)))
+        u2r_max = float(getattr(opt, "token_eru_u2r_max_gate", 0.1))
+        step = int(step)
+        r2u = 0.0 if step == 0 else min(1.0, step / r2u_steps)
+        if step <= u2r_start:
+            u2r = 0.0
+        else:
+            u2r = u2r_max * min(1.0, (step - u2r_start) / u2r_steps)
+        return float(r2u), float(u2r)
+
+    def set_token_eru_step(self, completed_optimizer_step: int) -> dict[str, float]:
+        if self.token_eru_decoder is None:
+            return {
+                "completed_optimizer_step": float(completed_optimizer_step),
+                "reconstruction_to_understanding_gate": 0.0,
+                "understanding_to_reconstruction_gate": 0.0,
+            }
+        r2u, u2r = self.token_eru_gates(completed_optimizer_step, self.opt)
+        self.token_eru_decoder.set_gates(
+            reconstruction_to_understanding=r2u,
+            understanding_to_reconstruction=u2r,
+        )
+        return {
+            "completed_optimizer_step": float(completed_optimizer_step),
+            "reconstruction_to_understanding_gate": r2u,
+            "understanding_to_reconstruction_gate": u2r,
+        }
+
+    def _forward_abs_hidden(self, model_input):
+        if self.token_eru_decoder is None:
+            return super()._forward_abs_hidden(model_input)
+        encoder_latent = self.forward_encoder(model_input.encoder)
+        self._last_encoder_values = encoder_latent.values
+        self._last_encoder_memory_meta = {
+            "shape": list(encoder_latent.values.shape),
+            "layout": "[B, num_heads, sequence_length, head_dim]",
+            "num_heads": int(encoder_latent.values.shape[1]),
+            "sequence_length": int(encoder_latent.values.shape[2]),
+            "head_dim": int(encoder_latent.values.shape[3]),
+        }
+        gs_tokens = self.get_gs_tokens(
+            encoder_latent.keys.shape[0],
+            encoder_latent=encoder_latent,
+            decoder_input=model_input.decoder,
+        )
+        gs_tokens = self._apply_time_embedding_to_gs_tokens(
+            gs_tokens, model_input.decoder
+        )
+        r_hidden, u_hidden = self.token_eru_decoder(
+            gs_tokens, encoder_latent
+        )
+        self._token_eru_last_reconstruction_tokens = r_hidden
+        self._token_eru_last_understanding_tokens = u_hidden
+        self._token_eru_understanding_units = self.token_eru_unit_formation.form_units(
+            u_hidden
+        )
+        return r_hidden
 
     def forward(
         self,

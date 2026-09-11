@@ -32,6 +32,7 @@ class InstanceDecode:
     object_queries: torch.Tensor
     assignment_logits: torch.Tensor
     assignment_probabilities: torch.Tensor
+    query_features: torch.Tensor
 
 
 @dataclass(frozen=True)
@@ -51,3 +52,4 @@ class GSIModelOutput:
     layout: CandidateLayout
     instance: InstanceDecode | None
     rendered_assignment: torch.Tensor | None
+    semantic_query_logits: torch.Tensor | None

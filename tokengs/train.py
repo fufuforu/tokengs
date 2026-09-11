@@ -19,6 +19,7 @@ import os
 import json
 import datetime
 import glob
+import hashlib
 import shutil
 import subprocess
 from dataclasses import asdict
@@ -31,6 +32,7 @@ from safetensors.torch import load_file, save_file
 
 import imageio
 import numpy as np
+import yaml
 
 from tokengs.options import AllConfigs
 from tokengs.data import get_multi_dataloader
@@ -235,6 +237,7 @@ def load_model_checkpoint(opt, model, accelerator, epoch_start):
             if bool(getattr(opt, "tsh_query_memory_refine_probe", False))
             or bool(getattr(opt, "ta_riu_v2_enabled", False))
             or bool(getattr(opt, "ta_riu_v3_enabled", False))
+            or bool(getattr(opt, "token_eru_enabled", False))
             else model.state_dict()
         )
         # Frozen-backbone recipes save prompt checkpoints without the
@@ -579,6 +582,7 @@ def load_model_checkpoint(opt, model, accelerator, epoch_start):
                 native_state = (
                     nn.Module.state_dict(model)
                     if bool(getattr(opt, "ta_riu_v2_enabled", False))
+                    or bool(getattr(opt, "token_eru_enabled", False))
                     else model.state_dict()
                 )
                 expected = [
@@ -763,6 +767,54 @@ def load_model_checkpoint(opt, model, accelerator, epoch_start):
                         "checkpoint: initialized fresh; abs/TSH continuation "
                         "was not reset"
                     )
+                if bool(getattr(opt, "token_eru_enabled", False)):
+                    eru_prefixes = (
+                        "token_eru_decoder.",
+                        "token_eru_unit_formation.",
+                    )
+                    ckpt_has_eru = any(
+                        key.startswith(eru_prefixes) for key in ckpt
+                    )
+                    model._token_eru_loaded_from_checkpoint = False
+                    if ckpt_has_eru:
+                        eru_expected = [
+                            key
+                            for key in native_state
+                            if key.startswith(eru_prefixes)
+                        ]
+                        eru_loadable = {
+                            key: ckpt[key]
+                            for key in ckpt
+                            if key.startswith(eru_prefixes)
+                            and key in native_state
+                            and native_state[key].shape == ckpt[key].shape
+                        }
+                        eru_missing = [
+                            key for key in eru_expected if key not in eru_loadable
+                        ]
+                        eru_unexpected = [
+                            key
+                            for key in ckpt
+                            if key.startswith(eru_prefixes)
+                            and key not in eru_loadable
+                        ]
+                        if eru_missing or eru_unexpected:
+                            raise RuntimeError(
+                                f"[{checkpoint_label}] TokenGS-ERU strict "
+                                "continuation failed: "
+                                f"missing={eru_missing[:5]} "
+                                f"unexpected={eru_unexpected[:5]}"
+                            )
+                        nn.Module.load_state_dict(
+                            model, eru_loadable, strict=False
+                        )
+                        model._token_eru_loaded_from_checkpoint = True
+                        accelerator.print(
+                            f"[{checkpoint_label}] TokenGS-ERU strict "
+                            f"restore: decoder/unit keys "
+                            f"{len(eru_loadable)}/{len(eru_expected)}, "
+                            "fresh copy skipped"
+                        )
                 if reinit:
                     # Fixed, reproducible fresh seed for the very first fork.
                     fresh_seed = (int(opt.seed) + 987654321) % (2**31)
@@ -1061,25 +1113,31 @@ def _initialize_dynamic_tokens_from_static(ckpt, state_dict, accelerator):
 def _setup_gsi_v2_optimizer(opt, model, accelerator, epoch_start):
     reconstruction = list(model.reconstruction_named_parameters())
     instance = list(model.instance_named_parameters())
+    semantic = list(model.semantic_named_parameters()) if hasattr(model, "semantic_named_parameters") else []
     instance_ids = {id(parameter) for _, parameter in instance}
+    semantic_ids = {id(parameter) for _, parameter in semantic}
     reconstruction = [(name, parameter) for name, parameter in reconstruction if id(parameter) not in instance_ids]
-    seen = [id(parameter) for _, parameter in reconstruction + instance]
+    reconstruction = [(name, parameter) for name, parameter in reconstruction if id(parameter) not in semantic_ids]
+    instance = [(name, parameter) for name, parameter in instance if id(parameter) not in semantic_ids]
+    seen = [id(parameter) for _, parameter in reconstruction + instance + semantic]
     trainable = {id(parameter) for parameter in model.parameters() if parameter.requires_grad}
     if len(seen) != len(set(seen)) or set(seen) != trainable:
         raise RuntimeError("[gsi-v2] optimizer parameter groups are not a disjoint complete partition")
     groups = []
-    def add(entries, lr):
+    def add(entries, lr, group_name):
         decay = [p for _, p in entries if p.ndim != 1 and not getattr(p, "_no_weight_decay", False)]
         nodecay = [p for _, p in entries if p.ndim == 1 or getattr(p, "_no_weight_decay", False)]
         if decay:
-            groups.append({"params": decay, "lr": float(lr), "weight_decay": float(opt.weight_decay)})
+            groups.append({"name": group_name, "params": decay, "lr": float(lr), "weight_decay": float(opt.weight_decay)})
         if nodecay:
-            groups.append({"params": nodecay, "lr": float(lr), "weight_decay": 0.0})
+            groups.append({"name": group_name, "params": nodecay, "lr": float(lr), "weight_decay": 0.0})
     if model.phase == "reconstruction":
-        add(reconstruction, opt.gsi_v2_reconstruction_lr)
+        add(reconstruction, opt.gsi_v2_reconstruction_lr, "gsi_v2_reconstruction")
     else:
-        add(reconstruction, opt.gsi_v2_joint_reconstruction_lr)
-        add(instance, opt.gsi_v2_instance_lr)
+        add(reconstruction, opt.gsi_v2_joint_reconstruction_lr, "gsi_v2_reconstruction")
+        add(instance, opt.gsi_v2_instance_lr, "gsi_v2_instance")
+        if semantic:
+            add(semantic, opt.gsi_v21_semantic_head_lr, "gsi_v21_semantic_head")
     try:
         optimizer = torch.optim.AdamW(groups, betas=(0.9, 0.95), fused=True)
     except (TypeError, RuntimeError):
@@ -1094,6 +1152,81 @@ def setup_optimizer(opt, model, accelerator, epoch_start):
     """Setup optimizer. Call before accelerator.prepare()."""
     if getattr(opt, "model_type", None) == "globalsplat_instance_v2":
         return _setup_gsi_v2_optimizer(opt, model, accelerator, epoch_start)
+    if bool(getattr(opt, "token_eru_enabled", False)):
+        mode = str(getattr(opt, "token_eru_mode", "disabled"))
+        if mode == "identity":
+            raise RuntimeError("TokenGS-ERU identity mode is evaluation-only")
+        if mode != "early_dual_stream":
+            raise RuntimeError(f"Unknown TokenGS-ERU optimizer mode: {mode}")
+        groups = []
+
+        def add_group(prefixes, lr, name):
+            decay, nodecay = [], []
+            for parameter_name, parameter in model.named_parameters():
+                if not parameter.requires_grad or not any(
+                    parameter_name.startswith(prefix) for prefix in prefixes
+                ):
+                    continue
+                target = nodecay if parameter.ndim == 1 or getattr(
+                    parameter, "_no_weight_decay", False
+                ) else decay
+                target.append(parameter)
+            if decay:
+                groups.append(
+                    {
+                        "params": decay,
+                        "lr": float(lr),
+                        "weight_decay": float(opt.weight_decay),
+                        "name": name,
+                    }
+                )
+            if nodecay:
+                groups.append(
+                    {
+                        "params": nodecay,
+                        "lr": float(lr),
+                        "weight_decay": 0.0,
+                        "name": name,
+                    }
+                )
+
+        add_group(("tsh_instance_head.",), opt.token_eru_tsh_lr, "tsh_instance_head")
+        add_group(
+            ("token_eru_unit_formation.",),
+            opt.token_eru_understanding_lr,
+            "understanding_unit_formation",
+        )
+        add_group(
+            ("token_eru_decoder.understanding_decoder_blocks.",),
+            opt.token_eru_understanding_lr,
+            "understanding_decoder",
+        )
+        add_group(
+            (
+                "token_eru_decoder.reconstruction_to_understanding.",
+                "token_eru_decoder.understanding_to_reconstruction.",
+            ),
+            opt.token_eru_adapter_lr,
+            "pair_adapters",
+        )
+        if not groups:
+            raise RuntimeError("TokenGS-ERU produced no trainable optimizer groups")
+        try:
+            optimizer = torch.optim.AdamW(
+                groups, lr=float(opt.lr), betas=(0.9, 0.95), fused=True
+            )
+        except (TypeError, RuntimeError):
+            optimizer = torch.optim.AdamW(
+                groups, lr=float(opt.lr), betas=(0.9, 0.95)
+            )
+        accelerator.print(
+            "[token-eru] optimizer groups: "
+            + ", ".join(
+                f"{group['name']}:{len(group['params'])}@{group['lr']}"
+                for group in groups
+            )
+        )
+        return optimizer
     decay_params, nodecay_params = [], []
     geometry_decay, geometry_nodecay = [], []
     guarded_abs_decay, guarded_abs_nodecay = [], []
@@ -1436,6 +1569,31 @@ def setup_scheduler(opt, optimizer, iters_per_epoch, accelerator, epoch_start):
     return scheduler
 
 
+def _gsi_v21_metadata(opt):
+    if not bool(getattr(opt, "gsi_v21_semantic_enabled", False)):
+        return {
+            "semantic_enabled": False,
+            "num_semantic_classes": int(getattr(opt, "gsi_v21_semantic_num_classes", -1)),
+        }
+    protocol_path = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        "configs", "semantic", "scannet_c3g8.yaml",
+    )
+    protocol = yaml.safe_load(open(protocol_path, encoding="utf-8"))
+    class_names = [str(item["name"]) for item in sorted(protocol["classes"], key=lambda item: int(item["train_id"]))]
+    return {
+        "semantic_enabled": True,
+        "num_semantic_classes": int(opt.gsi_v21_semantic_num_classes),
+        "semantic_class_names": class_names,
+        "semantic_label_mapping_sha256": hashlib.sha256(open(protocol_path, "rb").read()).hexdigest(),
+        "semantic_loss_weight": float(opt.gsi_v21_semantic_loss_weight),
+        "semantic_match_cost_weight": float(opt.gsi_v21_semantic_match_cost_weight),
+        "semantic_warmup_steps": int(opt.gsi_v21_semantic_warmup_steps),
+        "semantic_eos_coef": float(opt.gsi_v21_semantic_eos_coef),
+        "semantic_min_purity": float(opt.gsi_v21_semantic_min_purity),
+    }
+
+
 def save_checkpoint(
     opt, accelerator, model, optimizer, scheduler, epoch, wandb_run_id, global_step
 ):
@@ -1462,6 +1620,7 @@ def save_checkpoint(
                 "global_batch": int(opt.batch_size) * int(getattr(accelerator, "num_processes", 1)),
                 "gsi_v2_vgg_sha256": vgg_sha,
             })
+            metadata.update(_gsi_v21_metadata(opt))
         if bool(getattr(opt, "tsh_ddp8", False)):
             world = int(getattr(accelerator, "num_processes", 1))
             gbs = int(opt.batch_size) * world
@@ -1526,6 +1685,7 @@ def save_gsi_v2_step0_snapshot(opt, accelerator, model, optimizer, scheduler):
             "checkpoint_numel": int(sum(value.numel() for value in state.values())),
             "lineage": unwrapped.lineage_metadata(),
         }
+        metadata.update(_gsi_v21_metadata(opt))
         with open(os.path.join(ckpt_dir, "metadata_step_000000.json"), "w", encoding="utf-8") as handle:
             json.dump(metadata, handle, indent=2)
     if bool(getattr(opt, "abs_ckpt_full_state", False)):
@@ -1825,6 +1985,7 @@ def save_gsi_v2_intra_epoch_checkpoint_synchronized(
                 ),
                 "checkpoint_protocol": "shared_fs_sentinel_v1",
             }
+            metadata.update(_gsi_v21_metadata(opt))
             metadata_path = os.path.join(ckpt_dir, metadata_name)
             metadata_tmp = f"{metadata_path}.tmp.{os.getpid()}"
             with open(metadata_tmp, "w", encoding="utf-8") as handle:
@@ -2351,6 +2512,8 @@ def train_epoch(opt, accelerator, model, optimizer, scheduler, train_dataloader,
         global_step_for_aux = global_step
         completed_step = global_step + 1
         unwrapped_model = accelerator.unwrap_model(model)
+        if hasattr(unwrapped_model, "set_token_eru_step"):
+            unwrapped_model.set_token_eru_step(completed_step)
         if getattr(opt, "model_type", None) == "globalsplat_instance_v2":
             schedule_step = (
                 completed_step
@@ -2675,6 +2838,13 @@ def train_epoch(opt, accelerator, model, optimizer, scheduler, train_dataloader,
             "loss_dice",
             "loss_boundary_rgb",
             "loss_instance_group",
+            "loss_semantic_query_raw",
+            "semantic_loss_weight_eff",
+            "loss_semantic_query_weighted",
+            "semantic_match_cost_weight_eff",
+            "gsi_v21_matched_semantic_accuracy",
+            "gsi_v21_semantic_valid_object_ratio",
+            "gsi_v21_no_object_prediction_ratio",
             "instance_group_gt_count",
             "instance_group_matched_count",
             "instance_group_active_count",
@@ -3846,6 +4016,17 @@ def main():
     load_model_checkpoint(opt, model, accelerator, epoch_start)
     load_fresh_backbone_resume(opt, model, accelerator)
     load_semantic_adapter_resume(opt, model, accelerator)
+    if (
+        hasattr(model, "initialize_token_eru_from_reconstruction")
+        and not getattr(model, "_token_eru_loaded_from_checkpoint", False)
+    ):
+        report = model.initialize_token_eru_from_reconstruction()
+        if report["decoder_blocks"]:
+            accelerator.print(
+                "[token-eru] copied loaded reconstruction modules: "
+                f"decoder_blocks={report['decoder_blocks']} "
+                f"unit_keys={report['unit_keys']}"
+            )
     
     # Data
     train_dataloader, test_dataloader, train_dataset, test_dataset = get_multi_dataloader(opt, accelerator)

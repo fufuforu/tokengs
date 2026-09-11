@@ -1880,7 +1880,9 @@ class SemanticTokenGSv4(PromptTokenGS):
                 getattr(self.opt, "ta_riu_enabled", False)
             ) or str(
                 getattr(self.opt, "ga_idu_mode", "off")
-            ) in ("0", "1"):
+            ) in ("0", "1") or bool(
+                getattr(self.opt, "token_eru_enabled", False)
+            ):
                 keep = keep or name.startswith(
                     (
                         "absolute_gs_head.",
@@ -2679,6 +2681,7 @@ class SemanticTokenGSv4(PromptTokenGS):
         ta_riu_v3_align_raw = torch.zeros(
             (), device=next(self.parameters()).device
         )
+        token_eru_active = getattr(self, "token_eru_decoder", None) is not None
         teacher_on = abs_mode and self.training and (
             float(getattr(self, "teacher_lambda_eff", 0.0)) > 0.0
         )
@@ -2706,7 +2709,12 @@ class SemanticTokenGSv4(PromptTokenGS):
             else:
                 # Teacher off: skip the old GS head entirely.  The student
                 # forward/backward goes Token->Unit->GS only.
-                if bool(
+                if token_eru_active:
+                    # ERU must retain autograd through both new streams even
+                    # though the original reconstruction modules are frozen:
+                    # u2r adapters need the live frozen-path Jacobian.
+                    gs_token_hidden = self._forward_abs_hidden(model_input)
+                elif bool(
                     getattr(self.opt, "prompt_unfreeze_tokengs", False)
                 ) and float(
                     getattr(self.opt, "tsh_mbm_decoder_tail_lr", 0.0)
@@ -2869,7 +2877,11 @@ class SemanticTokenGSv4(PromptTokenGS):
                 self._tsh_last_student_gaussians = new_gaussians.detach().clone()
                 q_abs_for_instance = ta_riu_z_shared
             elif not ta_riu_v3_enabled:
-                q_abs_for_instance = q_abs
+                q_abs_for_instance = (
+                    getattr(self, "_token_eru_understanding_units", q_abs)
+                    if token_eru_active
+                    else q_abs
+                )
             reconstruction = self._reconstruction_from_gaussians(
                 new_gaussians
             )

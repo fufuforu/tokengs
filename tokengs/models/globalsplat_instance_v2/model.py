@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import copy
 import hashlib
+import math
 from dataclasses import replace
+from numbers import Integral, Real
 from pathlib import Path
 from typing import Any
 
@@ -22,8 +24,28 @@ from .instance_head import SceneGlobalInstanceHead
 from .renderer import normalize_rendered_assignment, render_feature_channels_sh_geometry, render_rgb_sh
 from .reconstruction_loss import GSIReconstructionLoss
 from .scene_instance_loss import scene_global_hungarian_instance_loss
+from .semantic_query_head import SemanticQueryHead
 from .tri_stream import build_tri_stream_slot_encoder
 from .types import GSIModelOutput
+
+
+def render_query_semantic_probabilities(
+    rendered_assignment: torch.Tensor,
+    semantic_query_logits: torch.Tensor,
+) -> torch.Tensor:
+    """Project query class probabilities through rendered query masks."""
+    if rendered_assignment.ndim != 6 or rendered_assignment.shape[1] != 101:
+        raise ValueError("rendered_assignment must be [B,101,V,1,H,W]")
+    if semantic_query_logits.ndim != 3 or semantic_query_logits.shape[:2] != (rendered_assignment.shape[0], 100):
+        raise ValueError("semantic_query_logits must be [B,100,C+1]")
+    query_masks = rendered_assignment[:, :100, :, 0]
+    with torch.autocast(device_type=semantic_query_logits.device.type, enabled=False):
+        query_class_prob = F.softmax(semantic_query_logits.float(), dim=-1)
+        semantic = torch.einsum("bqvhw,bqc->bcvhw", query_masks.float(), query_class_prob)
+        semantic = semantic.permute(0, 2, 1, 3, 4).contiguous()
+        semantic[:, :, -1] = semantic[:, :, -1] + rendered_assignment[:, 100, :, 0].float()
+        semantic = semantic / semantic.sum(dim=2, keepdim=True).clamp_min(1e-8)
+    return semantic
 
 
 class GlobalSplatInstanceV2(nn.Module):
@@ -50,6 +72,7 @@ class GlobalSplatInstanceV2(nn.Module):
             )
         self.reconstruction.set_stage(3, mix=1.0)
         self.instance_head = None
+        self.semantic_query_head = None
         if self.phase == "joint":
             dual_state = dict(self.reconstruction.slot_encoder.state_dict())
             tri = build_tri_stream_slot_encoder(
@@ -65,6 +88,15 @@ class GlobalSplatInstanceV2(nn.Module):
                 slot_dim=512, embedding_dim=64, num_queries=100, max_candidates=16,
                 query_layers=2, query_heads=8, temperature_init=10.0,
             )
+            if bool(getattr(opt, "gsi_v21_semantic_enabled", False)):
+                num_classes = int(getattr(opt, "gsi_v21_semantic_num_classes", -1))
+                if num_classes <= 0:
+                    raise ValueError("gsi_v21_semantic_num_classes must be set by the C3G8 audit")
+                self.semantic_query_head = SemanticQueryHead(
+                    query_dim=int(opt.gsi_v2_instance_embedding_dim),
+                    num_semantic_classes=num_classes,
+                    init_seed=int(getattr(opt, "gsi_v21_semantic_init_seed", 3407)),
+                )
         self.reconstruction_loss = GSIReconstructionLoss(
             symbols=self.symbols, mode=opt.gsi_v2_recon_loss_mode,
             vgg_weight_path=opt.gsi_v2_vgg_weight_path,
@@ -84,6 +116,9 @@ class GlobalSplatInstanceV2(nn.Module):
             parameter.requires_grad_(True)
         if self.instance_head is not None:
             for parameter in self.instance_head.parameters():
+                parameter.requires_grad_(True)
+        if self.semantic_query_head is not None:
+            for parameter in self.semantic_query_head.parameters():
                 parameter.requires_grad_(True)
         if self.reconstruction_loss.perceptual_loss is not None:
             for parameter in self.reconstruction_loss.perceptual_loss.parameters():
@@ -111,23 +146,63 @@ class GlobalSplatInstanceV2(nn.Module):
             self.reconstruction.slot_encoder.ins_rounds = copy.deepcopy(self.reconstruction.slot_encoder.geo_rounds)
         return {"reconstruction_keys": len(recon_keys), "loaded_reconstruction_keys": len(recon_keys), "missing": (), "unexpected": (), "shape_mismatch": ()}
 
-    def set_train_step(self, optimizer_step: int) -> None:
-        self._train_step = int(optimizer_step)
+    def _compute_schedule(self, completed_optimizer_step: int, *, gate_override: float | None = None) -> dict[str, float]:
+        """Pure short355 schedule calculation shared by train and eval paths."""
         if self.phase == "reconstruction":
-            self._gate = 0.0
-            self._gate_gradient_scale = 0.0
-            self._instance_weight = 0.0
+            instance_weight = 0.0
+            gate = 0.0
         else:
             instance_warmup = max(1, int(getattr(self.opt, "gsi_v2_instance_loss_warmup_steps", 500)))
             injection_start = int(getattr(self.opt, "gsi_v2_instance_to_reconstruction_start_step", 500))
             injection_ramp = max(1, int(getattr(self.opt, "gsi_v2_instance_to_reconstruction_ramp_steps", 500)))
-            injection_max = float(getattr(self.opt, "gsi_v2_instance_to_reconstruction_max", 0.1))
-            self._gate = (
-                0.0 if optimizer_step < injection_start
-                else min(1.0, (optimizer_step - injection_start) / injection_ramp)
+            instance_weight = min(1.0, max(0.0, completed_optimizer_step / instance_warmup))
+            gate = (
+                0.0 if completed_optimizer_step < injection_start
+                else min(1.0, (completed_optimizer_step - injection_start) / injection_ramp)
             )
-            self._gate_gradient_scale = injection_max * self._gate
-            self._instance_weight = min(1.0, max(0.0, optimizer_step / instance_warmup))
+        if gate_override is not None:
+            gate = gate_override
+        injection_max = float(getattr(self.opt, "gsi_v2_instance_to_reconstruction_max", 0.1))
+        return {
+            "completed_optimizer_step": float(completed_optimizer_step),
+            "instance_weight": float(instance_weight),
+            "gate": float(gate),
+            "gate_gradient_scale": float(injection_max * gate),
+        }
+
+    def set_train_step(self, optimizer_step: int) -> None:
+        self._train_step = int(optimizer_step)
+        schedule = self._compute_schedule(self._train_step)
+        self._gate = schedule["gate"]
+        self._gate_gradient_scale = schedule["gate_gradient_scale"]
+        self._instance_weight = schedule["instance_weight"]
+
+    def set_eval_schedule(
+        self,
+        completed_optimizer_step: int,
+        *,
+        gate_override: float | None = None,
+    ) -> dict[str, float]:
+        """Restore the non-persistent training schedule for checkpoint evaluation."""
+        if isinstance(completed_optimizer_step, bool) or not isinstance(completed_optimizer_step, Integral):
+            raise TypeError("completed_optimizer_step must be a non-negative integer")
+        completed_optimizer_step = int(completed_optimizer_step)
+        if completed_optimizer_step < 0:
+            raise ValueError("completed_optimizer_step must be non-negative")
+        if gate_override is not None:
+            if isinstance(gate_override, bool) or not isinstance(gate_override, Real):
+                raise TypeError("gate_override must be a finite real number")
+            gate_override = float(gate_override)
+            if not math.isfinite(gate_override):
+                raise ValueError("gate_override must be finite")
+            if gate_override < 0.0 or gate_override > 1.0:
+                raise ValueError("gate_override must be in [0, 1]")
+        self._train_step = completed_optimizer_step
+        schedule = self._compute_schedule(completed_optimizer_step, gate_override=gate_override)
+        self._gate = schedule["gate"]
+        self._gate_gradient_scale = schedule["gate_gradient_scale"]
+        self._instance_weight = schedule["instance_weight"]
+        return schedule
 
     def set_eval_stage(self) -> None:
         self.reconstruction.set_stage(3, mix=1.0)
@@ -139,6 +214,14 @@ class GlobalSplatInstanceV2(nn.Module):
         if self.instance_head is None:
             return []
         return [(f"reconstruction.slot_encoder.{name}", parameter) for name, parameter in self.reconstruction.slot_encoder.named_parameters() if name.startswith(("slot_to_ins.", "ins_rounds.", "tri_adapters."))] + [(f"instance_head.{name}", parameter) for name, parameter in self.instance_head.named_parameters()]
+
+    def semantic_named_parameters(self) -> list[tuple[str, nn.Parameter]]:
+        if self.semantic_query_head is None:
+            return []
+        return [
+            (f"semantic_query_head.{name}", parameter)
+            for name, parameter in self.semantic_query_head.named_parameters()
+        ]
 
     def _official_gaussians(self, model_input, context):
         tokens = self.reconstruction._tokenize(context["images"], context["intrinsic"], context["c2w"])
@@ -174,10 +257,13 @@ class GlobalSplatInstanceV2(nn.Module):
         rgb = render_rgb_sh(self.symbols, gaussians, target_meta, render_depth=True)
         instance = None
         rendered_assignment = None
+        semantic_query_logits = None
         if compute_instance:
             if self.instance_head is None or scene_ins is None:
                 raise RuntimeError("instance forward requested in reconstruction phase")
             instance = self.instance_head(scene_ins, layout, gate_gradient_scale=self._gate_gradient_scale)
+            if self.semantic_query_head is not None:
+                semantic_query_logits = self.semantic_query_head(instance.query_features)
             # Render all 101 assignment channels in one pass: 100 foreground
             # queries plus the head's channel-100 void probability.  The
             # normalizer preserves that void channel and only overrides it at
@@ -201,7 +287,10 @@ class GlobalSplatInstanceV2(nn.Module):
                 self.symbols, instance_gaussians, instance.assignment_probabilities, target_meta, packed=False
             )
             rendered_assignment = normalize_rendered_assignment(composed, alpha)
-        return GSIModelOutput(gaussians, rgb["images_pred"], rgb["alphas_pred"], rgb["depths_pred"], layout, instance, rendered_assignment)
+        return GSIModelOutput(
+            gaussians, rgb["images_pred"], rgb["alphas_pred"], rgb["depths_pred"],
+            layout, instance, rendered_assignment, semantic_query_logits,
+        )
 
     def forward(self, data: dict, skip_loss: bool = False) -> dict[str, torch.Tensor]:
         compute_instance = self.instance_enabled
@@ -293,16 +382,47 @@ class GlobalSplatInstanceV2(nn.Module):
             instance_loss = zero
             stats = loss_stats
             if compute_instance and output.rendered_assignment is not None and "instance_label_output" in data:
+                semantic_enabled = self.semantic_query_head is not None
+                semantic_warmup = max(1, int(getattr(self.opt, "gsi_v21_semantic_warmup_steps", 50)))
+                semantic_ramp = min(1.0, max(0.0, float(self._train_step) / float(semantic_warmup)))
+                semantic_match_weight_eff = (
+                    float(getattr(self.opt, "gsi_v21_semantic_match_cost_weight", 1.0)) * semantic_ramp
+                    if semantic_enabled else 0.0
+                )
+                semantic_loss_weight_eff = (
+                    float(getattr(self.opt, "gsi_v21_semantic_loss_weight", 1.0)) * semantic_ramp
+                    if semantic_enabled else 0.0
+                )
                 instance_loss, instance_stats, _ = scene_global_hungarian_instance_loss(
                     output.rendered_assignment, data["instance_label_output"].long(),
                     num_queries=100, min_visible_pixels=int(self.opt.gsi_v2_min_visible_pixels),
                     bce_weight=float(self.opt.gsi_v2_match_bce_weight), dice_weight=float(self.opt.gsi_v2_match_dice_weight),
                     void_weight=float(self.opt.gsi_v2_void_weight), unmatched_weight=float(self.opt.gsi_v2_unmatched_weight),
                     absent_view_weight=float(self.opt.gsi_v2_absent_view_weight),
+                    semantic_query_logits=output.semantic_query_logits if semantic_enabled else None,
+                    semantic_labels=data.get("semantic_label_output") if semantic_enabled else None,
+                    semantic_match_cost_weight_eff=semantic_match_weight_eff,
+                    semantic_loss_weight_eff=semantic_loss_weight_eff,
+                    semantic_eos_coef=float(getattr(self.opt, "gsi_v21_semantic_eos_coef", 0.1)),
+                    semantic_min_purity=float(getattr(self.opt, "gsi_v21_semantic_min_purity", 0.95)),
+                    semantic_raw_to_contiguous={
+                        value: value - 1
+                        for value in range(1, int(getattr(self.opt, "gsi_v21_semantic_num_classes", 8)) + 1)
+                    },
                 )
                 instance_total = float(getattr(self, "_instance_weight", 1.0)) * float(self.opt.gsi_v2_instance_loss_weight) * instance_loss
                 loss = loss + instance_total
                 stats.update(instance_stats)
+                if semantic_enabled:
+                    semantic_raw = instance_stats["gsi_v21_loss_semantic_query_raw"]
+                    semantic_weighted = semantic_loss_weight_eff * semantic_raw
+                    loss = loss + semantic_weighted
+                    stats.update({
+                        "loss_semantic_query_raw": semantic_raw,
+                        "semantic_loss_weight_eff": output.rendered_assignment.new_tensor(semantic_loss_weight_eff),
+                        "loss_semantic_query_weighted": semantic_weighted,
+                        "semantic_match_cost_weight_eff": output.rendered_assignment.new_tensor(semantic_match_weight_eff),
+                    })
             else:
                 instance_total = zero
         result = {
@@ -324,6 +444,11 @@ class GlobalSplatInstanceV2(nn.Module):
                 "loss_instance_group": instance_loss,
                 "tsh_instance_loss_weight": torch.as_tensor(getattr(self, "_instance_weight", 1.0), device=pred.device),
             })
+            if output.semantic_query_logits is not None:
+                result["semantic_query_logits"] = output.semantic_query_logits
+                result["semantic_probabilities"] = render_query_semantic_probabilities(
+                    output.rendered_assignment, output.semantic_query_logits
+                )
             # Diagnostics may request the pre-render tensors needed to audit
             # visible-unit/assignment changes.  Keep these opt-in so the
             # normal forward/checkpoint interface and memory footprint are

@@ -225,6 +225,19 @@ class Options:
     tsh_num_groups: int = 100
     tsh_num_heads: int = 8
     tsh_num_layers: int = 2
+    # TokenGS Early Reconstruction--Understanding dual stream.  All fields
+    # are disabled by default so every pre-existing TokenGS/semantic preset
+    # retains its original graph and optimizer partition.
+    token_eru_enabled: bool = False
+    token_eru_mode: str = "disabled"
+    token_eru_adapter_bottleneck_dim: int = 128
+    token_eru_tsh_lr: float = 3.0e-5
+    token_eru_understanding_lr: float = 3.0e-5
+    token_eru_adapter_lr: float = 1.0e-4
+    token_eru_r2u_ramp_steps: int = 25
+    token_eru_u2r_start_step: int = 25
+    token_eru_u2r_ramp_steps: int = 25
+    token_eru_u2r_max_gate: float = 0.1
     # True-Shared DDP8 variant marker: stage thresholds are expressed in
     # DDP optimizer steps (125 / 710 / ...) and extra metadata is written.
     tsh_ddp8: bool = False
@@ -809,6 +822,17 @@ class Options:
     gsi_v2_lr_min_ratio: float = 0.02
     gsi_v2_subset_consistency: bool = False
     gsi_v2_return_debug_tensors: bool = False
+
+    # --- GSI-v2.1 semantic-anchored scene object queries
+    gsi_v21_semantic_enabled: bool = False
+    gsi_v21_semantic_num_classes: int = -1
+    gsi_v21_semantic_loss_weight: float = 1.0
+    gsi_v21_semantic_match_cost_weight: float = 1.0
+    gsi_v21_semantic_warmup_steps: int = 50
+    gsi_v21_semantic_eos_coef: float = 0.1
+    gsi_v21_semantic_min_purity: float = 0.95
+    gsi_v21_semantic_head_lr: float = 1e-4
+    gsi_v21_semantic_init_seed: int = 3407
 
     def __post_init__(self) -> None:
         if self.dec_patch_size is None:
@@ -9554,6 +9578,40 @@ config_defaults["gsi_v2_joint_scannet_short355_ddp8"] = config_defaults[
     experiment_name="gsi_v2_joint_scannet_short355_ddp8",
 )
 
+config_doc["gsi_v21_maskonly_short200_ddp8"] = (
+    "GSI-v2.1 matched mask-only control from the R1@250 reconstruction mother."
+)
+config_defaults["gsi_v21_maskonly_short200_ddp8"] = config_defaults[
+    "gsi_v2_joint_scannet_short355_ddp8"
+].evolve(
+    gsi_v21_semantic_enabled=False,
+    gsi_v21_semantic_num_classes=8,
+    max_iters_per_epoch=200,
+    abs_ckpt_every=200,
+    abs_ckpt_steps_extra=(25, 50, 100, 150, 200),
+    workspace="workspace/gsi_v21_maskonly_short200_ddp8",
+    experiment_name="gsi_v21_maskonly_short200_ddp8",
+)
+
+config_doc["gsi_v21_semantic_short200_ddp8"] = (
+    "GSI-v2.1 semantic-anchored instance-query treatment from the same R1@250 mother."
+)
+config_defaults["gsi_v21_semantic_short200_ddp8"] = config_defaults[
+    "gsi_v21_maskonly_short200_ddp8"
+].evolve(
+    gsi_v21_semantic_enabled=True,
+    gsi_v21_semantic_num_classes=8,
+    gsi_v21_semantic_loss_weight=1.0,
+    gsi_v21_semantic_match_cost_weight=1.0,
+    gsi_v21_semantic_warmup_steps=50,
+    gsi_v21_semantic_eos_coef=0.1,
+    gsi_v21_semantic_min_purity=0.95,
+    gsi_v21_semantic_head_lr=1e-4,
+    gsi_v21_semantic_init_seed=3407,
+    workspace="workspace/gsi_v21_semantic_short200_ddp8",
+    experiment_name="gsi_v21_semantic_short200_ddp8",
+)
+
 config_doc["gsi_v2_joint_scannet_eval"] = "Fixed-step GSI-v2 joint evaluation."
 config_defaults["gsi_v2_joint_scannet_eval"] = Options(
     **_GSI_V2_SCANNET8X7_COMMON,
@@ -9561,6 +9619,78 @@ config_defaults["gsi_v2_joint_scannet_eval"] = Options(
     use_instance_labels=True, evaluating=True, num_workers=4, max_eval_iters=8, mixed_precision="bf16",
     resume="workspace/gsi_v2_joint_scannet_ddp8/model.safetensors",
     workspace="workspace/gsi_v2_joint_scannet_eval", experiment_name="gsi_v2_joint_scannet_eval",
+)
+
+# ---------------------------------------------------------------------------
+# TokenGS-ERU-v1: early reconstruction--understanding dual stream.
+_TOKEN_ERU_BASE = dict(
+    model_type="semantic_tokengs_v6",
+    resume=(
+        "workspace/semantic_v6_absolute_units_true_shared_siu3r_mbm_both_"
+        "w10_t3e6_ddp8/checkpoints/model_step_001420.safetensors"
+    ),
+    abs_true_shared_units=True,
+    instance_branch_abs_units=True,
+    abs_bootstrap_steps=0,
+    abs_teacher_decay_steps=0,
+    abs_instance_warmup_steps=0,
+    tsh_instance_warmup_steps=0,
+    tsh_instance_ramp_end_steps=1,
+    tsh_mbm_mode="off",
+    tsh_mbm_u2r_weight=0.0,
+    tsh_mbm_decoder_tail_lr=3.0e-6,
+    prompt_unfreeze_tokengs=False,
+    token_eru_enabled=True,
+    token_eru_adapter_bottleneck_dim=128,
+    token_eru_tsh_lr=3.0e-5,
+    token_eru_understanding_lr=3.0e-5,
+    token_eru_adapter_lr=1.0e-4,
+    token_eru_r2u_ramp_steps=25,
+    token_eru_u2r_start_step=25,
+    token_eru_u2r_ramp_steps=25,
+    token_eru_u2r_max_gate=0.1,
+    num_epochs=1,
+    max_iters_per_epoch=100,
+    abs_ckpt_every=0,
+    abs_ckpt_steps_extra=(),
+    mixed_precision="no",
+    seed=42,
+)
+
+config_doc["semantic_v6_absolute_units_true_shared_token_eru0_ddp8"] = (
+    "TokenGS-ERU-v1 identity control from Both@1420; no optimizer."
+)
+config_defaults["semantic_v6_absolute_units_true_shared_token_eru0_ddp8"] = (
+    config_defaults[
+        "semantic_v6_absolute_units_true_shared_siu3r_mbm_both_w10_t3e6_ddp8"
+    ].evolve(
+        **_TOKEN_ERU_BASE,
+        token_eru_mode="identity",
+        workspace=(
+            "workspace/semantic_v6_absolute_units_true_shared_token_eru0_ddp8"
+        ),
+        experiment_name=(
+            "semantic_v6_absolute_units_true_shared_token_eru0_ddp8"
+        ),
+    )
+)
+
+config_doc["semantic_v6_absolute_units_true_shared_token_eru1_ddp8"] = (
+    "TokenGS-ERU-v1 early dual-stream fixed-batch probe from Both@1420."
+)
+config_defaults["semantic_v6_absolute_units_true_shared_token_eru1_ddp8"] = (
+    config_defaults[
+        "semantic_v6_absolute_units_true_shared_siu3r_mbm_both_w10_t3e6_ddp8"
+    ].evolve(
+        **_TOKEN_ERU_BASE,
+        token_eru_mode="early_dual_stream",
+        workspace=(
+            "workspace/semantic_v6_absolute_units_true_shared_token_eru1_ddp8"
+        ),
+        experiment_name=(
+            "semantic_v6_absolute_units_true_shared_token_eru1_ddp8"
+        ),
+    )
 )
 
 AllConfigs = tyro.extras.subcommand_type_from_defaults(config_defaults, config_doc)
