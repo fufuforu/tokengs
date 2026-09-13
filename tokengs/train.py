@@ -815,6 +815,55 @@ def load_model_checkpoint(opt, model, accelerator, epoch_start):
                             f"{len(eru_loadable)}/{len(eru_expected)}, "
                             "fresh copy skipped"
                         )
+                if bool(getattr(opt, "token_eru_dino_metric_enabled", False)):
+                    dino_metric_prefixes = (
+                        "token_eru_dino_encoder.unit_projector.",
+                        "token_eru_dino_fusion.",
+                        "token_eru_metric_head.",
+                    )
+                    dino_expected = [
+                        key for key in native_state
+                        if key.startswith(dino_metric_prefixes)
+                    ]
+                    dino_present = any(
+                        key.startswith(dino_metric_prefixes) for key in ckpt
+                    )
+                    if dino_present:
+                        dino_loadable = {
+                            key: ckpt[key]
+                            for key in ckpt
+                            if key.startswith(dino_metric_prefixes)
+                            and key in native_state
+                            and native_state[key].shape == ckpt[key].shape
+                        }
+                        dino_missing = [
+                            key for key in dino_expected
+                            if key not in dino_loadable
+                        ]
+                        dino_unexpected = [
+                            key for key in ckpt
+                            if key.startswith(dino_metric_prefixes)
+                            and key not in dino_loadable
+                        ]
+                        if dino_missing or dino_unexpected:
+                            raise RuntimeError(
+                                f"[{checkpoint_label}] DINO metric strict "
+                                f"restore failed: missing={dino_missing[:5]} "
+                                f"unexpected={dino_unexpected[:5]}"
+                            )
+                        nn.Module.load_state_dict(
+                            model, dino_loadable, strict=False
+                        )
+                        accelerator.print(
+                            f"[{checkpoint_label}] DINO metric strict "
+                            f"restore: keys {len(dino_loadable)}/"
+                            f"{len(dino_expected)}"
+                        )
+                    else:
+                        accelerator.print(
+                            f"[{checkpoint_label}] DINO metric keys absent "
+                            "in source checkpoint: keeping fresh initialization"
+                        )
                 if reinit:
                     # Fixed, reproducible fresh seed for the very first fork.
                     fresh_seed = (int(opt.seed) + 987654321) % (2**31)
@@ -1209,6 +1258,16 @@ def setup_optimizer(opt, model, accelerator, epoch_start):
             opt.token_eru_adapter_lr,
             "pair_adapters",
         )
+        if bool(getattr(opt, "token_eru_dino_metric_enabled", False)):
+            add_group(
+                (
+                    "token_eru_dino_encoder.unit_projector.",
+                    "token_eru_dino_fusion.",
+                    "token_eru_metric_head.",
+                ),
+                1.0e-4,
+                "dino_metric",
+            )
         if not groups:
             raise RuntimeError("TokenGS-ERU produced no trainable optimizer groups")
         try:
@@ -1219,6 +1278,50 @@ def setup_optimizer(opt, model, accelerator, epoch_start):
             optimizer = torch.optim.AdamW(
                 groups, lr=float(opt.lr), betas=(0.9, 0.95)
             )
+        # A DINO-metric fork resumes the ERU source optimizer from the
+        # source checkpoint directory while leaving the newly introduced
+        # metric group without historical state.  This preserves the old
+        # trajectory and makes the new group genuinely fresh.
+        fork_step = int(getattr(opt, "tsh_fork_continue_step", 0))
+        source_dir = os.path.dirname(os.path.abspath(str(getattr(opt, "resume", ""))))
+        source_optimizer_path = os.path.join(
+            source_dir,
+            f"optimizer_step_{fork_step:06d}.pth",
+        )
+        workspace_optimizer_path = os.path.join(opt.workspace, "optimizer.pth")
+        optimizer_state_path = (
+            workspace_optimizer_path
+            if os.path.isfile(workspace_optimizer_path)
+            else source_optimizer_path
+            if fork_step > 0 and os.path.isfile(source_optimizer_path)
+            else ""
+        )
+        if optimizer_state_path:
+            source_state = torch.load(optimizer_state_path, map_location="cpu")
+            if fork_step > 0 and optimizer_state_path == source_optimizer_path:
+                current_state = optimizer.state_dict()
+                old_groups = source_state.get("param_groups", [])
+                new_groups = current_state.get("param_groups", [])
+                if len(old_groups) > len(new_groups):
+                    raise RuntimeError("source optimizer has more groups than the current ERU model")
+                for index, old_group in enumerate(old_groups):
+                    new_group = new_groups[index]
+                    if len(old_group.get("params", [])) != len(new_group.get("params", [])):
+                        raise RuntimeError(
+                            "source optimizer group shape differs at group "
+                            f"{index}: source={len(old_group.get('params', []))} "
+                            f"current={len(new_group.get('params', []))}"
+                        )
+                    for old_id, new_id in zip(old_group["params"], new_group["params"]):
+                        if old_id in source_state.get("state", {}):
+                            current_state["state"][new_id] = source_state["state"][old_id]
+                optimizer.load_state_dict(current_state)
+                accelerator.print(
+                    f"[token-eru] restored source optimizer groups={len(old_groups)} "
+                    f"from {optimizer_state_path}; new groups={len(new_groups)}"
+                )
+            else:
+                optimizer.load_state_dict(source_state)
         accelerator.print(
             "[token-eru] optimizer groups: "
             + ", ".join(
@@ -1548,11 +1651,17 @@ def setup_scheduler(opt, optimizer, iters_per_epoch, accelerator, epoch_start):
         fork_continue = bool(
             getattr(opt, "tsh_fork_continue_step", 0) > 0
         )
-        if epoch_start > 0 or (
-            fork_continue
-            and os.path.isfile(os.path.join(opt.workspace, "scheduler.pth"))
-        ):
-            scheduler.load_state_dict(torch.load(os.path.join(opt.workspace, 'scheduler.pth')))
+        scheduler_path = os.path.join(opt.workspace, "scheduler.pth")
+        if not os.path.isfile(scheduler_path) and fork_continue:
+            source_dir = os.path.dirname(os.path.abspath(str(getattr(opt, "resume", ""))))
+            candidate = os.path.join(
+                source_dir,
+                f"scheduler_step_{int(getattr(opt, 'tsh_fork_continue_step', 0)):06d}.pth",
+            )
+            if os.path.isfile(candidate):
+                scheduler_path = candidate
+        if epoch_start > 0 or (fork_continue and os.path.isfile(scheduler_path)):
+            scheduler.load_state_dict(torch.load(scheduler_path, map_location="cpu"))
         return scheduler
 
     steps_per_epoch = iters_per_epoch // opt.gradient_accumulation_steps
@@ -1735,6 +1844,15 @@ def load_fork_rng_state(opt, accelerator):
     path = os.path.join(
         opt.workspace, ".fork_state", f"rank{rank}.pt"
     )
+    if not os.path.isfile(path):
+        source_dir = os.path.dirname(os.path.abspath(str(getattr(opt, "resume", ""))))
+        source_step = int(getattr(opt, "tsh_fork_continue_step", 0))
+        candidate = os.path.join(
+            source_dir,
+            f"rng_step_{source_step:06d}_rank{rank:02d}.pth",
+        )
+        if os.path.isfile(candidate):
+            path = candidate
     if not os.path.isfile(path):
         raise RuntimeError(
             f"missing per-rank fork state for rank {rank}: {path}"
@@ -1969,6 +2087,14 @@ def save_gsi_v2_intra_epoch_checkpoint_synchronized(
             except Exception:
                 git_commit = "unknown"
             gbs = int(opt.batch_size) * world
+            dino_enabled = bool(getattr(opt, "token_eru_dino_metric_enabled", False))
+            dino_start = int(getattr(opt, "token_eru_dino_gate_start_step", 500))
+            dino_end = int(getattr(opt, "token_eru_dino_gate_end_step", 525))
+            dino_gate = (
+                0.0
+                if not dino_enabled or step <= dino_start
+                else min(1.0, (step - dino_start) / float(max(1, dino_end - dino_start)))
+            )
             metadata = {
                 "optimizer_step": step,
                 "equivalent_global_samples": step * gbs,
@@ -2021,6 +2147,237 @@ def save_gsi_v2_intra_epoch_checkpoint_synchronized(
             f"[abs-ckpt] saved synchronized intra-epoch full-state checkpoint "
             f"step={step} sentinel={os.path.join(ckpt_dir, f'{prefix}.complete')}"
         )
+
+
+def save_token_eru_intra_epoch_checkpoint_synchronized(
+    opt, accelerator, model, optimizer, scheduler, epoch, completed_step
+):
+    """Save a complete ERU milestone using shared-FS publication ordering.
+
+    ERU uses the generic TokenGS model class, so it cannot use the GSI-v2
+    checkpoint helper above.  Each rank first publishes its RNG sidecar;
+    rank zero then writes the model/optimizer/scheduler/metadata and finally
+    atomically publishes the completion marker.  The only distributed
+    synchronization after rank-zero file I/O is the short matching barrier.
+    """
+    if not bool(getattr(opt, "abs_ckpt_full_state", False)):
+        raise RuntimeError("TokenGS-ERU milestone save requires full state")
+    ckpt_dir = os.path.join(opt.workspace, "checkpoints")
+    os.makedirs(ckpt_dir, exist_ok=True)
+    step = int(completed_step)
+    rank = int(getattr(accelerator, "process_index", -1))
+    world = int(getattr(accelerator, "num_processes", 1))
+    prefix = f"step_{step:06d}"
+    model_name = f"model_step_{step:06d}.safetensors"
+    optimizer_name = f"optimizer_step_{step:06d}.pth"
+    scheduler_name = f"scheduler_step_{step:06d}.pth"
+    metadata_name = f"metadata_step_{step:06d}.json"
+    config_name = f"config_step_{step:06d}.yaml"
+    required = (model_name, optimizer_name, scheduler_name, metadata_name)
+    config_path = os.path.join(opt.workspace, "config.yaml")
+    if os.path.isfile(config_path):
+        required += (config_name,)
+
+    for name in required + (f"step_{step:06d}.complete", f"step_{step:06d}.failed"):
+        path = os.path.join(ckpt_dir, name)
+        if os.path.exists(path):
+            raise FileExistsError(
+                f"refusing to overwrite existing TokenGS-ERU artifact: {path}"
+            )
+
+    import random
+
+    rng_name = f"rng_step_{step:06d}_rank{rank:02d}.pth"
+    rng_done_name = f"rng_step_{step:06d}_rank{rank:02d}.complete"
+    rng_path = os.path.join(ckpt_dir, rng_name)
+    rng_tmp = f"{rng_path}.tmp.{os.getpid()}"
+    try:
+        torch.save(
+            {
+                "optimizer_step": step,
+                "epoch": int(epoch),
+                "rank": rank,
+                "torch_rng": torch.get_rng_state(),
+                "cuda_rng": torch.cuda.get_rng_state()
+                if torch.cuda.is_available()
+                else None,
+                "python_random": random.getstate(),
+            },
+            rng_tmp,
+        )
+        os.replace(rng_tmp, rng_path)
+        _atomic_touch(os.path.join(ckpt_dir, rng_done_name))
+    except Exception as exc:
+        _atomic_write_text(
+            os.path.join(ckpt_dir, f"step_{step:06d}.rank{rank:02d}.failed"),
+            f"rank={rank} step={step} rng save failed: {exc!r}\n",
+        )
+        if os.path.exists(rng_tmp):
+            os.unlink(rng_tmp)
+        raise
+
+    rank_done_names = tuple(
+        f"rng_step_{step:06d}_rank{value:02d}.complete"
+        for value in range(world)
+    )
+    try:
+        if accelerator.is_main_process:
+            _wait_for_rank_markers(
+                ckpt_dir, step, rank_done_names, rank, timeout_seconds=1800
+            )
+            unwrapped = accelerator.unwrap_model(model)
+            state = {
+                key: value.detach().cpu().contiguous()
+                for key, value in unwrapped.state_dict().items()
+            }
+            model_path = os.path.join(ckpt_dir, model_name)
+            model_tmp = f"{model_path}.tmp.{os.getpid()}"
+            save_file(state, model_tmp)
+            os.replace(model_tmp, model_path)
+            del state
+
+            optimizer_path = os.path.join(ckpt_dir, optimizer_name)
+            optimizer_tmp = f"{optimizer_path}.tmp.{os.getpid()}"
+            optimizer_state = optimizer.state_dict()
+            torch.save(optimizer_state, optimizer_tmp)
+            del optimizer_state
+            os.replace(optimizer_tmp, optimizer_path)
+
+            scheduler_path = os.path.join(ckpt_dir, scheduler_name)
+            scheduler_tmp = f"{scheduler_path}.tmp.{os.getpid()}"
+            scheduler_state = scheduler.state_dict()
+            torch.save(scheduler_state, scheduler_tmp)
+            del scheduler_state
+            os.replace(scheduler_tmp, scheduler_path)
+
+            if os.path.isfile(config_path):
+                config_dst = os.path.join(ckpt_dir, config_name)
+                config_tmp = f"{config_dst}.tmp.{os.getpid()}"
+                shutil.copy2(config_path, config_tmp)
+                os.replace(config_tmp, config_dst)
+
+            try:
+                git_commit = subprocess.check_output(
+                    ["git", "rev-parse", "HEAD"], cwd=os.getcwd(), text=True
+                ).strip()
+            except Exception:
+                git_commit = "unknown"
+            gbs = int(opt.batch_size) * world
+            metadata = {
+                "optimizer_step": step,
+                "equivalent_global_samples": step * gbs,
+                "epoch": int(epoch),
+                "world_size": world,
+                "per_gpu_batch_size": int(opt.batch_size),
+                "global_batch_size": gbs,
+                "git_commit": git_commit,
+                "config_path": os.path.abspath(config_path),
+                "optimizer_state": os.path.abspath(optimizer_path),
+                "scheduler_state": os.path.abspath(scheduler_path),
+                "rng_state_pattern": os.path.abspath(
+                    os.path.join(ckpt_dir, f"rng_step_{step:06d}_rank*.pth")
+                ),
+                "checkpoint_protocol": "token_eru_shared_fs_sentinel_v1",
+                "token_eru_enabled": bool(getattr(opt, "token_eru_enabled", False)),
+                "token_eru_mode": str(getattr(opt, "token_eru_mode", "disabled")),
+                "token_eru_matching_mode": str(
+                    getattr(opt, "token_eru_matching_mode", "per_view")
+                ),
+                "hungarian_scope": (
+                    "scene_window"
+                    if str(getattr(opt, "token_eru_matching_mode", "per_view"))
+                    == "scene"
+                    else "per_view"
+                ),
+                "expected_hungarian_calls_per_scene_window": (
+                    1
+                    if str(getattr(opt, "token_eru_matching_mode", "per_view"))
+                    == "scene"
+                    else 7
+                ),
+                "same_assignment_all_target_views": str(
+                    getattr(opt, "token_eru_matching_mode", "per_view")
+                )
+                == "scene",
+                "token_eru_dino_metric_enabled": bool(
+                    dino_enabled
+                ),
+                "token_eru_dino_repo_path": os.path.abspath(
+                    str(getattr(opt, "token_eru_dino_repo_path", ""))
+                ),
+                "token_eru_dino_weight_path": os.path.abspath(
+                    str(getattr(opt, "token_eru_dino_weight_path", ""))
+                ),
+                "token_eru_dino_weight_sha256": (
+                    "0b8b82f85de91b424aded121c7e1dcc2b7bc6d0adeea651bf73a13307fad8c73"
+                    if bool(getattr(opt, "token_eru_dino_metric_enabled", False))
+                    else None
+                ),
+                "token_eru_dino_metric_loss_weight": float(
+                    getattr(opt, "token_eru_dino_metric_loss_weight", 0.0)
+                ),
+                "token_eru_dino_gate_start_step": int(
+                    dino_start
+                ),
+                "token_eru_dino_gate_end_step": int(
+                    dino_end
+                ),
+                "token_eru_dino_native_gate": float(dino_gate),
+                "token_eru_dino_native_metric_loss_weight": float(
+                    getattr(opt, "token_eru_dino_metric_loss_weight", 0.0)
+                ) * float(dino_gate),
+                "token_eru_dino_embedding_dim": int(
+                    getattr(opt, "token_eru_dino_embedding_dim", 128)
+                ),
+                "token_eru_dino_temperature": 0.1,
+                "token_eru_dino_num_tokens": 1024,
+                "token_eru_dino_units_per_token": 8,
+                "token_eru_dino_gaussians_per_unit": 8,
+                "token_eru_dino_alignment": "context_dino_to_gaussian_centers_then_8_child_unit_mean",
+                "token_eru_dino_cluster_position_weight": 1.0,
+                "token_eru_dino_source": "local",
+                "token_eru_dino_cluster_eps": float(
+                    getattr(opt, "token_eru_dino_cluster_eps", 0.5)
+                ),
+            }
+            metadata_path = os.path.join(ckpt_dir, metadata_name)
+            metadata_tmp = f"{metadata_path}.tmp.{os.getpid()}"
+            with open(metadata_tmp, "w", encoding="utf-8") as handle:
+                json.dump(metadata, handle, indent=2)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(metadata_tmp, metadata_path)
+            _atomic_touch(os.path.join(ckpt_dir, f"step_{step:06d}.complete"))
+        else:
+            _wait_for_shared_checkpoint(
+                ckpt_dir,
+                step,
+                required,
+                rank,
+                timeout_seconds=1800,
+            )
+    except Exception as exc:
+        if accelerator.is_main_process:
+            _atomic_write_text(
+                os.path.join(ckpt_dir, f"step_{step:06d}.failed"),
+                f"rank={rank} step={step} checkpoint save failed: {exc!r}\n",
+            )
+        raise
+    finally:
+        for temporary in glob.glob(os.path.join(ckpt_dir, f"*step_{step:06d}*.tmp.*")):
+            try:
+                os.unlink(temporary)
+            except FileNotFoundError:
+                pass
+
+    accelerator.wait_for_everyone()
+    if accelerator.is_main_process:
+        accelerator.print(
+            f"[token-eru-ckpt] saved step={step} "
+            f"sentinel={os.path.join(ckpt_dir, f'step_{step:06d}.complete')}"
+        )
+
+
 def save_prompt_validation_checkpoint(
     opt, accelerator, model, epoch, global_step, validation_metrics, is_best
 ):
@@ -2048,6 +2405,20 @@ def save_prompt_validation_checkpoint(
             "prompt_checkpoint": os.path.abspath(checkpoint_path),
             "model_type": opt.model_type,
         }
+        if bool(getattr(opt, "token_eru_enabled", False)):
+            matching_mode = str(getattr(opt, "token_eru_matching_mode", "per_view"))
+            metadata.update(
+                {
+                    "token_eru_matching_mode": matching_mode,
+                    "hungarian_scope": (
+                        "scene_window" if matching_mode == "scene" else "per_view"
+                    ),
+                    "expected_hungarian_calls_per_scene_window": (
+                        1 if matching_mode == "scene" else 7
+                    ),
+                    "same_assignment_all_target_views": matching_mode == "scene",
+                }
+            )
         if bool(getattr(opt, "tsh_ddp8", False)):
             world = int(getattr(accelerator, "num_processes", 1))
             gbs = int(opt.batch_size) * world
@@ -2514,6 +2885,8 @@ def train_epoch(opt, accelerator, model, optimizer, scheduler, train_dataloader,
         unwrapped_model = accelerator.unwrap_model(model)
         if hasattr(unwrapped_model, "set_token_eru_step"):
             unwrapped_model.set_token_eru_step(completed_step)
+        if hasattr(unwrapped_model, "set_token_eru_dino_metric_step"):
+            unwrapped_model.set_token_eru_dino_metric_step(completed_step)
         if getattr(opt, "model_type", None) == "globalsplat_instance_v2":
             schedule_step = (
                 completed_step
@@ -2809,7 +3182,47 @@ def train_epoch(opt, accelerator, model, optimizer, scheduler, train_dataloader,
                 out["tokengs_grad_norm"] = grad_norm(frozen_parameters)
 
         if accelerator.sync_gradients:
-            accelerator.clip_grad_norm_(model.parameters(), opt.gradient_clip)
+            if bool(getattr(opt, "token_eru_enabled", False)):
+                pre_clip_sq = torch.zeros((), device=loss.device)
+                for parameter in model.parameters():
+                    if parameter.grad is not None:
+                        pre_clip_sq = pre_clip_sq + parameter.grad.detach().float().square().sum()
+                pre_clip_norm = pre_clip_sq.sqrt()
+                accelerator.clip_grad_norm_(model.parameters(), opt.gradient_clip)
+                post_clip_sq = torch.zeros((), device=loss.device)
+                for parameter in model.parameters():
+                    if parameter.grad is not None:
+                        post_clip_sq = post_clip_sq + parameter.grad.detach().float().square().sum()
+                post_clip_norm = post_clip_sq.sqrt()
+                clip_coefficient = torch.minimum(
+                    torch.ones_like(pre_clip_norm),
+                    torch.as_tensor(opt.gradient_clip, device=loss.device)
+                    / pre_clip_norm.clamp_min(1e-12),
+                )
+                out["token_eru_pre_clip_grad_norm"] = pre_clip_norm.detach()
+                out["token_eru_post_clip_grad_norm"] = post_clip_norm.detach()
+                out["token_eru_clip_coefficient"] = clip_coefficient.detach()
+                token_eru_group_prefixes = {
+                    "token_eru_tsh_grad_norm": ("tsh_instance_head.",),
+                    "token_eru_understanding_decoder_grad_norm": (
+                        "token_eru_decoder.understanding_decoder_blocks.",
+                    ),
+                    "token_eru_understanding_unit_grad_norm": (
+                        "token_eru_unit_formation.",
+                    ),
+                    "token_eru_pair_adapters_grad_norm": (
+                        "token_eru_decoder.reconstruction_to_understanding.",
+                        "token_eru_decoder.understanding_to_reconstruction.",
+                    ),
+                }
+                for metric_name, prefixes in token_eru_group_prefixes.items():
+                    out[metric_name] = grad_norm(
+                        parameter
+                        for name, parameter in unwrapped_model.named_parameters()
+                        if any(name.startswith(prefix) for prefix in prefixes)
+                    ).detach()
+            else:
+                accelerator.clip_grad_norm_(model.parameters(), opt.gradient_clip)
 
         optimizer.step()
         if accelerator.sync_gradients:
@@ -2926,6 +3339,13 @@ def train_epoch(opt, accelerator, model, optimizer, scheduler, train_dataloader,
             "temperature_grad_norm",
             "last_cross_attention_grad_norm",
             "tokengs_grad_norm",
+            "token_eru_pre_clip_grad_norm",
+            "token_eru_post_clip_grad_norm",
+            "token_eru_clip_coefficient",
+            "token_eru_tsh_grad_norm",
+            "token_eru_understanding_decoder_grad_norm",
+            "token_eru_understanding_unit_grad_norm",
+            "token_eru_pair_adapters_grad_norm",
             "gc2_assignment_entropy",
             "gc2_assignment_max_probability",
             "gc2_assignment_void_share",
@@ -2969,8 +3389,40 @@ def train_epoch(opt, accelerator, model, optimizer, scheduler, train_dataloader,
     if accelerator.is_main_process:
         print(f"[INFO] Setting RNG epoch to {epoch}")
 
-    iterator = iter(train_dataloader)
-    if sample_skip > 0:
+    direct_batches = None
+    iterator = None
+    if sample_skip > 0 and os.environ.get("TOKENG_FAST_FORK_SKIP") == "1":
+        # Diagnostic-only fast path: preserve the prepared sampler's exact
+        # index stream, but do not decode samples that will be discarded.
+        # Formal training never sets this environment variable.
+        from torch.utils.data._utils.collate import default_collate
+
+        selected_batch_indices = []
+        for batch_index, indices in enumerate(train_dataloader.batch_sampler):
+            if batch_index < sample_skip:
+                continue
+            if batch_index >= sample_skip + epoch_iters:
+                break
+            selected_batch_indices.append(list(indices))
+        if len(selected_batch_indices) != epoch_iters:
+            raise RuntimeError(
+                "fast fork skip sampler ended unexpectedly: "
+                f"expected={epoch_iters} got={len(selected_batch_indices)}"
+            )
+        collate_fn = getattr(train_dataloader, "collate_fn", None) or default_collate
+        dataset = train_dataloader.dataset
+        direct_batches = [
+            collate_fn([dataset[index] for index in indices])
+            for indices in selected_batch_indices
+        ]
+        if accelerator.is_main_process:
+            print(
+                f"[fork] fast-skip selected {epoch_iters} exact batches "
+                f"after {sample_skip} discarded sampler batches"
+            )
+    else:
+        iterator = iter(train_dataloader)
+    if sample_skip > 0 and direct_batches is None:
         if accelerator.is_main_process:
             print(
                 f"[fork] skipping first {sample_skip} local samples "
@@ -2981,7 +3433,7 @@ def train_epoch(opt, accelerator, model, optimizer, scheduler, train_dataloader,
         if accelerator.is_main_process:
             print(f"[fork] skip done; {epoch_iters} steps remain in epoch")
     for i in range(epoch_iters):
-        data = next(iterator)
+        data = direct_batches[i] if direct_batches is not None else next(iterator)
         global_step = global_step_offset + i
         completed_step = global_step + 1
         if getattr(opt, "prompt_overfit_single_batch", False):
@@ -3124,6 +3576,10 @@ def train_epoch(opt, accelerator, model, optimizer, scheduler, train_dataloader,
             bool(getattr(opt, "tsh_ddp8", False))
             and bool(getattr(opt, "abs_ckpt_full_state", False))
             and getattr(opt, "model_type", None) == "globalsplat_instance_v2"
+        ) and not (
+            bool(getattr(opt, "token_eru_enabled", False))
+            and bool(getattr(opt, "tsh_ddp8", False))
+            and bool(getattr(opt, "abs_ckpt_full_state", False))
         ) and accelerator.is_main_process:
             # Intra-epoch periodic head checkpoints for recovery/staging
             # (optimizer state stays in the workspace-level saves).
@@ -3224,6 +3680,9 @@ def train_epoch(opt, accelerator, model, optimizer, scheduler, train_dataloader,
         if checkpoint_due and bool(getattr(opt, "abs_ckpt_full_state", False)) and not (
             bool(getattr(opt, "tsh_ddp8", False))
             and getattr(opt, "model_type", None) == "globalsplat_instance_v2"
+        ) and not (
+            bool(getattr(opt, "token_eru_enabled", False))
+            and bool(getattr(opt, "tsh_ddp8", False))
         ):
             # Every rank writes its own RNG state.  This is intentionally a
             # sidecar-only operation and does not alter model/loss semantics.
@@ -3249,6 +3708,22 @@ def train_epoch(opt, accelerator, model, optimizer, scheduler, train_dataloader,
                 ),
             )
             accelerator.wait_for_everyone()
+
+        if (
+            checkpoint_due
+            and bool(getattr(opt, "token_eru_enabled", False))
+            and bool(getattr(opt, "tsh_ddp8", False))
+            and bool(getattr(opt, "abs_ckpt_full_state", False))
+        ):
+            save_token_eru_intra_epoch_checkpoint_synchronized(
+                opt,
+                accelerator,
+                model,
+                optimizer,
+                scheduler,
+                epoch,
+                completed_step,
+            )
 
         if (
             checkpoint_due
@@ -4069,6 +4544,25 @@ def main():
     # computed from the per-GPU iters_per_epoch, and prepare() would divide it again
     # by num_processes, causing the LR to decay to zero far too early.
     scheduler = setup_scheduler(opt, optimizer, iters_per_epoch, accelerator, epoch_start)
+
+    if (
+        bool(getattr(opt, "token_eru_enabled", False))
+        and bool(getattr(opt, "tsh_ddp8", False))
+        and bool(getattr(opt, "abs_ckpt_full_state", False))
+        and epoch_start == 0
+        and not os.path.exists(
+            os.path.join(opt.workspace, "checkpoints", "model_step_000000.safetensors")
+        )
+    ):
+        save_token_eru_intra_epoch_checkpoint_synchronized(
+            opt,
+            accelerator,
+            model,
+            optimizer,
+            scheduler,
+            epoch=0,
+            completed_step=0,
+        )
 
     # loop
     os.makedirs(opt.workspace, exist_ok=True)

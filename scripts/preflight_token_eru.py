@@ -86,6 +86,9 @@ def main() -> None:
     parser.add_argument("--workspace", required=True)
     parser.add_argument("--steps", type=int, default=3)
     parser.add_argument("--ddp", action="store_true")
+    parser.add_argument("--config", default=CFG)
+    parser.add_argument("--matching-mode", choices=("per_view", "scene"), default=None)
+    parser.add_argument("--checkpoint", default=str(CKPT))
     args = parser.parse_args()
     output_dir = ROOT / args.workspace
     if output_dir.exists() and any(output_dir.iterdir()):
@@ -94,8 +97,10 @@ def main() -> None:
         raise ValueError("preflight is limited to 1-3 optimizer steps")
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    opt = dataclasses.replace(config_defaults[CFG])
-    opt.resume = str(CKPT)
+    opt = dataclasses.replace(config_defaults[args.config])
+    if args.matching_mode is not None:
+        opt.token_eru_matching_mode = args.matching_mode
+    opt.resume = str(args.checkpoint)
     opt.workspace = str(output_dir)
     opt.num_workers = 0
     opt.batch_size = 1
@@ -118,6 +123,9 @@ def main() -> None:
     batch = _move(next(iter(loader)), accelerator.device)
     if batch["input"].shape[1] != 15 or batch["instance_label_output"].shape[1] != 7:
         raise RuntimeError("ERU preflight did not receive the formal 8+7 batch")
+    matching_mode = str(getattr(opt, "token_eru_matching_mode", "per_view"))
+    if matching_mode == "scene" and int(batch["instance_label_output"].shape[1]) != 7:
+        raise RuntimeError("scene ERU preflight requires exactly seven target views")
 
     samples = _gather_objects(
         {
@@ -142,6 +150,15 @@ def main() -> None:
         optimizer.zero_grad(set_to_none=True)
         with accelerator.autocast():
             output = model(batch, compute_quality_metrics=False)
+        if matching_mode == "scene":
+            calls = int(output.get("tsh_instance_group_hungarian_calls", -1))
+            if calls != int(batch["input"].shape[0]):
+                raise AssertionError(
+                    "scene preflight Hungarian calls must equal local batch size: "
+                    f"calls={calls} batch={batch['input'].shape[0]}"
+                )
+            if not bool(output.get("tsh_instance_group_same_assignment_all_views", False)):
+                raise AssertionError("scene preflight assignment was not reused across views")
         if not torch.isfinite(output["loss_instance_group"]):
             raise FloatingPointError("non-finite instance loss")
         accelerator.backward(output["loss"])
@@ -223,21 +240,10 @@ def main() -> None:
         "instance_group_scene_level_matching": bool(
             getattr(opt, "instance_group_scene_level_matching", False)
         ),
-        "matching_mode": (
-            "scene_level"
-            if bool(getattr(opt, "instance_group_scene_level_matching", False))
-            else "per_view"
-        ),
-        "hungarian_calls_per_scene": (
-            1
-            if bool(getattr(opt, "instance_group_scene_level_matching", False))
-            else 7
-        ),
-        "assignment_reused_target_views": (
-            7
-            if bool(getattr(opt, "instance_group_scene_level_matching", False))
-            else 0
-        ),
+        "matching_mode": matching_mode,
+        "hungarian_calls_per_scene": 1 if matching_mode == "scene" else 7,
+        "assignment_reused_target_views": 7 if matching_mode == "scene" else 0,
+        "same_assignment_all_7_views": matching_mode == "scene",
         "teacher_called": False,
         "u_to_r_old_path": 0.0,
         "unit_multiplier_old_path": 0.0,

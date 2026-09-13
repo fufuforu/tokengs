@@ -2605,32 +2605,63 @@ class SemanticTokenGSv4(PromptTokenGS):
                                "void_share", "max_group_prob_share")):
                 outputs[key] = value.detach()
         if training and "instance_label_output" in data:
-            loss, stats = hungarian_instance_group_loss(
-                rendered_probability,
-                data["instance_label_output"].long(),
-                num_groups=int(head.num_groups),
-                min_instance_pixels=int(
-                    getattr(self.opt, "instance_group_min_instance_pixels", 32)
-                ),
-                dice_weight=float(
-                    getattr(self.opt, "lambda_instance_group_dice", 1.0)
-                ),
-                mask_weight=float(
-                    getattr(self.opt, "lambda_instance_group_mask", 1.0)
-                ),
-                void_weight=float(
-                    getattr(self.opt, "lambda_instance_group_void", 0.1)
-                ),
-                unmatched_weight=float(
-                    getattr(self.opt, "lambda_instance_group_unmatched", 0.1)
-                ),
-                usage_entropy_weight=float(
-                    getattr(self.opt, "instance_group_usage_entropy", 0.05)
-                ),
-                scene_level_matching=bool(
-                    getattr(self.opt, "instance_group_scene_level_matching", False)
-                ),
+            matching_mode = str(
+                getattr(self.opt, "token_eru_matching_mode", "per_view")
             )
+            if matching_mode == "per_view":
+                loss, stats = hungarian_instance_group_loss(
+                    rendered_probability,
+                    data["instance_label_output"].long(),
+                    num_groups=int(head.num_groups),
+                    min_instance_pixels=int(
+                        getattr(self.opt, "instance_group_min_instance_pixels", 32)
+                    ),
+                    dice_weight=float(
+                        getattr(self.opt, "lambda_instance_group_dice", 1.0)
+                    ),
+                    mask_weight=float(
+                        getattr(self.opt, "lambda_instance_group_mask", 1.0)
+                    ),
+                    void_weight=float(
+                        getattr(self.opt, "lambda_instance_group_void", 0.1)
+                    ),
+                    unmatched_weight=float(
+                        getattr(self.opt, "lambda_instance_group_unmatched", 0.1)
+                    ),
+                    usage_entropy_weight=float(
+                        getattr(self.opt, "instance_group_usage_entropy", 0.05)
+                    ),
+                    scene_level_matching=False,
+                )
+            elif matching_mode == "scene":
+                if rendered_probability.shape[2] != 7:
+                    raise AssertionError(
+                        "TokenGS-ERU scene matching requires 7 target views"
+                    )
+                from tokengs.models.token_eru.scene_hungarian_loss import (
+                    scene_hungarian_instance_group_loss,
+                )
+
+                scene_config = dict(vars(self.opt))
+                scene_config["_scene_void_probability"] = rendered_probability[
+                    :, int(head.num_groups), :, 0
+                ]
+                loss, stats = scene_hungarian_instance_group_loss(
+                    rendered_probability[:, : int(head.num_groups), :, 0].permute(
+                        0, 2, 1, 3, 4
+                    ),
+                    data["instance_label_output"].long(),
+                    existing_loss_config=scene_config,
+                )
+                if int(stats["instance_group_hungarian_calls"]) != rendered_probability.shape[0]:
+                    raise AssertionError(
+                        "scene matching must call Hungarian once per batch scene"
+                    )
+            else:
+                raise ValueError(
+                    "token_eru_matching_mode must be 'per_view' or 'scene', "
+                    f"got {matching_mode!r}"
+                )
             outputs["loss_instance_group"] = loss
             for key, value in stats.items():
                 outputs[f"tsh_{key}"] = (
@@ -2682,6 +2713,10 @@ class SemanticTokenGSv4(PromptTokenGS):
             (), device=next(self.parameters()).device
         )
         token_eru_active = getattr(self, "token_eru_decoder", None) is not None
+        token_eru_dino_metric_outputs = {}
+        token_eru_dino_metric_loss = torch.zeros(
+            (), device=next(self.parameters()).device
+        )
         teacher_on = abs_mode and self.training and (
             float(getattr(self, "teacher_lambda_eff", 0.0)) > 0.0
         )
@@ -2934,6 +2969,20 @@ class SemanticTokenGSv4(PromptTokenGS):
                     ta_riu_v2_outputs.update(target_stats)
                     ta_riu_v2_outputs.update(nce_stats)
                 q_abs_for_instance = ta_riu_v2_outputs["z_inst"]
+            if getattr(self, "token_eru_dino_encoder", None) is not None:
+                token_eru_dino_metric_outputs = self._forward_token_eru_dino_metric(
+                    data,
+                    q_abs_for_instance,
+                    new_gaussians,
+                    model_input,
+                    training=self.training,
+                )
+                q_abs_for_instance = token_eru_dino_metric_outputs[
+                    "fused_understanding_units"
+                ]
+                token_eru_dino_metric_loss = token_eru_dino_metric_outputs[
+                    "loss_instance_metric_weighted"
+                ]
         else:
             reconstruction, gs_token_hidden, rgb_results = (
                 self._forward_prompt_reconstruction(model_input)
@@ -3250,6 +3299,8 @@ class SemanticTokenGSv4(PromptTokenGS):
             + loss_instance_contrastive
             + loss_boundary_rgb
         )
+        if self.training and token_eru_dino_metric_outputs:
+            joint_loss = joint_loss + token_eru_dino_metric_loss
         if self.training and ta_riu_v2_enabled:
             joint_loss = joint_loss + ta_riu_v2_loss * float(
                 getattr(self.opt, "ta_riu_v2_embedding_weight", .1)
@@ -3306,6 +3357,20 @@ class SemanticTokenGSv4(PromptTokenGS):
                 model_input,
                 training=self.training,
             )
+            if (
+                not self.training
+                and token_eru_dino_metric_outputs
+                and str(getattr(self.opt, "token_eru_dino_eval_mode", "query"))
+                == "metric_cluster"
+            ):
+                instance_outputs["metric_cluster_output"] = (
+                    self.build_token_eru_dino_metric_cluster(
+                        token_eru_dino_metric_outputs["unit_metric_embeddings"],
+                        instance_outputs["unit_logits"],
+                        new_gaussians,
+                        model_input,
+                    )
+                )
             if self.training and instance_outputs:
                 head_eff = float(
                     getattr(
@@ -3618,6 +3683,11 @@ class SemanticTokenGSv4(PromptTokenGS):
                 if ta_riu_enabled
                 else {}
             ),
+            **token_eru_dino_metric_outputs,
+            # The eval-only GT-free cluster object is added to
+            # instance_outputs after the metric branch returns.  Keep this
+            # merge order so the metric branch's placeholder None cannot
+            # overwrite the actual rendered cluster output.
             **instance_outputs,
             **(
                 {

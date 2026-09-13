@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import random
 from pathlib import Path
 
 import torch
@@ -35,6 +36,17 @@ from tokengs.models.ta_riu_v2 import (
 )
 from tokengs.models.ta_riu_v3 import TARIUV3DualStream
 from tokengs.models.token_eru import TokenGSEarlyDualStreamDecoder
+from tokengs.models.token_eru.dino_metric import (
+    DINOUnitEvidence,
+    DINOUnitFusion,
+    HistoricalDINOUnitEncoder,
+    MetricEmbeddingHead,
+)
+from tokengs.models.token_eru.historical_unit_infonce import (
+    build_historical_soft_unit_targets,
+    historical_soft_unit_infonce,
+)
+from tokengs.models.token_eru.metric_clustering import historical_metric_cluster
 
 
 class SemanticTokenGSv6(SemanticTokenGSv4):
@@ -64,6 +76,10 @@ class SemanticTokenGSv6(SemanticTokenGSv4):
         self.ta_riu_v3_dual_stream = None
         self.token_eru_decoder = None
         self.token_eru_unit_formation = None
+        self.token_eru_dino_encoder = None
+        self.token_eru_dino_fusion = None
+        self.token_eru_metric_head = None
+        self._token_eru_dino_metric_step = 500
         super().__init__(opt)
         num_groups = int(getattr(self.opt, "instance_group_num_groups", 64))
         head_input_dim = int(self.opt.token_dim)
@@ -1297,6 +1313,59 @@ class SemanticTokenGSv6(SemanticTokenGSv4):
             f"blocks={len(self.enc_dec_backbone.decoder_blocks)} "
             f"decoder_dim={self.opt.enc_embed_dim}"
         )
+        self._configure_token_eru_dino_metric()
+
+    def _configure_token_eru_dino_metric(self) -> None:
+        enabled = bool(getattr(self.opt, "token_eru_dino_metric_enabled", False))
+        if not enabled:
+            return
+        if self.token_eru_decoder is None or self.token_eru_unit_formation is None:
+            raise RuntimeError(
+                "TokenGS-ERU-DINO-Metric requires the early dual-stream ERU path"
+            )
+        cpu_rng = torch.get_rng_state()
+        cuda_rng = None
+        if torch.cuda.is_available() and torch.cuda.is_initialized():
+            cuda_rng = torch.cuda.get_rng_state_all()
+        python_rng = random.getstate()
+        try:
+            self.token_eru_dino_encoder = HistoricalDINOUnitEncoder(
+                getattr(
+                    self.opt,
+                    "token_eru_dino_repo_path",
+                    "/space/mawb/.cache/torch/hub/facebookresearch_dinov2_main",
+                ),
+                getattr(
+                    self.opt,
+                    "token_eru_dino_weight_path",
+                    "/space/mawb/.cache/torch/hub/checkpoints/dinov2_vitb14_pretrain.pth",
+                ),
+                output_dim=256,
+                num_context_views=8,
+                num_tokens=1024,
+                units_per_token=8,
+            )
+            self.token_eru_dino_fusion = DINOUnitFusion(256, 256)
+            self.token_eru_metric_head = MetricEmbeddingHead(
+                input_dim=256,
+                hidden_dim=256,
+                embedding_dim=int(getattr(self.opt, "token_eru_dino_embedding_dim", 128)),
+            )
+        finally:
+            torch.set_rng_state(cpu_rng)
+            if cuda_rng is not None:
+                torch.cuda.set_rng_state_all(cuda_rng)
+            random.setstate(python_rng)
+        self.token_eru_dino_encoder.requires_grad_(True)
+        self.token_eru_dino_fusion.requires_grad_(True)
+        self.token_eru_metric_head.requires_grad_(True)
+        # The external DINO model is still frozen and is deliberately not a
+        # registered child of FrozenDINOv2Extractor.
+        self.token_eru_dino_encoder.dino_extractor.requires_grad_(False)
+        print(
+            "[token-eru-dino] metric branch constructed: "
+            f"embedding_dim={getattr(self.opt, 'token_eru_dino_embedding_dim', 128)}"
+        )
 
     def initialize_token_eru_from_reconstruction(self) -> dict[str, int]:
         """Copy loaded reconstruction modules into the fresh ERU branches."""
@@ -1345,11 +1414,163 @@ class SemanticTokenGSv6(SemanticTokenGSv4):
             reconstruction_to_understanding=r2u,
             understanding_to_reconstruction=u2r,
         )
+        if self.token_eru_dino_encoder is not None:
+            self.set_token_eru_dino_metric_step(completed_optimizer_step)
         return {
             "completed_optimizer_step": float(completed_optimizer_step),
             "reconstruction_to_understanding_gate": r2u,
             "understanding_to_reconstruction_gate": u2r,
         }
+
+    @staticmethod
+    def token_eru_dino_schedule(step: int, opt) -> tuple[float, float]:
+        step = int(step)
+        if step < 500:
+            return 0.0, 0.0
+        start = int(getattr(opt, "token_eru_dino_gate_start_step", 500))
+        end = int(getattr(opt, "token_eru_dino_gate_end_step", 525))
+        if end <= start:
+            raise ValueError("DINO gate end step must be greater than start step")
+        if step <= start:
+            value = 0.0
+        else:
+            value = min(1.0, (step - start) / float(end - start))
+        return float(value), float(value)
+
+    def set_token_eru_dino_metric_step(self, completed_optimizer_step: int) -> dict[str, float]:
+        if int(completed_optimizer_step) < 0:
+            raise ValueError("DINO metric step must be non-negative")
+        self._token_eru_dino_metric_step = int(completed_optimizer_step)
+        gate, weight = self.token_eru_dino_schedule(completed_optimizer_step, self.opt)
+        return {
+            "completed_optimizer_step": float(completed_optimizer_step),
+            "dino_gate": gate,
+            "metric_loss_weight": float(getattr(self.opt, "token_eru_dino_metric_loss_weight", 0.0)) * weight,
+        }
+
+    def _forward_token_eru_dino_metric(
+        self,
+        data: dict,
+        understanding_units: torch.Tensor,
+        reconstruction_gaussians: torch.Tensor,
+        model_input,
+        training: bool,
+    ) -> dict:
+        if self.token_eru_dino_encoder is None:
+            return {}
+        if "images_input" not in data:
+            raise RuntimeError("TokenGS-ERU-DINO-Metric requires context images_input")
+        context = data["images_input"]
+        if context.ndim != 5 or context.shape[1] != 8:
+            raise RuntimeError(f"expected context RGB [B,8,3,H,W], got {tuple(context.shape)}")
+        evidence: DINOUnitEvidence = self.token_eru_dino_encoder(
+            context,
+            {
+                "base_gaussians": reconstruction_gaussians.detach(),
+                "cam_to_world_input": data["cam_to_world_input"],
+                "intrinsics_input": data["intrinsics_input"],
+                "image_hw": tuple(int(x) for x in context.shape[-2:]),
+            },
+        )
+        gate, ramp = self.token_eru_dino_schedule(
+            self._token_eru_dino_metric_step, self.opt
+        )
+        fused = self.token_eru_dino_fusion(
+            understanding_units, evidence.unit_features, gate
+        )
+        embeddings = self.token_eru_metric_head(fused)
+        zero = embeddings.sum() * 0.0
+        metric_stats = None
+        if training and "instance_label_input" in data and "instance_label_output" in data:
+            targets, valid = build_historical_soft_unit_targets(
+                reconstruction_gaussians.detach(),
+                data,
+                tuple(int(x) for x in data["instance_label_output"].shape[-2:]),
+            )
+            metric_stats = historical_soft_unit_infonce(
+                embeddings.reshape(embeddings.shape[0], 8192, -1),
+                targets,
+                valid,
+                temperature=0.1,
+            )
+            metric_loss = metric_stats.loss
+        else:
+            metric_loss = zero
+        loss_weight = float(getattr(self.opt, "token_eru_dino_metric_loss_weight", 0.0)) * ramp
+        output = {
+            "dino_unit_features": evidence.unit_features,
+            "dino_patch_features": evidence.patch_features,
+            "dino_alignment_weights": evidence.alignment_weights,
+            "fused_understanding_units": fused,
+            "unit_metric_embeddings": embeddings,
+            "loss_instance_metric": metric_loss,
+            "loss_instance_metric_weighted": metric_loss * loss_weight,
+            "metric_loss_diagnostics": metric_stats,
+            "dino_gate": torch.tensor(gate, device=fused.device),
+            "metric_loss_weight_eff": torch.tensor(loss_weight, device=fused.device),
+        }
+        if metric_stats is not None:
+            output.update(
+                {
+                    "metric_valid_unit_count": torch.tensor(
+                        float(metric_stats.valid_unit_count), device=fused.device
+                    ),
+                    "metric_positive_pair_count": torch.tensor(
+                        float(metric_stats.positive_pair_count), device=fused.device
+                    ),
+                    "metric_negative_pair_count": torch.tensor(
+                        float(metric_stats.negative_pair_count), device=fused.device
+                    ),
+                    "metric_mean_positive_similarity": metric_stats.mean_positive_similarity,
+                    "metric_mean_negative_similarity": metric_stats.mean_negative_similarity,
+                    "metric_target_entropy": metric_stats.target_entropy,
+                }
+            )
+        if not training:
+            output["metric_cluster_output"] = None
+        return output
+
+    def build_token_eru_dino_metric_cluster(
+        self,
+        metric_embeddings: torch.Tensor,
+        unit_logits: torch.Tensor,
+        reconstruction_gaussians: torch.Tensor,
+        model_input,
+    ):
+        """Build the formal GT-free metric-cluster output after TSH logits.
+
+        Objectness is derived only from the predicted 101-way unit logits;
+        no labels or pseudo-target cache enters this path.
+        """
+        if metric_embeddings.ndim != 4 or metric_embeddings.shape[1:3] != (1024, 8):
+            raise ValueError("metric embeddings must be [B,1024,8,128]")
+        if unit_logits.ndim == 3 and unit_logits.shape[1:] == (8192, 101):
+            unit_logits = unit_logits.reshape(unit_logits.shape[0], 1024, 8, 101)
+        elif unit_logits.ndim != 4 or unit_logits.shape[1:3] != (1024, 8):
+            raise ValueError(
+                "unit logits must be [B,1024,8,101] or canonical-flattened "
+                f"[B,8192,101], got {tuple(unit_logits.shape)}"
+            )
+        probabilities = torch.softmax(unit_logits.float(), dim=-1)
+        unit_objectness = (1.0 - probabilities[..., 100]).reshape(
+            probabilities.shape[0], 8192
+        )
+        unit_positions = reconstruction_gaussians[..., :3].reshape(
+            reconstruction_gaussians.shape[0], 1024, 8, 8, 3
+        ).mean(dim=3).reshape(reconstruction_gaussians.shape[0], 8192, 3)
+        return historical_metric_cluster(
+            metric_embeddings.reshape(metric_embeddings.shape[0], 8192, -1),
+            unit_positions,
+            unit_objectness,
+            {"values": reconstruction_gaussians, "renderer": self.gs},
+            {
+                "cam_view": model_input.decoder.cam_view,
+                "intrinsics": model_input.decoder.intrinsics,
+            },
+            eps=float(getattr(self.opt, "token_eru_dino_cluster_eps", 0.5)),
+            foreground_threshold=0.5,
+            foreground_share=0.5,
+        )
 
     def _forward_abs_hidden(self, model_input):
         if self.token_eru_decoder is None:

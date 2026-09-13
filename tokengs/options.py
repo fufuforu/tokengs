@@ -238,6 +238,23 @@ class Options:
     token_eru_u2r_start_step: int = 25
     token_eru_u2r_ramp_steps: int = 25
     token_eru_u2r_max_gate: float = 0.1
+    token_eru_matching_mode: str = "per_view"
+    # TokenGS-ERU-DINO-Metric-v1.  The external DINO backbone is loaded only
+    # from these explicit local paths and is never a registered checkpoint
+    # child.  The metric path is disabled by default.
+    token_eru_dino_metric_enabled: bool = False
+    token_eru_dino_metric_loss_weight: float = 0.0
+    token_eru_dino_gate_start_step: int = 500
+    token_eru_dino_gate_end_step: int = 525
+    token_eru_dino_embedding_dim: int = 128
+    token_eru_dino_repo_path: str = (
+        "/space/mawb/.cache/torch/hub/facebookresearch_dinov2_main"
+    )
+    token_eru_dino_weight_path: str = (
+        "/space/mawb/.cache/torch/hub/checkpoints/dinov2_vitb14_pretrain.pth"
+    )
+    token_eru_dino_cluster_eps: float = 0.5
+    token_eru_dino_eval_mode: str = "query"
     # True-Shared DDP8 variant marker: stage thresholds are expressed in
     # DDP optimizer steps (125 / 710 / ...) and extra metadata is written.
     tsh_ddp8: bool = False
@@ -9691,6 +9708,126 @@ config_defaults["semantic_v6_absolute_units_true_shared_token_eru1_ddp8"] = (
             "semantic_v6_absolute_units_true_shared_token_eru1_ddp8"
         ),
     )
+)
+
+config_doc["semantic_v6_absolute_units_true_shared_token_eru1_short200_ddp8"] = (
+    "TokenGS-ERU-v1 strict eight-scene short200 generalization experiment "
+    "from Both@1420, with full per-milestone state checkpoints."
+)
+config_defaults[
+    "semantic_v6_absolute_units_true_shared_token_eru1_short200_ddp8"
+] = config_defaults[
+    "semantic_v6_absolute_units_true_shared_token_eru1_ddp8"
+].evolve(
+    tsh_ddp8=True,
+    num_workers=2,
+    num_epochs=1,
+    max_iters_per_epoch=200,
+    print_freq=10,
+    log_image_freq=0,
+    eval_before_training=False,
+    abs_ckpt_every=200,
+    abs_ckpt_steps_extra=(25, 50, 75, 100, 150, 200),
+    abs_ckpt_full_state=True,
+    workspace=(
+        "workspace/semantic_v6_absolute_units_true_shared_token_eru1_"
+        "short200_ddp8"
+    ),
+    experiment_name=(
+        "semantic_v6_absolute_units_true_shared_token_eru1_short200_ddp8"
+    ),
+)
+
+config_doc[
+    "semantic_v6_absolute_units_true_shared_token_eru1_scene_hungarian_short200_ddp8"
+] = (
+    "TokenGS-ERU-v1 visibility-aware scene-window Hungarian short200 "
+    "control-variable experiment from Both@1420."
+)
+config_defaults[
+    "semantic_v6_absolute_units_true_shared_token_eru1_scene_hungarian_short200_ddp8"
+] = config_defaults[
+    "semantic_v6_absolute_units_true_shared_token_eru1_short200_ddp8"
+].evolve(
+    token_eru_matching_mode="scene",
+    workspace=(
+        "workspace/semantic_v6_absolute_units_true_shared_token_eru1_"
+        "scene_hungarian_short200_ddp8"
+    ),
+    experiment_name=(
+        "semantic_v6_absolute_units_true_shared_token_eru1_"
+        "scene_hungarian_short200_ddp8"
+    ),
+)
+
+_TOKEN_ERU_DINO_SOURCE = (
+    "workspace/semantic_v6_absolute_units_true_shared_token_eru1_"
+    "scene_hungarian_resume200_to500_persist_ddp8/checkpoints/"
+    "model_step_000500.safetensors"
+)
+_TOKEN_ERU_DINO_BASE = config_defaults[
+    "semantic_v6_absolute_units_true_shared_token_eru1_scene_hungarian_short200_ddp8"
+].evolve(
+    resume=_TOKEN_ERU_DINO_SOURCE,
+    tsh_fork_continue_step=500,
+    num_epochs=1,
+    max_iters_per_epoch=700,
+    num_workers=2,
+    tsh_ddp8=True,
+    abs_ckpt_every=700,
+    abs_ckpt_steps_extra=(550, 600, 700),
+    abs_ckpt_full_state=True,
+    log_image_freq=0,
+    eval_n_media_dumps=0,
+    eval_before_training=False,
+    token_eru_dino_metric_loss_weight=0.0,
+    token_eru_dino_gate_start_step=500,
+    token_eru_dino_gate_end_step=525,
+    token_eru_dino_embedding_dim=128,
+    token_eru_dino_cluster_eps=0.5,
+    token_eru_dino_eval_mode="query",
+)
+
+config_doc[
+    "semantic_v6_absolute_units_true_shared_token_eru1_dino_metric_control_resume500_to700_ddp8"
+] = "ERU-DINO-Metric control: DINO metric path disabled; resumes the ERU step-500 source protocol."
+config_defaults[
+    "semantic_v6_absolute_units_true_shared_token_eru1_dino_metric_control_resume500_to700_ddp8"
+] = _TOKEN_ERU_DINO_BASE.evolve(
+    token_eru_dino_metric_enabled=False,
+    token_eru_dino_metric_loss_weight=0.0,
+    workspace=(
+        "workspace/semantic_v6_absolute_units_true_shared_token_eru1_"
+        "dino_metric_control_resume500_to700_ddp8"
+    ),
+    experiment_name=(
+        "semantic_v6_absolute_units_true_shared_token_eru1_"
+        "dino_metric_control_resume500_to700_ddp8"
+    ),
+)
+
+config_doc[
+    "semantic_v6_absolute_units_true_shared_token_eru1_dino_metric_treatment_resume500_to700_ddp8"
+] = "ERU-DINO-Metric treatment with recovered context-only DINO evidence and historical metric supervision."
+config_defaults[
+    "semantic_v6_absolute_units_true_shared_token_eru1_dino_metric_treatment_resume500_to700_ddp8"
+] = _TOKEN_ERU_DINO_BASE.evolve(
+    token_eru_dino_metric_enabled=True,
+    token_eru_dino_metric_loss_weight=1.0,
+    token_eru_dino_repo_path=(
+        "/space/mawb/.cache/torch/hub/facebookresearch_dinov2_main"
+    ),
+    token_eru_dino_weight_path=(
+        "/space/mawb/.cache/torch/hub/checkpoints/dinov2_vitb14_pretrain.pth"
+    ),
+    workspace=(
+        "workspace/semantic_v6_absolute_units_true_shared_token_eru1_"
+        "dino_metric_treatment_resume500_to700_ddp8"
+    ),
+    experiment_name=(
+        "semantic_v6_absolute_units_true_shared_token_eru1_"
+        "dino_metric_treatment_resume500_to700_ddp8"
+    ),
 )
 
 AllConfigs = tyro.extras.subcommand_type_from_defaults(config_defaults, config_doc)

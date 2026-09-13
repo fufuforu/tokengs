@@ -259,13 +259,17 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--workspace", required=True)
     parser.add_argument("--steps", type=int, default=100)
+    parser.add_argument("--config", default=ERU_CONFIG)
+    parser.add_argument("--matching-mode", choices=("per_view", "scene"), default=None)
     args = parser.parse_args()
     output_dir = ROOT / args.workspace
     if output_dir.exists() and any(output_dir.iterdir()):
         raise RuntimeError(f"refusing non-empty output directory: {output_dir}")
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    opt = dataclasses.replace(config_defaults[ERU_CONFIG])
+    opt = dataclasses.replace(config_defaults[args.config])
+    if args.matching_mode is not None:
+        opt.token_eru_matching_mode = args.matching_mode
     opt.workspace = str(output_dir)
     opt.resume = str(CHECKPOINT)
     opt.num_workers = 0
@@ -486,11 +490,15 @@ def main() -> None:
         if completed in milestones:
             model.train()
             with torch.no_grad():
-                audit_output = model(batch, compute_quality_metrics=True)
+                # Fixed-batch learning audit only needs reconstruction PSNR and
+                # instance diagnostics.  Do not instantiate the heavyweight
+                # VGG/LPIPS quality path at every milestone; formal evaluation
+                # owns SSIM/LPIPS and uses the unchanged evaluator.
+                audit_output = model(batch, compute_quality_metrics=False)
             model.eval()
             unwrapped.set_token_eru_step(completed)
             with torch.no_grad():
-                snapshot = model(batch, compute_quality_metrics=True)
+                snapshot = model(batch, compute_quality_metrics=False)
                 metric = _model_metrics(
                     snapshot,
                     batch,
@@ -563,6 +571,11 @@ def main() -> None:
                 encoding="utf-8",
             )
             model.train()
+            del checkpoint, snapshot, audit_output
+        # Do not retain the previous iteration's autograd graph or output
+        # tensors while advancing the fixed-batch probe.
+        del output, loss
+        gc.collect()
     if int(args.steps) >= 100:
         restore_opt = dataclasses.replace(
             opt,
