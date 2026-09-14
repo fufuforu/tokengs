@@ -255,6 +255,29 @@ class Options:
     )
     token_eru_dino_cluster_eps: float = 0.5
     token_eru_dino_eval_mode: str = "query"
+    # Stage-M is an independent fine-tuning fork from the ERU@500 model.
+    # It uses stage-local optimizer/checkpoint steps and never restores the
+    # parent optimizer, scheduler, RNG, sampler cursor, or epoch position.
+    token_eru_dino_metric_stage_m: bool = False
+    token_eru_dino_metric_stage_m_parent_step: int = 500
+    token_eru_dino_metric_stage_m_name: str = "eru_dino_metric_stage_m"
+    # Joint-formation fork: the ERU@500 weights are a model-only parent, but
+    # the complete TokenGS token -> unit -> GS path is trainable from stage
+    # step 1.  This flag is opt-in and leaves every older recipe untouched.
+    token_eru_dino_metric_joint_formation: bool = False
+    # Independent Stage-J2 continuation from the JointFormation@710 model
+    # weights.  This is deliberately separate from the v1 and Stage-M flags.
+    token_eru_dino_metric_joint_formation_j2: bool = False
+    token_eru_dino_metric_joint_formation_j2_parent_step: int = 710
+    token_eru_dino_metric_joint_formation_j2_name: str = (
+        "token_eru_dino_joint_formation_stage_j2"
+    )
+    token_eru_dino_metric_joint_formation_j2_warmup_steps: int = 50
+    token_eru_dino_metric_joint_formation_j2_total_steps: int = 710
+    token_eru_dino_metric_joint_formation_j2_min_ratio: float = 0.1
+    # Optional per-rank manifest written immediately before Accelerator
+    # prepare() for diagnosing distributed model/optimizer mismatches.
+    joint_formation_ddp_manifest_audit: bool = False
     # True-Shared DDP8 variant marker: stage thresholds are expressed in
     # DDP optimizer steps (125 / 710 / ...) and extra metadata is written.
     tsh_ddp8: bool = False
@@ -391,6 +414,9 @@ class Options:
     # Save optimizer/scheduler/per-rank RNG and provenance sidecars for
     # intra-epoch snapshots when an independently resumable probe needs them.
     abs_ckpt_full_state: bool = False
+    # Optional subset of due checkpoints that receives full optimizer,
+    # scheduler and per-rank RNG sidecars. Empty preserves legacy behavior.
+    abs_ckpt_full_state_steps: tuple[int, ...] = ()
     # Dedicated rendered-space instance feature (InstanceSplat-style
     # grounding): an explicit instance head on the 8 local units, propagated
     # to GS, rendered to 2D feature maps and supervised by per-view GT
@@ -9827,6 +9853,149 @@ config_defaults[
     experiment_name=(
         "semantic_v6_absolute_units_true_shared_token_eru1_"
         "dino_metric_treatment_resume500_to700_ddp8"
+    ),
+)
+
+config_doc[
+    "semantic_v6_absolute_units_true_shared_token_eru1_dino_metric_short200_ddp8"
+] = (
+    "ERU-DINO-Metric native-query short200 fork from the persisted ERU@500 "
+    "state; formal training is 501 through 700 only."
+)
+config_defaults[
+    "semantic_v6_absolute_units_true_shared_token_eru1_dino_metric_short200_ddp8"
+] = config_defaults[
+    "semantic_v6_absolute_units_true_shared_token_eru1_dino_metric_treatment_resume500_to700_ddp8"
+].evolve(
+    abs_ckpt_steps_extra=(525, 550, 600, 650, 700),
+    abs_ckpt_full_state_steps=(600, 700),
+    workspace=(
+        "workspace/semantic_v6_absolute_units_true_shared_token_eru1_"
+        "dino_metric_short200_ddp8"
+    ),
+    experiment_name=(
+        "semantic_v6_absolute_units_true_shared_token_eru1_"
+        "dino_metric_short200_ddp8"
+    ),
+)
+
+config_doc[
+    "semantic_v6_absolute_units_true_shared_token_eru1_dino_metric_stage_m_short200_ddp8"
+] = (
+    "TokenGS-ERU-DINO-Metric Stage-M: independent 200-step fine-tuning "
+    "from ERU@500 model weights only; no parent optimizer/scheduler/RNG or "
+    "sampler cursor is restored."
+)
+config_defaults[
+    "semantic_v6_absolute_units_true_shared_token_eru1_dino_metric_stage_m_short200_ddp8"
+] = config_defaults[
+    "semantic_v6_absolute_units_true_shared_token_eru1_dino_metric_treatment_resume500_to700_ddp8"
+].evolve(
+    tsh_fork_continue_step=0,
+    num_epochs=1,
+    max_iters_per_epoch=200,
+    abs_ckpt_every=200,
+    abs_ckpt_steps_extra=(25, 50, 100, 150, 200),
+    abs_ckpt_full_state=True,
+    abs_ckpt_full_state_steps=(100, 200),
+    token_eru_dino_metric_stage_m=True,
+    token_eru_dino_metric_stage_m_parent_step=500,
+    token_eru_dino_metric_stage_m_name="eru_dino_metric_stage_m",
+    seed=42,
+    workspace=(
+        "workspace/semantic_v6_absolute_units_true_shared_token_eru1_"
+        "dino_metric_stage_m_short200_ddp8"
+    ),
+    experiment_name=(
+        "semantic_v6_absolute_units_true_shared_token_eru1_"
+        "dino_metric_stage_m_short200_ddp8"
+    ),
+)
+
+config_doc[
+    "semantic_v6_absolute_units_true_shared_token_eru1_dino_metric_joint_formation_v1_ddp8"
+] = (
+    "TokenGS-ERU-DINO-JointFormation-v1: model-only ERU@500 parent, full "
+    "reconstruction token/unit/GS formation jointly trainable for one epoch."
+)
+config_defaults[
+    "semantic_v6_absolute_units_true_shared_token_eru1_dino_metric_joint_formation_v1_ddp8"
+] = config_defaults[
+    "semantic_v6_absolute_units_true_shared_token_eru1_dino_metric_treatment_resume500_to700_ddp8"
+].evolve(
+    tsh_fork_continue_step=0,
+    token_eru_dino_metric_joint_formation=True,
+    token_eru_dino_metric_enabled=True,
+    token_eru_dino_metric_loss_weight=1.0,
+    token_eru_dino_gate_start_step=0,
+    token_eru_dino_gate_end_step=50,
+    token_eru_dino_eval_mode="query",
+    num_epochs=1,
+    max_iters_per_epoch=710,
+    num_workers=2,
+    tsh_ddp8=True,
+    abs_ckpt_every=710,
+    abs_ckpt_steps_extra=(50, 100, 250, 500, 710),
+    abs_ckpt_full_state=True,
+    abs_ckpt_full_state_steps=(250, 500, 710),
+    eval_before_training=False,
+    workspace=(
+        "workspace/semantic_v6_absolute_units_true_shared_token_eru1_"
+        "dino_metric_joint_formation_v1_ddp8"
+    ),
+    experiment_name=(
+        "semantic_v6_absolute_units_true_shared_token_eru1_"
+        "dino_metric_joint_formation_v1_ddp8"
+    ),
+)
+
+_TOKEN_ERU_DINO_J2_SOURCE = (
+    "/space/mawb/tokengs/workspace/semantic_v6_absolute_units_true_shared_"
+    "token_eru1_dino_metric_joint_formation_v1_ddp8/checkpoints/"
+    "model_step_000710.safetensors"
+)
+config_doc[
+    "semantic_v6_absolute_units_true_shared_token_eru1_dino_metric_joint_formation_j2_ddp8"
+] = (
+    "TokenGS-ERU-DINO JointFormation Stage-J2: independent 710-step "
+    "joint fine-tuning from JointFormation-v1@710 model weights."
+)
+config_defaults[
+    "semantic_v6_absolute_units_true_shared_token_eru1_dino_metric_joint_formation_j2_ddp8"
+] = config_defaults[
+    "semantic_v6_absolute_units_true_shared_token_eru1_dino_metric_joint_formation_v1_ddp8"
+].evolve(
+    resume=_TOKEN_ERU_DINO_J2_SOURCE,
+    tsh_fork_continue_step=0,
+    seed=42,
+    token_eru_dino_metric_joint_formation=False,
+    token_eru_dino_metric_joint_formation_j2=True,
+    token_eru_dino_metric_joint_formation_j2_parent_step=710,
+    token_eru_dino_metric_joint_formation_j2_name=(
+        "token_eru_dino_joint_formation_stage_j2"
+    ),
+    token_eru_dino_metric_joint_formation_j2_warmup_steps=50,
+    token_eru_dino_metric_joint_formation_j2_total_steps=710,
+    token_eru_dino_metric_joint_formation_j2_min_ratio=0.1,
+    token_eru_dino_gate_start_step=0,
+    token_eru_dino_gate_end_step=50,
+    token_eru_dino_metric_loss_weight=1.0,
+    num_epochs=1,
+    max_iters_per_epoch=710,
+    num_workers=2,
+    tsh_ddp8=True,
+    abs_ckpt_every=710,
+    abs_ckpt_steps_extra=(100, 250, 500, 710),
+    abs_ckpt_full_state=True,
+    abs_ckpt_full_state_steps=(500, 710),
+    eval_before_training=False,
+    workspace=(
+        "workspace/semantic_v6_absolute_units_true_shared_token_eru1_"
+        "dino_metric_joint_formation_j2_ddp8"
+    ),
+    experiment_name=(
+        "semantic_v6_absolute_units_true_shared_token_eru1_"
+        "dino_metric_joint_formation_j2_ddp8"
     ),
 )
 

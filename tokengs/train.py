@@ -20,8 +20,11 @@ import json
 import datetime
 import glob
 import hashlib
+import importlib.util
 import shutil
 import subprocess
+import inspect
+import sys
 from dataclasses import asdict
 
 import torch
@@ -37,12 +40,32 @@ import yaml
 from tokengs.options import AllConfigs
 from tokengs.data import get_multi_dataloader
 from tokengs.models import model_registry
+from tokengs.models.token_eru.j2_schedule import joint_formation_j2_lr_scale
 from tokengs.models.instance_group_loss import hungarian_instance_group_loss
 
 import warnings
 
 from tokengs.utils.gaussians import Gaussians
 warnings.filterwarnings("ignore")
+
+
+def _load_cached_gsplat_extension() -> None:
+    """Load the validated local gsplat extension before the first render."""
+    so_path = os.environ.get("GSPLAT_PRECOMPILED_SO")
+    if not so_path or not os.path.isfile(so_path):
+        return
+    if "gsplat_cuda" in sys.modules:
+        return
+    spec = importlib.util.spec_from_file_location("gsplat_cuda", so_path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"cannot load cached gsplat extension: {so_path}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    sys.modules["gsplat_cuda"] = module
+    import gsplat
+
+    sys.modules.setdefault("gsplat.csrc", module)
+    setattr(gsplat, "csrc", module)
 
 try:
     from _240_path_remap import remap_path as _240_remap_path
@@ -175,6 +198,56 @@ def apply_checkpoint_architecture(opt):
 
 def load_model_checkpoint(opt, model, accelerator, epoch_start):
     """Load model checkpoint with tolerance for shape mismatches."""
+    if bool(getattr(opt, "token_eru_dino_metric_joint_formation_j2", False)):
+        if not opt.resume or not os.path.isfile(opt.resume):
+            raise RuntimeError(f"Stage-J2 parent checkpoint missing: {opt.resume}")
+        checkpoint = load_file(opt.resume, device="cpu")
+        expected = nn.Module.state_dict(model)
+        active_prefixes = (
+            "gs_tokens",
+            "gs_tokens_dynamic",
+            "enc_dec_backbone.decoder_blocks.",
+            "absolute_gs_head.",
+            "tsh_instance_head.",
+            "token_eru_decoder.",
+            "token_eru_unit_formation.",
+            "token_eru_dino_encoder.unit_projector.",
+            "token_eru_dino_fusion.",
+            "token_eru_metric_head.",
+        )
+        active_expected = {
+            key for key in expected
+            if key == "gs_tokens"
+            or key == "gs_tokens_dynamic"
+            or key.startswith(active_prefixes[2:])
+        }
+        active_checkpoint = {
+            key for key in checkpoint
+            if key == "gs_tokens"
+            or key == "gs_tokens_dynamic"
+            or key.startswith(active_prefixes[2:])
+        }
+        missing = sorted(active_expected - active_checkpoint)
+        unexpected = sorted(active_checkpoint - active_expected)
+        mismatched = sorted(
+            (key, tuple(checkpoint[key].shape), tuple(expected[key].shape))
+            for key in active_expected & active_checkpoint
+            if checkpoint[key].shape != expected[key].shape
+        )
+        if missing or unexpected or mismatched:
+            raise RuntimeError(
+                "Stage-J2 parent strict restore failed: "
+                f"missing={missing[:5]} unexpected={unexpected[:5]} "
+                f"shape_mismatch={mismatched[:5]}"
+            )
+        loadable = {key: checkpoint[key] for key in active_expected}
+        nn.Module.load_state_dict(model, loadable, strict=False)
+        model._token_eru_loaded_from_checkpoint = True
+        accelerator.print(
+            f"[token-eru-j2] strict parent restore path={os.path.abspath(opt.resume)} "
+            f"keys={len(checkpoint)}"
+        )
+        return
     if getattr(opt, "model_type", None) == "globalsplat_instance_v2":
         mode = str(getattr(opt, "gsi_v2_resume_mode", "official"))
         if mode == "official":
@@ -1197,11 +1270,250 @@ def _setup_gsi_v2_optimizer(opt, model, accelerator, epoch_start):
     return optimizer
 
 
+def configure_joint_formation_trainability(model: torch.nn.Module, opt) -> dict[str, list[str]]:
+    """Set and audit the exact TokenGS-ERU JointFormation boundary.
+
+    The current ``AbsoluteUnitDecoder`` owns both the local-unit formation
+    submodules and the final per-child Gaussian decoder.  They are therefore
+    split by their actual ``form_units``/``decode_units`` consumers so the
+    fixed learning-rate groups remain explicit without introducing a second
+    module or changing the forward graph.
+    """
+    if not (
+        bool(getattr(opt, "token_eru_dino_metric_joint_formation", False))
+        or _token_eru_j2_enabled(opt)
+    ):
+        raise RuntimeError("JointFormation trainability requested for a non-JointFormation config")
+    required = (
+        "token_eru_decoder",
+        "token_eru_unit_formation",
+        "absolute_gs_head",
+        "tsh_instance_head",
+        "token_eru_dino_encoder",
+        "token_eru_dino_fusion",
+        "token_eru_metric_head",
+    )
+    missing_modules = [name for name in required if getattr(model, name, None) is None]
+    if missing_modules:
+        raise RuntimeError(f"JointFormation modules are missing: {missing_modules}")
+
+    model.requires_grad_(False)
+    categories: dict[str, list[str]] = {
+        "frozen_backbone": [],
+        "reconstruction_query": [],
+        "reconstruction_decoder": [],
+        "reconstruction_unit": [],
+        "absolute_gs_head": [],
+        "understanding_decoder": [],
+        "understanding_unit": [],
+        "pair_adapters": [],
+        "instance_head": [],
+        "metric_head": [],
+        "frozen_other": [],
+    }
+    named = list(model.named_parameters())
+    by_id = {id(parameter): name for name, parameter in named}
+    assigned: dict[int, str] = {}
+
+    def assign_module(module: torch.nn.Module, category: str) -> None:
+        for parameter in module.parameters():
+            parameter_id = id(parameter)
+            if parameter_id not in by_id:
+                # The ERU decoder's reconstruction reference is intentionally
+                # not registered a second time; its parameters are named under
+                # enc_dec_backbone.decoder_blocks below.
+                continue
+            previous = assigned.get(parameter_id)
+            if previous is not None and previous != category:
+                raise RuntimeError(
+                    f"parameter assigned twice: {by_id[parameter_id]} "
+                    f"({previous}, {category})"
+                )
+            assigned[parameter_id] = category
+            parameter.requires_grad_(True)
+            categories[category].append(by_id[parameter_id])
+
+    # Learnable reconstruction query bank; these are the only query tensors
+    # created by TokenGS and retain their original names.
+    for name, parameter in named:
+        if name in ("gs_tokens", "gs_tokens_dynamic"):
+            assigned[id(parameter)] = "reconstruction_query"
+            parameter.requires_grad_(True)
+            categories["reconstruction_query"].append(name)
+
+    assign_module(model.enc_dec_backbone.decoder_blocks, "reconstruction_decoder")
+    assign_module(model.token_eru_decoder.understanding_decoder_blocks, "understanding_decoder")
+    assign_module(model.token_eru_decoder.reconstruction_to_understanding, "pair_adapters")
+    assign_module(model.token_eru_decoder.understanding_to_reconstruction, "pair_adapters")
+    assign_module(model.token_eru_unit_formation, "understanding_unit")
+    assign_module(model.tsh_instance_head, "instance_head")
+    assign_module(model.token_eru_dino_encoder.unit_projector, "metric_head")
+    assign_module(model.token_eru_dino_fusion, "metric_head")
+    assign_module(model.token_eru_metric_head, "metric_head")
+
+    # AbsoluteUnitDecoder is one actual module, but its two public operations
+    # have disjoint parameter submodules.  Keep the requested LR distinction
+    # by assigning the exact parameters consumed by each operation.
+    reconstruction_unit_names = (
+        "absolute_gs_head.tok_norm",
+        "absolute_gs_head.tok_proj",
+        "absolute_gs_head.unit_queries",
+        "absolute_gs_head.unit_readout",
+    )
+    absolute_gs_names = (
+        "absolute_gs_head.slot_emb",
+        "absolute_gs_head.gs_decoder",
+        "absolute_gs_head.center_mlp",
+    )
+    for name, parameter in named:
+        if any(name == prefix or name.startswith(prefix + ".") for prefix in reconstruction_unit_names):
+            if id(parameter) in assigned:
+                raise RuntimeError(f"absolute unit parameter already assigned: {name}")
+            assigned[id(parameter)] = "reconstruction_unit"
+            parameter.requires_grad_(True)
+            categories["reconstruction_unit"].append(name)
+        elif any(name == prefix or name.startswith(prefix + ".") for prefix in absolute_gs_names):
+            if id(parameter) in assigned:
+                raise RuntimeError(f"absolute GS parameter already assigned: {name}")
+            assigned[id(parameter)] = "absolute_gs_head"
+            parameter.requires_grad_(True)
+            categories["absolute_gs_head"].append(name)
+
+    # Every parameter is classified exactly once.  This also catches a future
+    # module addition in the active graph instead of silently omitting it.
+    for name, parameter in named:
+        parameter_id = id(parameter)
+        if parameter_id in assigned:
+            continue
+        if name.startswith(("patch_embed.", "patch_plucker_embed.", "enc_dec_backbone.")) and not name.startswith(
+            "enc_dec_backbone.decoder_blocks."
+        ):
+            category = "frozen_backbone"
+        else:
+            category = "frozen_other"
+        assigned[parameter_id] = category
+        categories[category].append(name)
+
+    if len(assigned) != len(named) or set(assigned) != {id(parameter) for _, parameter in named}:
+        raise RuntimeError("JointFormation parameter classification is incomplete")
+    trainable_ids = {id(parameter) for _, parameter in named if parameter.requires_grad}
+    expected_trainable_ids = {
+        parameter_id
+        for parameter_id, category in assigned.items()
+        if category not in ("frozen_backbone", "frozen_other")
+    }
+    if trainable_ids != expected_trainable_ids:
+        raise RuntimeError("JointFormation trainability flags disagree with classification")
+    for category in categories:
+        categories[category].sort()
+    return categories
+
+
+def _setup_token_eru_joint_formation_optimizer(opt, model, accelerator, epoch_start):
+    del epoch_start
+    categories = configure_joint_formation_trainability(model, opt)
+    if _token_eru_j2_enabled(opt):
+        lr_by_category = {
+            "reconstruction_query": 1.0e-6,
+            "reconstruction_decoder": 1.0e-6,
+            "reconstruction_unit": 1.0e-6,
+            "absolute_gs_head": 3.0e-7,
+            "understanding_decoder": 1.0e-5,
+            "understanding_unit": 1.0e-5,
+            "pair_adapters": 3.0e-5,
+            "instance_head": 1.0e-5,
+            "metric_head": 3.0e-5,
+        }
+    else:
+        lr_by_category = {
+            "reconstruction_query": 3.0e-6,
+            "reconstruction_decoder": 3.0e-6,
+            "reconstruction_unit": 3.0e-6,
+            "absolute_gs_head": 1.0e-6,
+            "understanding_decoder": float(opt.token_eru_understanding_lr),
+            "understanding_unit": float(opt.token_eru_understanding_lr),
+            "pair_adapters": float(opt.token_eru_adapter_lr),
+            "instance_head": float(opt.token_eru_tsh_lr),
+            "metric_head": 1.0e-4,
+        }
+    name_to_parameter = dict(model.named_parameters())
+    groups = []
+    seen: set[int] = set()
+    for category in (
+        "reconstruction_query",
+        "reconstruction_decoder",
+        "reconstruction_unit",
+        "absolute_gs_head",
+        "understanding_decoder",
+        "understanding_unit",
+        "pair_adapters",
+        "instance_head",
+        "metric_head",
+    ):
+        entries = [name_to_parameter[name] for name in categories[category]]
+        if not entries:
+            raise RuntimeError(f"JointFormation optimizer group is empty: {category}")
+        if any(id(parameter) in seen for parameter in entries):
+            raise RuntimeError(f"JointFormation optimizer group overlap: {category}")
+        seen.update(id(parameter) for parameter in entries)
+        decay = [parameter for parameter in entries if parameter.ndim != 1 and not getattr(parameter, "_no_weight_decay", False)]
+        nodecay = [parameter for parameter in entries if parameter.ndim == 1 or getattr(parameter, "_no_weight_decay", False)]
+        for parameters, weight_decay in ((decay, float(opt.weight_decay)), (nodecay, 0.0)):
+            if parameters:
+                groups.append({
+                    "params": parameters,
+                    "lr": float(lr_by_category[category]),
+                    "weight_decay": weight_decay,
+                    "name": category,
+                })
+    expected = {id(parameter) for _, parameter in model.named_parameters() if parameter.requires_grad}
+    if seen != expected:
+        raise RuntimeError(
+            "JointFormation optimizer does not cover exactly the trainable set: "
+            f"missing={len(expected - seen)} extra={len(seen - expected)}"
+        )
+    if _token_eru_j2_enabled(opt):
+        trainable_count = sum(1 for _, parameter in model.named_parameters() if parameter.requires_grad)
+        trainable_numel = sum(parameter.numel() for _, parameter in model.named_parameters() if parameter.requires_grad)
+        if trainable_count != 903 or trainable_numel != 364_349_232:
+            raise RuntimeError(
+                "Stage-J2 trainable parameter audit mismatch: "
+                f"count={trainable_count} expected=903 "
+                f"numel={trainable_numel} expected=364349232"
+            )
+    try:
+        optimizer = torch.optim.AdamW(groups, lr=float(opt.lr), betas=(0.9, 0.95), fused=True)
+    except (TypeError, RuntimeError):
+        optimizer = torch.optim.AdamW(groups, lr=float(opt.lr), betas=(0.9, 0.95))
+    accelerator.print(
+        "[token-eru-joint] optimizer groups: "
+        + ", ".join(
+            f"{group['name']}:{len(group['params'])}@{group['lr']}@wd={group['weight_decay']}"
+            for group in groups
+        )
+    )
+    accelerator.print(
+        "[token-eru-joint] trainability: "
+        + ", ".join(
+            f"{category}={len(names)}"
+            for category, names in categories.items()
+        )
+    )
+    return optimizer
+
+
 def setup_optimizer(opt, model, accelerator, epoch_start):
     """Setup optimizer. Call before accelerator.prepare()."""
     if getattr(opt, "model_type", None) == "globalsplat_instance_v2":
         return _setup_gsi_v2_optimizer(opt, model, accelerator, epoch_start)
     if bool(getattr(opt, "token_eru_enabled", False)):
+        if (
+            bool(getattr(opt, "token_eru_dino_metric_joint_formation", False))
+            or _token_eru_j2_enabled(opt)
+        ):
+            return _setup_token_eru_joint_formation_optimizer(
+                opt, model, accelerator, epoch_start
+            )
         mode = str(getattr(opt, "token_eru_mode", "disabled"))
         if mode == "identity":
             raise RuntimeError("TokenGS-ERU identity mode is evaluation-only")
@@ -1283,6 +1595,7 @@ def setup_optimizer(opt, model, accelerator, epoch_start):
         # metric group without historical state.  This preserves the old
         # trajectory and makes the new group genuinely fresh.
         fork_step = int(getattr(opt, "tsh_fork_continue_step", 0))
+        stage_m = bool(getattr(opt, "token_eru_dino_metric_stage_m", False))
         source_dir = os.path.dirname(os.path.abspath(str(getattr(opt, "resume", ""))))
         source_optimizer_path = os.path.join(
             source_dir,
@@ -1296,6 +1609,12 @@ def setup_optimizer(opt, model, accelerator, epoch_start):
             if fork_step > 0 and os.path.isfile(source_optimizer_path)
             else ""
         )
+        if stage_m:
+            optimizer_state_path = ""
+            accelerator.print(
+                "[token-eru-stage-m] parent optimizer is intentionally not restored; "
+                "using a fresh optimizer"
+            )
         if optimizer_state_path:
             source_state = torch.load(optimizer_state_path, map_location="cpu")
             if fork_step > 0 and optimizer_state_path == source_optimizer_path:
@@ -1646,13 +1965,43 @@ def setup_scheduler(opt, optimizer, iters_per_epoch, accelerator, epoch_start):
             for group, lr in zip(optimizer.param_groups, scheduler_state["_last_lr"]):
                 group["lr"] = float(lr)
         return scheduler
+    if _token_eru_j2_enabled(opt):
+        warmup_steps = int(getattr(opt, "token_eru_dino_metric_joint_formation_j2_warmup_steps", 50))
+        total_steps = int(getattr(opt, "token_eru_dino_metric_joint_formation_j2_total_steps", 710))
+        min_ratio = float(getattr(opt, "token_eru_dino_metric_joint_formation_j2_min_ratio", 0.1))
+
+        def multiplier(last_epoch):
+            # LambdaLR calls this once at construction with last_epoch=0 in
+            # the current torch version.  The value therefore denotes the
+            # upcoming local optimizer step, and step 1 receives 1/50.
+            upcoming = max(1, min(total_steps, int(last_epoch) + 1))
+            return joint_formation_j2_lr_scale(
+                upcoming,
+                warmup_steps=warmup_steps,
+                total_steps=total_steps,
+                min_ratio=min_ratio,
+            )
+
+        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=multiplier)
+        scheduler_path = os.path.join(opt.workspace, "scheduler.pth")
+        if epoch_start > 0 and os.path.isfile(scheduler_path):
+            scheduler_state = torch.load(scheduler_path, map_location="cpu")
+            scheduler.load_state_dict(scheduler_state)
+            for group, lr in zip(optimizer.param_groups, scheduler_state.get("_last_lr", ())):
+                group["lr"] = float(lr)
+        elif epoch_start == 0:
+            accelerator.print(
+                "[token-eru-j2] fresh warmup+cosine scheduler; parent scheduler not restored"
+            )
+        return scheduler
     if opt.lr_scheduler == "constant":
         scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lambda _: 1.0)
         fork_continue = bool(
             getattr(opt, "tsh_fork_continue_step", 0) > 0
         )
         scheduler_path = os.path.join(opt.workspace, "scheduler.pth")
-        if not os.path.isfile(scheduler_path) and fork_continue:
+        stage_m = bool(getattr(opt, "token_eru_dino_metric_stage_m", False))
+        if not os.path.isfile(scheduler_path) and fork_continue and not stage_m:
             source_dir = os.path.dirname(os.path.abspath(str(getattr(opt, "resume", ""))))
             candidate = os.path.join(
                 source_dir,
@@ -1660,8 +2009,13 @@ def setup_scheduler(opt, optimizer, iters_per_epoch, accelerator, epoch_start):
             )
             if os.path.isfile(candidate):
                 scheduler_path = candidate
-        if epoch_start > 0 or (fork_continue and os.path.isfile(scheduler_path)):
+        if not stage_m and (epoch_start > 0 or (fork_continue and os.path.isfile(scheduler_path))):
             scheduler.load_state_dict(torch.load(scheduler_path, map_location="cpu"))
+        if stage_m:
+            accelerator.print(
+                "[token-eru-stage-m] parent scheduler is intentionally not restored; "
+                "using a fresh scheduler"
+            )
         return scheduler
 
     steps_per_epoch = iters_per_epoch // opt.gradient_accumulation_steps
@@ -1964,6 +2318,413 @@ def _wait_for_rank_markers(
         time.sleep(1.0)
 
 
+def _checkpoint_space_guard(ckpt_dir: str, accelerator, step: int, kind: str) -> None:
+    """Synchronously reject a checkpoint save when shared-FS headroom is low."""
+    minimum = 8 * 1024 ** 3 if kind == "model-only" else 15 * 1024 ** 3
+    local_ok = True
+    local_message = ""
+    try:
+        stats = os.statvfs(ckpt_dir)
+        free_bytes = int(stats.f_bavail) * int(stats.f_frsize)
+        if free_bytes < minimum:
+            local_ok = False
+            local_message = (
+                f"checkpoint step={step} kind={kind} requires at least "
+                f"{minimum} bytes free, got {free_bytes}"
+            )
+    except OSError as exc:
+        local_ok = False
+        local_message = f"cannot stat checkpoint filesystem: {exc!r}"
+
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        flag = torch.tensor(
+            [1 if local_ok else 0], device=accelerator.device, dtype=torch.int32
+        )
+        torch.distributed.all_reduce(flag, op=torch.distributed.ReduceOp.MIN)
+        if int(flag.item()) == 0:
+            raise RuntimeError(
+                local_message
+                or f"checkpoint step={step} kind={kind} rejected by another rank"
+            )
+    elif not local_ok:
+        raise RuntimeError(local_message)
+
+
+def _token_eru_full_state_due(opt, step: int) -> bool:
+    if not bool(getattr(opt, "abs_ckpt_full_state", False)):
+        return False
+    selected = tuple(int(value) for value in getattr(
+        opt, "abs_ckpt_full_state_steps", ()
+    ))
+    return not selected or int(step) in selected
+
+
+def _token_eru_dino_metadata(opt, step: int) -> dict:
+    schedule_step = int(step)
+    if _token_eru_j2_enabled(opt):
+        schedule_step = int(getattr(opt, "token_eru_dino_metric_joint_formation_j2_parent_step", 710)) + int(step)
+    if bool(getattr(opt, "token_eru_dino_metric_stage_m", False)):
+        schedule_step += int(
+            getattr(opt, "token_eru_dino_metric_stage_m_parent_step", 500)
+        )
+    enabled = bool(getattr(opt, "token_eru_dino_metric_enabled", False))
+    start = int(getattr(opt, "token_eru_dino_gate_start_step", 500))
+    end = int(getattr(opt, "token_eru_dino_gate_end_step", 525))
+    gate = (
+        0.0
+        if not enabled or schedule_step <= start
+        else min(1.0, (schedule_step - start) / float(max(1, end - start)))
+    )
+    return {
+        "token_eru_dino_metric_enabled": enabled,
+        "token_eru_dino_metric_joint_formation": bool(
+            getattr(opt, "token_eru_dino_metric_joint_formation", False)
+        ),
+        "token_eru_dino_metric_joint_formation_j2": _token_eru_j2_enabled(opt),
+        "token_eru_dino_repo_path": os.path.abspath(str(getattr(opt, "token_eru_dino_repo_path", ""))),
+        "token_eru_dino_weight_path": os.path.abspath(str(getattr(opt, "token_eru_dino_weight_path", ""))),
+        "token_eru_dino_weight_sha256": (
+            "0b8b82f85de91b424aded121c7e1dcc2b7bc6d0adeea651bf73a13307fad8c73"
+            if enabled else None
+        ),
+        "token_eru_dino_metric_loss_weight": float(getattr(opt, "token_eru_dino_metric_loss_weight", 0.0)),
+        "token_eru_dino_gate_start_step": start,
+        "token_eru_dino_gate_end_step": end,
+        "token_eru_dino_native_gate": 1.0 if _token_eru_j2_enabled(opt) else float(gate),
+        "token_eru_dino_native_metric_loss_weight": (
+            float(getattr(opt, "token_eru_dino_metric_loss_weight", 0.0))
+            if _token_eru_j2_enabled(opt) else
+            float(getattr(opt, "token_eru_dino_metric_loss_weight", 0.0)) * float(gate)
+        ),
+        "token_eru_dino_embedding_dim": int(getattr(opt, "token_eru_dino_embedding_dim", 128)),
+        "token_eru_dino_temperature": 0.1,
+        "token_eru_dino_num_tokens": 1024,
+        "token_eru_dino_units_per_token": 8,
+        "token_eru_dino_gaussians_per_unit": 8,
+        "token_eru_dino_alignment": "context_dino_to_gaussian_centers_then_8_child_unit_mean",
+        "token_eru_dino_cluster_position_weight": 1.0,
+        "token_eru_dino_source": "local",
+        "token_eru_dino_cluster_eps": float(getattr(opt, "token_eru_dino_cluster_eps", 0.5)),
+    }
+
+
+def _token_eru_stage_m_metadata(opt, stage_step: int) -> dict:
+    """Explicit lineage for the independent Stage-M fine-tuning fork."""
+    if not bool(getattr(opt, "token_eru_dino_metric_stage_m", False)):
+        return {}
+    parent_step = int(getattr(opt, "token_eru_dino_metric_stage_m_parent_step", 500))
+    return {
+        "stage_name": str(
+            getattr(opt, "token_eru_dino_metric_stage_m_name", "eru_dino_metric_stage_m")
+        ),
+        "parent_step": parent_step,
+        "stage_optimizer_step": int(stage_step),
+        "effective_schedule_step": parent_step + int(stage_step),
+        "old_optimizer_restored": False,
+        "old_scheduler_restored": False,
+        "old_rng_restored": False,
+        "old_sampler_cursor_restored": False,
+        "batches_skipped": 0,
+    }
+
+
+def _token_eru_j2_enabled(opt) -> bool:
+    return bool(getattr(opt, "token_eru_dino_metric_joint_formation_j2", False))
+
+
+def _token_eru_stage_parent_step(opt) -> int:
+    if _token_eru_j2_enabled(opt):
+        return int(getattr(opt, "token_eru_dino_metric_joint_formation_j2_parent_step", 710))
+    if bool(getattr(opt, "token_eru_dino_metric_stage_m", False)):
+        return int(getattr(opt, "token_eru_dino_metric_stage_m_parent_step", 500))
+    return 0
+
+
+def _token_eru_j2_metadata(opt, stage_step: int) -> dict:
+    if not _token_eru_j2_enabled(opt):
+        return {}
+    parent_step = int(getattr(opt, "token_eru_dino_metric_joint_formation_j2_parent_step", 710))
+    return {
+        "stage_name": str(getattr(
+            opt, "token_eru_dino_metric_joint_formation_j2_name",
+            "token_eru_dino_joint_formation_stage_j2",
+        )),
+        "parent_optimizer_step": parent_step,
+        "stage_local_step": int(stage_step),
+        "effective_optimizer_step": parent_step + int(stage_step),
+        "old_optimizer_restored": False,
+        "old_scheduler_restored": False,
+        "old_rng_restored": False,
+        "old_sampler_cursor_restored": False,
+        "batches_skipped": 0,
+        "reconstruction_to_understanding_gate": 1.0,
+        "understanding_to_reconstruction_gate": 0.1,
+        "dino_gate": 1.0,
+        "metric_loss_weight": 1.0,
+        "training_mode": "new_stage_j2_from_joint_formation_710",
+    }
+
+
+def write_token_eru_joint_parent_reference(opt, accelerator) -> None:
+    """Record the model-only ERU parent without copying its state."""
+    if not (
+        bool(getattr(opt, "token_eru_dino_metric_joint_formation", False))
+        or _token_eru_j2_enabled(opt)
+    ):
+        return
+    parent = os.path.abspath(str(getattr(opt, "resume", "")))
+    if not parent or not os.path.isfile(parent):
+        raise RuntimeError(f"JointFormation parent checkpoint is missing: {parent}")
+    digest = hashlib.sha256()
+    with open(parent, "rb") as handle:
+        for chunk in iter(lambda: handle.read(8 * 1024 * 1024), b""):
+            digest.update(chunk)
+    if _token_eru_j2_enabled(opt):
+        payload = {
+            "parent_checkpoint_path": parent,
+            "parent_checkpoint_sha256": digest.hexdigest(),
+            "parent_model_step": 710,
+            "parent_optimizer_step": 710,
+            "stage_name": str(getattr(
+                opt, "token_eru_dino_metric_joint_formation_j2_name",
+                "token_eru_dino_joint_formation_stage_j2",
+            )),
+            "optimizer_restored": False,
+            "scheduler_restored": False,
+            "rng_restored": False,
+            "dataloader_cursor_restored": False,
+            "batches_skipped": 0,
+        }
+    else:
+        payload = {
+        "parent_checkpoint_path": parent,
+        "parent_checkpoint_sha256": digest.hexdigest(),
+        "parent_model_step": 500,
+        "stage_name": "token_eru_dino_joint_formation_v1",
+        "optimizer_restored": False,
+        "scheduler_restored": False,
+        "rng_restored": False,
+        "dataloader_cursor_restored": False,
+        "batches_skipped": 0,
+        }
+    path = os.path.join(opt.workspace, "parent_checkpoint.json")
+    should_write = not os.path.exists(path)
+    if os.path.exists(path):
+        with open(path, "r", encoding="utf-8") as handle:
+            existing = json.load(handle)
+        if existing != payload:
+            raise RuntimeError(f"refusing to overwrite mismatched parent reference: {path}")
+    if should_write and accelerator.is_main_process:
+        temporary = f"{path}.tmp.{os.getpid()}"
+        with open(temporary, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, indent=2)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    # Every rank must enter this barrier, including ranks that observed the
+    # file after rank0 created it. Returning early here mismatches this
+    # barrier with the next collective in accelerator.prepare().
+    accelerator.wait_for_everyone()
+    if not os.path.isfile(path):
+        raise RuntimeError(f"JointFormation parent reference was not published: {path}")
+    with open(path, "r", encoding="utf-8") as handle:
+        published = json.load(handle)
+    if published != payload:
+        raise RuntimeError(f"published parent reference changed during synchronization: {path}")
+
+
+def _joint_formation_prepare_audit(
+    opt,
+    accelerator,
+    model,
+    optimizer,
+    train_dataloader,
+    test_dataloader,
+) -> None:
+    """Write a complete per-rank manifest immediately before prepare().
+
+    The manifest is opt-in. Each rank writes its own file before the audit
+    barrier/all-gather so a model mismatch cannot be hidden by a main-rank
+    summary.
+    """
+    if not bool(getattr(opt, "joint_formation_ddp_manifest_audit", False)):
+        return
+    rank = int(getattr(accelerator, "process_index", os.environ.get("RANK", -1)))
+    local_rank = int(
+        os.environ.get("LOCAL_RANK", getattr(accelerator, "local_process_index", -1))
+    )
+    world = int(getattr(accelerator, "num_processes", os.environ.get("WORLD_SIZE", 1)))
+    named = list(model.named_parameters())
+    name_by_id = {id(parameter): name for name, parameter in named}
+    trainable = [(name, parameter) for name, parameter in named if parameter.requires_grad]
+    trainable_ids = {id(parameter) for _, parameter in trainable}
+
+    digest = hashlib.sha256()
+    for name, parameter in sorted(trainable):
+        digest.update(name.encode("utf-8"))
+        digest.update(repr(tuple(parameter.shape)).encode("utf-8"))
+    trainable_name_shape_hash = digest.hexdigest()
+
+    state_digest = hashlib.sha256()
+    state_manifest = []
+    for name, value in sorted(model.state_dict().items()):
+        shape = tuple(value.shape)
+        state_digest.update(name.encode("utf-8"))
+        state_digest.update(repr(shape).encode("utf-8"))
+        state_manifest.append({"name": name, "shape": list(shape)})
+
+    optimizer_manifest = []
+    optimizer_ids = []
+    optimizer_requires_grad_false = []
+    unmapped_optimizer_parameters = []
+    for index, group in enumerate(optimizer.param_groups):
+        entries = []
+        for parameter in group["params"]:
+            parameter_id = id(parameter)
+            optimizer_ids.append(parameter_id)
+            name = name_by_id.get(parameter_id)
+            if name is None:
+                unmapped_optimizer_parameters.append(parameter_id)
+            if not parameter.requires_grad:
+                optimizer_requires_grad_false.append(name or f"<unmapped:{parameter_id}>")
+            entries.append({
+                "name": name,
+                "shape": list(parameter.shape),
+                "numel": int(parameter.numel()),
+                "requires_grad": bool(parameter.requires_grad),
+            })
+        optimizer_manifest.append({
+            "index": index,
+            "name": group.get("name", f"group_{index}"),
+            "lr": float(group["lr"]),
+            "weight_decay": float(group.get("weight_decay", 0.0)),
+            "parameter_tensor_count": len(entries),
+            "numel": sum(item["numel"] for item in entries),
+            "parameter_names": sorted(item["name"] for item in entries if item["name"] is not None),
+        })
+    optimizer_ids_set = set(optimizer_ids)
+    optimizer_digest = hashlib.sha256(
+        json.dumps(optimizer_manifest, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+
+    parent = os.path.abspath(str(getattr(opt, "resume", "")))
+    parent_sha = None
+    if os.path.isfile(parent):
+        parent_digest = hashlib.sha256()
+        with open(parent, "rb") as handle:
+            for chunk in iter(lambda: handle.read(8 * 1024 * 1024), b""):
+                parent_digest.update(chunk)
+        parent_sha = parent_digest.hexdigest()
+
+    payload = {
+        "global_rank": rank,
+        "local_rank": local_rank,
+        "world_size": world,
+        "hostname": __import__("socket").gethostname(),
+        "pid": os.getpid(),
+        "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES", ""),
+        "cuda_current_device": torch.cuda.current_device() if torch.cuda.is_available() else None,
+        "gpu_name": torch.cuda.get_device_name() if torch.cuda.is_available() else None,
+        "cwd": os.getcwd(),
+        "repo_realpath": os.path.realpath(os.getcwd()),
+        "model_class": type(model).__name__,
+        "model_definition": os.path.abspath(inspect.getfile(type(model))),
+        "model_object_id": id(model),
+        "config_name": getattr(opt, "experiment_name", None),
+        "config": {
+            "model_type": getattr(opt, "model_type", None),
+            "token_eru_dino_metric_joint_formation": bool(getattr(opt, "token_eru_dino_metric_joint_formation", False)),
+            "token_eru_enabled": bool(getattr(opt, "token_eru_enabled", False)),
+            "tsh_ddp8": bool(getattr(opt, "tsh_ddp8", False)),
+            "batch_size": int(getattr(opt, "batch_size", -1)),
+            "num_workers": int(getattr(opt, "num_workers", -1)),
+            "max_iters_per_epoch": int(getattr(opt, "max_iters_per_epoch", -1)),
+            "mixed_precision": getattr(opt, "mixed_precision", None),
+        },
+        "parent_checkpoint_path": parent,
+        "parent_checkpoint_sha256": parent_sha,
+        "named_parameters": [
+            {
+                "name": name,
+                "shape": list(parameter.shape),
+                "dtype": str(parameter.dtype),
+                "requires_grad": bool(parameter.requires_grad),
+                "numel": int(parameter.numel()),
+            }
+            for name, parameter in named
+        ],
+        "parameter_tensor_count": len(named),
+        "parameter_numel": sum(int(parameter.numel()) for _, parameter in named),
+        "trainable_tensor_count": len(trainable),
+        "trainable_numel": sum(int(parameter.numel()) for _, parameter in trainable),
+        "trainable_name_shape_sha256": trainable_name_shape_hash,
+        "state_dict_key_shape_sha256": state_digest.hexdigest(),
+        "state_dict_manifest": state_manifest,
+        "optimizer_group_count": len(optimizer_manifest),
+        "optimizer_groups": optimizer_manifest,
+        "optimizer_parameter_names_sha256": optimizer_digest,
+        "optimizer_object_id": id(optimizer),
+        "trainable_not_in_optimizer": sorted(name for name, _ in trainable if id(_) not in optimizer_ids_set),
+        "optimizer_requires_grad_false": sorted(optimizer_requires_grad_false),
+        "duplicate_optimizer_parameters": sorted(
+            str(parameter_id)
+            for parameter_id in set(optimizer_ids)
+            if optimizer_ids.count(parameter_id) > 1
+        ),
+        "unmapped_optimizer_parameters": sorted(str(parameter_id) for parameter_id in unmapped_optimizer_parameters),
+        "prepare_objects": [
+            {"position": 0, "type": type(model).__name__, "object_id": id(model)},
+            {"position": 1, "type": type(optimizer).__name__, "object_id": id(optimizer)},
+            {"position": 2, "type": type(train_dataloader).__name__, "object_id": id(train_dataloader)},
+            {"position": 3, "type": type(test_dataloader).__name__, "object_id": id(test_dataloader)},
+        ],
+        "collectives_before_prepare": [
+            {"seq": 0, "operation": "barrier", "phase": "parent_reference"},
+            {"seq": 1, "operation": "barrier", "phase": "prepare_audit"},
+            {"seq": 2, "operation": "all_gather_object", "phase": "prepare_audit"},
+        ],
+    }
+    audit_dir = os.path.join(opt.workspace, "joint_formation_ddp_manifest_audit")
+    os.makedirs(audit_dir, exist_ok=True)
+    rank_path = os.path.join(audit_dir, f"rank{rank:02d}.json")
+    with open(rank_path, "w", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=2)
+        handle.flush()
+        os.fsync(handle.fileno())
+
+    if not torch.distributed.is_available() or not torch.distributed.is_initialized():
+        return
+    # These are the first audit collectives and occur only after every rank
+    # has completed its independent manifest write.
+    accelerator.wait_for_everyone()
+    manifests = [None] * world
+    torch.distributed.all_gather_object(
+        manifests,
+        {
+            "rank": rank,
+            "trainable_tensor_count": len(trainable),
+            "trainable_numel": payload["trainable_numel"],
+            "trainable_name_shape_sha256": trainable_name_shape_hash,
+            "state_dict_key_shape_sha256": state_digest.hexdigest(),
+            "optimizer_parameter_names_sha256": optimizer_digest,
+        },
+    )
+    if rank == 0:
+        with open(os.path.join(audit_dir, "summary.json"), "w", encoding="utf-8") as handle:
+            json.dump(
+                {
+                    "collective_sequence": [
+                        {"seq": 0, "operation": "barrier", "phase": "parent_reference"},
+                        {"seq": 1, "operation": "barrier", "phase": "prepare_audit"},
+                        {"seq": 2, "operation": "all_gather_object", "phase": "prepare_audit"},
+                    ],
+                    "ranks": manifests,
+                },
+                handle,
+                indent=2,
+            )
+
+
 def save_gsi_v2_intra_epoch_checkpoint_synchronized(
     opt, accelerator, model, optimizer, scheduler, epoch, completed_step
 ):
@@ -2149,6 +2910,90 @@ def save_gsi_v2_intra_epoch_checkpoint_synchronized(
         )
 
 
+def save_token_eru_model_only_checkpoint_synchronized(
+    opt, accelerator, model, epoch, completed_step
+):
+    """Publish an atomic ERU model-only milestone with a shared-FS guard."""
+    ckpt_dir = os.path.join(opt.workspace, "checkpoints")
+    os.makedirs(ckpt_dir, exist_ok=True)
+    step = int(completed_step)
+    rank = int(getattr(accelerator, "process_index", -1))
+    world = int(getattr(accelerator, "num_processes", 1))
+    model_name = f"model_step_{step:06d}.safetensors"
+    metadata_name = f"metadata_step_{step:06d}.json"
+    required = (model_name, metadata_name)
+    for name in required + (f"step_{step:06d}.complete", f"step_{step:06d}.failed"):
+        if os.path.exists(os.path.join(ckpt_dir, name)):
+            raise FileExistsError(
+                f"refusing to overwrite existing TokenGS-ERU artifact: "
+                f"{os.path.join(ckpt_dir, name)}"
+            )
+
+    accelerator.wait_for_everyone()
+    _checkpoint_space_guard(ckpt_dir, accelerator, step, "model-only")
+    try:
+        if accelerator.is_main_process:
+            unwrapped = accelerator.unwrap_model(model)
+            state = {
+                key: value.detach().cpu().contiguous()
+                for key, value in unwrapped.state_dict().items()
+            }
+            model_path = os.path.join(ckpt_dir, model_name)
+            model_tmp = f"{model_path}.tmp.{os.getpid()}"
+            save_file(state, model_tmp)
+            os.replace(model_tmp, model_path)
+            del state
+            gbs = int(opt.batch_size) * world
+            metadata = {
+                "optimizer_step": step,
+                "equivalent_global_samples": step * gbs,
+                "epoch": int(epoch),
+                "world_size": world,
+                "per_gpu_batch_size": int(opt.batch_size),
+                "global_batch_size": gbs,
+                "checkpoint_kind": "model-only",
+                "parent_checkpoint_reference": os.path.abspath(str(getattr(opt, "resume", ""))),
+                "parent_optimizer_step": _token_eru_stage_parent_step(opt),
+                "token_eru_matching_mode": str(getattr(opt, "token_eru_matching_mode", "per_view")),
+                "hungarian_scope": "scene_window" if str(getattr(opt, "token_eru_matching_mode", "per_view")) == "scene" else "per_view",
+                "expected_hungarian_calls_per_scene_window": 1 if str(getattr(opt, "token_eru_matching_mode", "per_view")) == "scene" else 7,
+                "same_assignment_all_target_views": str(getattr(opt, "token_eru_matching_mode", "per_view")) == "scene",
+                "checkpoint_protocol": "token_eru_model_only_shared_fs_v1",
+            }
+            metadata.update(_token_eru_dino_metadata(opt, step))
+            metadata.update(_token_eru_stage_m_metadata(opt, step))
+            metadata.update(_token_eru_j2_metadata(opt, step))
+            metadata_path = os.path.join(ckpt_dir, metadata_name)
+            metadata_tmp = f"{metadata_path}.tmp.{os.getpid()}"
+            with open(metadata_tmp, "w", encoding="utf-8") as handle:
+                json.dump(metadata, handle, indent=2)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(metadata_tmp, metadata_path)
+            _atomic_touch(os.path.join(ckpt_dir, f"step_{step:06d}.complete"))
+        else:
+            _wait_for_shared_checkpoint(ckpt_dir, step, required, rank, timeout_seconds=1800)
+    except Exception as exc:
+        if accelerator.is_main_process:
+            _atomic_write_text(
+                os.path.join(ckpt_dir, f"step_{step:06d}.failed"),
+                f"rank={rank} step={step} checkpoint save failed: {exc!r}\n",
+            )
+        raise
+    finally:
+        for temporary in glob.glob(os.path.join(ckpt_dir, f"*step_{step:06d}*.tmp.*")):
+            try:
+                os.unlink(temporary)
+            except FileNotFoundError:
+                pass
+    accelerator.wait_for_everyone()
+    if accelerator.is_main_process:
+        accelerator.print(
+            f"[token-eru-ckpt] saved model-only step={step} "
+            f"sentinel={os.path.join(ckpt_dir, f'step_{step:06d}.complete')}"
+        )
+
+
 def save_token_eru_intra_epoch_checkpoint_synchronized(
     opt, accelerator, model, optimizer, scheduler, epoch, completed_step
 ):
@@ -2185,6 +3030,8 @@ def save_token_eru_intra_epoch_checkpoint_synchronized(
                 f"refusing to overwrite existing TokenGS-ERU artifact: {path}"
             )
 
+    accelerator.wait_for_everyone()
+    _checkpoint_space_guard(ckpt_dir, accelerator, step, "full-state")
     import random
 
     rng_name = f"rng_step_{step:06d}_rank{rank:02d}.pth"
@@ -2263,6 +3110,14 @@ def save_token_eru_intra_epoch_checkpoint_synchronized(
             except Exception:
                 git_commit = "unknown"
             gbs = int(opt.batch_size) * world
+            dino_enabled = bool(getattr(opt, "token_eru_dino_metric_enabled", False))
+            dino_start = int(getattr(opt, "token_eru_dino_gate_start_step", 500))
+            dino_end = int(getattr(opt, "token_eru_dino_gate_end_step", 525))
+            dino_gate = (
+                0.0
+                if not dino_enabled or step <= dino_start
+                else min(1.0, (step - dino_start) / float(max(1, dino_end - dino_start)))
+            )
             metadata = {
                 "optimizer_step": step,
                 "equivalent_global_samples": step * gbs,
@@ -2270,6 +3125,11 @@ def save_token_eru_intra_epoch_checkpoint_synchronized(
                 "world_size": world,
                 "per_gpu_batch_size": int(opt.batch_size),
                 "global_batch_size": gbs,
+                "checkpoint_kind": "full-state",
+                "parent_checkpoint_reference": os.path.abspath(
+                    str(getattr(opt, "resume", ""))
+                ),
+                "parent_optimizer_step": _token_eru_stage_parent_step(opt),
                 "git_commit": git_commit,
                 "config_path": os.path.abspath(config_path),
                 "optimizer_state": os.path.abspath(optimizer_path),
@@ -2301,6 +3161,9 @@ def save_token_eru_intra_epoch_checkpoint_synchronized(
                 == "scene",
                 "token_eru_dino_metric_enabled": bool(
                     dino_enabled
+                ),
+                "token_eru_dino_metric_joint_formation": bool(
+                    getattr(opt, "token_eru_dino_metric_joint_formation", False)
                 ),
                 "token_eru_dino_repo_path": os.path.abspath(
                     str(getattr(opt, "token_eru_dino_repo_path", ""))
@@ -2340,6 +3203,8 @@ def save_token_eru_intra_epoch_checkpoint_synchronized(
                     getattr(opt, "token_eru_dino_cluster_eps", 0.5)
                 ),
             }
+            metadata.update(_token_eru_stage_m_metadata(opt, step))
+            metadata.update(_token_eru_j2_metadata(opt, step))
             metadata_path = os.path.join(ckpt_dir, metadata_name)
             metadata_tmp = f"{metadata_path}.tmp.{os.getpid()}"
             with open(metadata_tmp, "w", encoding="utf-8") as handle:
@@ -2880,13 +3745,15 @@ def train_epoch(opt, accelerator, model, optimizer, scheduler, train_dataloader,
         """Execute a single training step and return metrics."""
         optimizer.zero_grad()
 
-        global_step_for_aux = global_step
+        stage_parent = _token_eru_stage_parent_step(opt)
+        global_step_for_aux = global_step + stage_parent
         completed_step = global_step + 1
+        effective_completed_step = completed_step + stage_parent
         unwrapped_model = accelerator.unwrap_model(model)
         if hasattr(unwrapped_model, "set_token_eru_step"):
-            unwrapped_model.set_token_eru_step(completed_step)
+            unwrapped_model.set_token_eru_step(effective_completed_step)
         if hasattr(unwrapped_model, "set_token_eru_dino_metric_step"):
-            unwrapped_model.set_token_eru_dino_metric_step(completed_step)
+            unwrapped_model.set_token_eru_dino_metric_step(effective_completed_step)
         if getattr(opt, "model_type", None) == "globalsplat_instance_v2":
             schedule_step = (
                 completed_step
@@ -3572,6 +4439,10 @@ def train_epoch(opt, accelerator, model, optimizer, scheduler, train_dataloader,
                 ))
             )
         )
+        token_eru_full_state_due = (
+            bool(getattr(opt, "token_eru_enabled", False))
+            and _token_eru_full_state_due(opt, completed_step)
+        )
         if checkpoint_due and not (
             bool(getattr(opt, "tsh_ddp8", False))
             and bool(getattr(opt, "abs_ckpt_full_state", False))
@@ -3677,6 +4548,16 @@ def train_epoch(opt, accelerator, model, optimizer, scheduler, train_dataloader,
                 f"[abs-ckpt] saved intra-epoch head checkpoint "
                 f"step={completed_step}"
             )
+        if (
+            checkpoint_due
+            and bool(getattr(opt, "token_eru_enabled", False))
+            and bool(getattr(opt, "tsh_ddp8", False))
+            and bool(getattr(opt, "abs_ckpt_full_state", False))
+            and not token_eru_full_state_due
+        ):
+            save_token_eru_model_only_checkpoint_synchronized(
+                opt, accelerator, model, epoch, completed_step
+            )
         if checkpoint_due and bool(getattr(opt, "abs_ckpt_full_state", False)) and not (
             bool(getattr(opt, "tsh_ddp8", False))
             and getattr(opt, "model_type", None) == "globalsplat_instance_v2"
@@ -3713,7 +4594,7 @@ def train_epoch(opt, accelerator, model, optimizer, scheduler, train_dataloader,
             checkpoint_due
             and bool(getattr(opt, "token_eru_enabled", False))
             and bool(getattr(opt, "tsh_ddp8", False))
-            and bool(getattr(opt, "abs_ckpt_full_state", False))
+            and token_eru_full_state_due
         ):
             save_token_eru_intra_epoch_checkpoint_synchronized(
                 opt,
@@ -4385,6 +5266,7 @@ def evaluate_epoch(
 def main():    
     start_time = time.time()
     opt = tyro.cli(AllConfigs)
+    _load_cached_gsplat_extension()
 
     if getattr(opt, "model_type", None) == "globalsplat_instance_v2":
         if getattr(opt, "gsi_v2_recon_loss_mode", "mse_smoke") == "official_vgg":
@@ -4432,6 +5314,17 @@ def main():
         dataloader_config=DataLoaderConfiguration(use_seedable_sampler=True),
         kwargs_handlers=[ddp_kwargs] if ddp_kwargs is not None else None,
     )
+    if torch.cuda.is_available():
+        local_rank = int(
+            os.environ.get(
+                "LOCAL_RANK", getattr(accelerator, "local_process_index", 0)
+            )
+        )
+        torch.cuda.set_device(local_rank)
+        accelerator.print(
+            f"[ddp-device] rank={getattr(accelerator, 'process_index', -1)} "
+            f"local_rank={local_rank} current_device={torch.cuda.current_device()}"
+        )
 
     # Setup workspace and status
     setup_workspace_and_status(opt, accelerator)
@@ -4502,6 +5395,19 @@ def main():
                 f"decoder_blocks={report['decoder_blocks']} "
                 f"unit_keys={report['unit_keys']}"
             )
+    if (
+        bool(getattr(opt, "token_eru_dino_metric_joint_formation", False))
+        or _token_eru_j2_enabled(opt)
+    ):
+        # The parent checkpoint is model-only.  Apply the JointFormation
+        # trainability boundary only after all parent weights and fresh ERU
+        # copies have been established, before constructing the new optimizer.
+        trainability = configure_joint_formation_trainability(model, opt)
+        accelerator.print(
+            "[token-eru-joint] configured after parent restore: "
+            f"trainable_tensors={sum(len(trainability[k]) for k in trainability if k not in ('frozen_backbone', 'frozen_other'))}"
+        )
+        write_token_eru_joint_parent_reference(opt, accelerator)
     
     # Data
     train_dataloader, test_dataloader, train_dataset, test_dataset = get_multi_dataloader(opt, accelerator)
@@ -4510,6 +5416,9 @@ def main():
     optimizer = setup_optimizer(opt, model, accelerator, epoch_start)
 
     # accelerate (shards dataloader across GPUs)
+    _joint_formation_prepare_audit(
+        opt, accelerator, model, optimizer, train_dataloader, test_dataloader
+    )
     model, optimizer, train_dataloader, test_dataloader = accelerator.prepare(
         model, optimizer, train_dataloader, test_dataloader
     )
@@ -4549,6 +5458,9 @@ def main():
         bool(getattr(opt, "token_eru_enabled", False))
         and bool(getattr(opt, "tsh_ddp8", False))
         and bool(getattr(opt, "abs_ckpt_full_state", False))
+        and not bool(getattr(opt, "token_eru_dino_metric_stage_m", False))
+        and not bool(getattr(opt, "token_eru_dino_metric_joint_formation", False))
+        and not _token_eru_j2_enabled(opt)
         and epoch_start == 0
         and not os.path.exists(
             os.path.join(opt.workspace, "checkpoints", "model_step_000000.safetensors")
@@ -4603,7 +5515,11 @@ def main():
             )
 
     epoch = epoch_start
-    fork_step = int(getattr(opt, "tsh_fork_continue_step", 0))
+    fork_step = (
+        0
+        if bool(getattr(opt, "token_eru_dino_metric_stage_m", False))
+        else int(getattr(opt, "tsh_fork_continue_step", 0))
+    )
     fork_pending = fork_step > 0
     fork_epoch = fork_step // max(1, iters_per_epoch)
     fork_step_in_epoch = fork_step % max(1, iters_per_epoch)
@@ -4630,17 +5546,22 @@ def main():
         
         # checkpoint
         global_step = (epoch + 1) * iters_per_epoch
-        save_checkpoint(
-            opt,
-            accelerator,
-            model,
-            optimizer,
-            scheduler,
-            epoch,
-            wandb_run_id,
-            global_step,
-        )
-        save_fork_rng_state(opt, accelerator, epoch, global_step)
+        if (
+            not bool(getattr(opt, "token_eru_dino_metric_stage_m", False))
+            and not bool(getattr(opt, "token_eru_dino_metric_joint_formation", False))
+            and not _token_eru_j2_enabled(opt)
+        ):
+            save_checkpoint(
+                opt,
+                accelerator,
+                model,
+                optimizer,
+                scheduler,
+                epoch,
+                wandb_run_id,
+                global_step,
+            )
+            save_fork_rng_state(opt, accelerator, epoch, global_step)
 
         # eval
         if (

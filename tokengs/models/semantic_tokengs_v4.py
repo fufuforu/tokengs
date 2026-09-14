@@ -2562,6 +2562,15 @@ class SemanticTokenGSv4(PromptTokenGS):
             # and appearance residuals remain RGB-trainable.
             render_gs = student_gaussians.clone()
             render_gs[..., 3:4] = student_gaussians[..., 3:4].detach()
+        elif bool(
+            getattr(self.opt, "token_eru_dino_metric_joint_formation", False)
+        ):
+            # JointFormation deliberately keeps the native instance mask
+            # renderer on the live Student-GS tensor.  The legacy ERU and
+            # Stage-M paths retain their historical detached geometry path.
+            # render_feature_channels consumes assignment channels, so SH/
+            # color do not acquire an instance-loss edge.
+            render_gs = student_gaussians
         else:
             render_gs = student_gaussians.detach()
         self._tsh_last_render_gs = render_gs
@@ -2775,6 +2784,10 @@ class SemanticTokenGSv4(PromptTokenGS):
             new_gaussians, q_abs, _unit_centers = self.absolute_gs_head(
                 gs_token_hidden
             )
+            # Runtime-only references for the JointFormation gradient audit;
+            # these are not parameters, buffers, or checkpoint state.
+            self._tsh_last_q_abs_live = q_abs
+            self._tsh_last_student_gaussians_live = new_gaussians
             self._tsh_last_q_abs = q_abs.detach().clone()
             self._tsh_last_student_gaussians = new_gaussians.detach().clone()
             if new_gaussians.shape[1] != expected_gaussians:

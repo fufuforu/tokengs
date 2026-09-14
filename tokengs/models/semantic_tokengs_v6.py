@@ -1390,6 +1390,15 @@ class SemanticTokenGSv6(SemanticTokenGSv4):
     def token_eru_gates(step: int, opt) -> tuple[float, float]:
         if int(step) < 0:
             raise ValueError("TokenGS-ERU step must be non-negative")
+        if bool(
+            getattr(opt, "token_eru_dino_metric_joint_formation", False)
+        ) or bool(
+            getattr(opt, "token_eru_dino_metric_joint_formation_j2", False)
+        ):
+            # JointFormation starts from the already-native ERU@500 state;
+            # its parent gates remain fixed rather than replaying the ERU
+            # warm-up schedule from zero.
+            return 1.0, 0.1
         r2u_steps = max(1, int(getattr(opt, "token_eru_r2u_ramp_steps", 25)))
         u2r_start = int(getattr(opt, "token_eru_u2r_start_step", 25))
         u2r_steps = max(1, int(getattr(opt, "token_eru_u2r_ramp_steps", 25)))
@@ -1425,9 +1434,20 @@ class SemanticTokenGSv6(SemanticTokenGSv4):
     @staticmethod
     def token_eru_dino_schedule(step: int, opt) -> tuple[float, float]:
         step = int(step)
-        if step < 500:
+        joint_formation = bool(
+            getattr(opt, "token_eru_dino_metric_joint_formation", False)
+        ) or bool(
+            getattr(opt, "token_eru_dino_metric_joint_formation_j2", False)
+        )
+        if not joint_formation and step < 500:
             return 0.0, 0.0
-        start = int(getattr(opt, "token_eru_dino_gate_start_step", 500))
+        start = int(
+            getattr(
+                opt,
+                "token_eru_dino_gate_start_step",
+                0 if joint_formation else 500,
+            )
+        )
         end = int(getattr(opt, "token_eru_dino_gate_end_step", 525))
         if end <= start:
             raise ValueError("DINO gate end step must be greater than start step")
