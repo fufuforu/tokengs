@@ -2564,7 +2564,7 @@ class SemanticTokenGSv4(PromptTokenGS):
             render_gs[..., 3:4] = student_gaussians[..., 3:4].detach()
         elif bool(
             getattr(self.opt, "token_eru_dino_metric_joint_formation", False)
-        ):
+        ) or getattr(self, "token_eru_3d_anchor", None) is not None:
             # JointFormation deliberately keeps the native instance mask
             # renderer on the live Student-GS tensor.  The legacy ERU and
             # Stage-M paths retain their historical detached geometry path.
@@ -2723,6 +2723,7 @@ class SemanticTokenGSv4(PromptTokenGS):
         )
         token_eru_active = getattr(self, "token_eru_decoder", None) is not None
         token_eru_dino_metric_outputs = {}
+        token_eru_3d_anchor_outputs = {}
         token_eru_dino_metric_loss = torch.zeros(
             (), device=next(self.parameters()).device
         )
@@ -2996,6 +2997,24 @@ class SemanticTokenGSv4(PromptTokenGS):
                 token_eru_dino_metric_loss = token_eru_dino_metric_outputs[
                     "loss_instance_metric_weighted"
                 ]
+            anchor = getattr(self, "token_eru_3d_anchor", None)
+            if anchor is not None:
+                anchor_output = anchor(
+                    q_abs_for_instance,
+                    new_gaussians[..., :3],
+                    new_gaussians[..., 3:4],
+                )
+                q_abs_for_instance = anchor_output.anchored_units
+                token_eru_3d_anchor_outputs = {
+                    "unit_3d_anchor_centers_world": anchor_output.unit_centers_world,
+                    "unit_3d_anchor_centers_normalized": anchor_output.unit_centers_normalized,
+                    "unit_3d_anchor_opacity_mass": anchor_output.opacity_mass,
+                    "unit_3d_anchor_fallback_mask": anchor_output.fallback_mask,
+                    "unit_3d_anchor_position_features": anchor_output.position_features,
+                    "unit_3d_anchor_delta": anchor_output.anchor_delta,
+                    "unit_3d_anchor_anchored_units": anchor_output.anchored_units,
+                }
+                self._token_eru_3d_anchor_output = anchor_output
         else:
             reconstruction, gs_token_hidden, rgb_results = (
                 self._forward_prompt_reconstruction(model_input)
@@ -3697,6 +3716,7 @@ class SemanticTokenGSv4(PromptTokenGS):
                 else {}
             ),
             **token_eru_dino_metric_outputs,
+            **token_eru_3d_anchor_outputs,
             # The eval-only GT-free cluster object is added to
             # instance_outputs after the metric branch returns.  Keep this
             # merge order so the metric branch's placeholder None cannot

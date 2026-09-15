@@ -275,6 +275,19 @@ class Options:
     token_eru_dino_metric_joint_formation_j2_warmup_steps: int = 50
     token_eru_dino_metric_joint_formation_j2_total_steps: int = 710
     token_eru_dino_metric_joint_formation_j2_min_ratio: float = 0.1
+    # TokenGS-ERU-3DAnchor-v1.  The anchor is an opt-in query-side
+    # conditioning path and is disabled for every existing configuration.
+    token_eru_3d_anchor_enabled: bool = False
+    token_eru_3d_anchor_unit_dim: int = 256
+    token_eru_3d_anchor_hidden_dim: int = 256
+    token_eru_3d_anchor_num_frequencies: int = 6
+    token_eru_3d_anchor_eps: float = 1e-6
+    token_eru_3d_anchor_min_scale: float = 1e-3
+    token_eru_3d_anchor_clamp_value: float = 10.0
+    token_eru_3d_anchor_injection_scale: float = 1.0
+    token_eru_3d_anchor_detach_statistics: bool = True
+    token_eru_3d_anchor_lr: float = 1e-4
+    token_eru_3d_anchor_weight_decay: float = 1e-6
     # Optional per-rank manifest written immediately before Accelerator
     # prepare() for diagnosing distributed model/optimizer mismatches.
     joint_formation_ddp_manifest_audit: bool = False
@@ -9996,6 +10009,71 @@ config_defaults[
     experiment_name=(
         "semantic_v6_absolute_units_true_shared_token_eru1_"
         "dino_metric_joint_formation_j2_ddp8"
+    ),
+)
+
+_TOKEN_ERU_3D_ANCHOR_PARENT = (
+    "/space/mawb/tokengs/workspace/"
+    "semantic_v6_absolute_units_true_shared_token_eru1_dino_metric_"
+    "joint_formation_j2_ddp8/checkpoints/model_step_000250.safetensors"
+)
+_TOKEN_ERU_3D_ANCHOR_BASE = config_defaults[
+    "semantic_v6_absolute_units_true_shared_token_eru1_dino_metric_joint_formation_j2_ddp8"
+].evolve(
+    resume=_TOKEN_ERU_3D_ANCHOR_PARENT,
+    tsh_fork_continue_step=0,
+    seed=42,
+    token_eru_dino_metric_joint_formation_j2=True,
+    token_eru_dino_metric_joint_formation_j2_parent_step=960,
+    token_eru_dino_metric_joint_formation_j2_name=(
+        "token_eru_3d_anchor_v1_stage"
+    ),
+    token_eru_dino_metric_joint_formation_j2_warmup_steps=50,
+    token_eru_dino_metric_joint_formation_j2_total_steps=200,
+    token_eru_dino_metric_joint_formation_j2_min_ratio=0.1,
+    token_eru_dino_gate_start_step=0,
+    token_eru_dino_gate_end_step=50,
+    token_eru_dino_metric_loss_weight=1.0,
+    num_epochs=1,
+    max_iters_per_epoch=200,
+    num_workers=2,
+    tsh_ddp8=True,
+    abs_ckpt_every=200,
+    abs_ckpt_steps_extra=(50, 100, 150, 200),
+    abs_ckpt_full_state=True,
+    abs_ckpt_full_state_steps=(200,),
+    eval_before_training=False,
+)
+config_doc[
+    "semantic_v6_absolute_units_true_shared_token_eru1_dino_metric_joint_formation_j2_local250_control_short200_ddp8"
+] = "TokenGS-ERU-3DAnchor-v1 A0 control from J2 local250."
+config_defaults[
+    "semantic_v6_absolute_units_true_shared_token_eru1_dino_metric_joint_formation_j2_local250_control_short200_ddp8"
+] = _TOKEN_ERU_3D_ANCHOR_BASE.evolve(
+    token_eru_3d_anchor_enabled=False,
+    workspace=(
+        "workspace/semantic_v6_absolute_units_true_shared_token_eru1_"
+        "dino_metric_joint_formation_j2_local250_control_short200_ddp8"
+    ),
+    experiment_name=(
+        "semantic_v6_absolute_units_true_shared_token_eru1_dino_metric_"
+        "joint_formation_j2_local250_control_short200_ddp8"
+    ),
+)
+config_doc[
+    "semantic_v6_absolute_units_true_shared_token_eru1_dino_metric_joint_formation_j2_local250_3d_anchor_v1_short200_ddp8"
+] = "TokenGS-ERU-3DAnchor-v1 A1 treatment from J2 local250."
+config_defaults[
+    "semantic_v6_absolute_units_true_shared_token_eru1_dino_metric_joint_formation_j2_local250_3d_anchor_v1_short200_ddp8"
+] = _TOKEN_ERU_3D_ANCHOR_BASE.evolve(
+    token_eru_3d_anchor_enabled=True,
+    workspace=(
+        "workspace/semantic_v6_absolute_units_true_shared_token_eru1_"
+        "dino_metric_joint_formation_j2_local250_3d_anchor_v1_short200_ddp8"
+    ),
+    experiment_name=(
+        "semantic_v6_absolute_units_true_shared_token_eru1_dino_metric_"
+        "joint_formation_j2_local250_3d_anchor_v1_short200_ddp8"
     ),
 )
 

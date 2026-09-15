@@ -16,6 +16,14 @@ from .metric_clustering import (
     historical_metric_cluster,
     historical_metric_cluster_oracle_audit,
 )
+from .unit_3d_anchor import (
+    FixedFourierPositionEncoding,
+    Unit3DAnchor,
+    Unit3DAnchorOutput,
+    compute_opacity_weighted_unit_centers,
+    normalize_unit_centers,
+    reshape_child_gaussian_attributes,
+)
 
 __all__ = [
     "TokenERUOutput",
@@ -31,4 +39,10 @@ __all__ = [
     "MetricClusterOutput",
     "historical_metric_cluster",
     "historical_metric_cluster_oracle_audit",
+    "FixedFourierPositionEncoding",
+    "Unit3DAnchor",
+    "Unit3DAnchorOutput",
+    "compute_opacity_weighted_unit_centers",
+    "normalize_unit_centers",
+    "reshape_child_gaussian_attributes",
 ]

@@ -214,6 +214,7 @@ def load_model_checkpoint(opt, model, accelerator, epoch_start):
             "token_eru_dino_encoder.unit_projector.",
             "token_eru_dino_fusion.",
             "token_eru_metric_head.",
+            "token_eru_3d_anchor.",
         )
         active_expected = {
             key for key in expected
@@ -227,7 +228,13 @@ def load_model_checkpoint(opt, model, accelerator, epoch_start):
             or key == "gs_tokens_dynamic"
             or key.startswith(active_prefixes[2:])
         }
-        missing = sorted(active_expected - active_checkpoint)
+        anchor_prefix = "token_eru_3d_anchor."
+        allowed_missing = {
+            key for key in active_expected - active_checkpoint
+            if key.startswith(anchor_prefix)
+            and getattr(model, "token_eru_3d_anchor", None) is not None
+        }
+        missing = sorted((active_expected - active_checkpoint) - allowed_missing)
         unexpected = sorted(active_checkpoint - active_expected)
         mismatched = sorted(
             (key, tuple(checkpoint[key].shape), tuple(expected[key].shape))
@@ -240,7 +247,7 @@ def load_model_checkpoint(opt, model, accelerator, epoch_start):
                 f"missing={missing[:5]} unexpected={unexpected[:5]} "
                 f"shape_mismatch={mismatched[:5]}"
             )
-        loadable = {key: checkpoint[key] for key in active_expected}
+        loadable = {key: checkpoint[key] for key in active_expected if key in checkpoint}
         nn.Module.load_state_dict(model, loadable, strict=False)
         model._token_eru_loaded_from_checkpoint = True
         accelerator.print(
@@ -1309,6 +1316,7 @@ def configure_joint_formation_trainability(model: torch.nn.Module, opt) -> dict[
         "pair_adapters": [],
         "instance_head": [],
         "metric_head": [],
+        "3d_anchor": [],
         "frozen_other": [],
     }
     named = list(model.named_parameters())
@@ -1350,6 +1358,8 @@ def configure_joint_formation_trainability(model: torch.nn.Module, opt) -> dict[
     assign_module(model.token_eru_dino_encoder.unit_projector, "metric_head")
     assign_module(model.token_eru_dino_fusion, "metric_head")
     assign_module(model.token_eru_metric_head, "metric_head")
+    if getattr(model, "token_eru_3d_anchor", None) is not None:
+        assign_module(model.token_eru_3d_anchor, "3d_anchor")
 
     # AbsoluteUnitDecoder is one actual module, but its two public operations
     # have disjoint parameter submodules.  Keep the requested LR distinction
@@ -1423,6 +1433,7 @@ def _setup_token_eru_joint_formation_optimizer(opt, model, accelerator, epoch_st
             "pair_adapters": 3.0e-5,
             "instance_head": 1.0e-5,
             "metric_head": 3.0e-5,
+            "3d_anchor": float(getattr(opt, "token_eru_3d_anchor_lr", 1.0e-4)),
         }
     else:
         lr_by_category = {
@@ -1435,6 +1446,7 @@ def _setup_token_eru_joint_formation_optimizer(opt, model, accelerator, epoch_st
             "pair_adapters": float(opt.token_eru_adapter_lr),
             "instance_head": float(opt.token_eru_tsh_lr),
             "metric_head": 1.0e-4,
+            "3d_anchor": float(getattr(opt, "token_eru_3d_anchor_lr", 1.0e-4)),
         }
     name_to_parameter = dict(model.named_parameters())
     groups = []
@@ -1449,16 +1461,24 @@ def _setup_token_eru_joint_formation_optimizer(opt, model, accelerator, epoch_st
         "pair_adapters",
         "instance_head",
         "metric_head",
+        "3d_anchor",
     ):
         entries = [name_to_parameter[name] for name in categories[category]]
         if not entries:
+            if category == "3d_anchor":
+                continue
             raise RuntimeError(f"JointFormation optimizer group is empty: {category}")
         if any(id(parameter) in seen for parameter in entries):
             raise RuntimeError(f"JointFormation optimizer group overlap: {category}")
         seen.update(id(parameter) for parameter in entries)
         decay = [parameter for parameter in entries if parameter.ndim != 1 and not getattr(parameter, "_no_weight_decay", False)]
         nodecay = [parameter for parameter in entries if parameter.ndim == 1 or getattr(parameter, "_no_weight_decay", False)]
-        for parameters, weight_decay in ((decay, float(opt.weight_decay)), (nodecay, 0.0)):
+        category_weight_decay = (
+            float(getattr(opt, "token_eru_3d_anchor_weight_decay", 1e-6))
+            if category == "3d_anchor"
+            else float(opt.weight_decay)
+        )
+        for parameters, weight_decay in ((decay, category_weight_decay), (nodecay, 0.0)):
             if parameters:
                 groups.append({
                     "params": parameters,
@@ -1475,11 +1495,13 @@ def _setup_token_eru_joint_formation_optimizer(opt, model, accelerator, epoch_st
     if _token_eru_j2_enabled(opt):
         trainable_count = sum(1 for _, parameter in model.named_parameters() if parameter.requires_grad)
         trainable_numel = sum(parameter.numel() for _, parameter in model.named_parameters() if parameter.requires_grad)
-        if trainable_count != 903 or trainable_numel != 364_349_232:
+        expected_count = 907 if getattr(model, "token_eru_3d_anchor", None) is not None else 903
+        expected_numel = 364_425_264 if getattr(model, "token_eru_3d_anchor", None) is not None else 364_349_232
+        if trainable_count != expected_count or trainable_numel != expected_numel:
             raise RuntimeError(
-                "Stage-J2 trainable parameter audit mismatch: "
-                f"count={trainable_count} expected=903 "
-                f"numel={trainable_numel} expected=364349232"
+                "Stage-J2/3DAnchor trainable parameter audit mismatch: "
+                f"count={trainable_count} expected={expected_count} "
+                f"numel={trainable_numel} expected={expected_numel}"
             )
     try:
         optimizer = torch.optim.AdamW(groups, lr=float(opt.lr), betas=(0.9, 0.95), fused=True)
@@ -2405,6 +2427,15 @@ def _token_eru_dino_metadata(opt, step: int) -> dict:
         "token_eru_dino_cluster_position_weight": 1.0,
         "token_eru_dino_source": "local",
         "token_eru_dino_cluster_eps": float(getattr(opt, "token_eru_dino_cluster_eps", 0.5)),
+        "token_eru_3d_anchor_enabled": bool(getattr(opt, "token_eru_3d_anchor_enabled", False)),
+        "token_eru_3d_anchor_unit_dim": int(getattr(opt, "token_eru_3d_anchor_unit_dim", 256)),
+        "token_eru_3d_anchor_hidden_dim": int(getattr(opt, "token_eru_3d_anchor_hidden_dim", 256)),
+        "token_eru_3d_anchor_num_frequencies": int(getattr(opt, "token_eru_3d_anchor_num_frequencies", 6)),
+        "token_eru_3d_anchor_eps": float(getattr(opt, "token_eru_3d_anchor_eps", 1e-6)),
+        "token_eru_3d_anchor_min_scale": float(getattr(opt, "token_eru_3d_anchor_min_scale", 1e-3)),
+        "token_eru_3d_anchor_clamp_value": float(getattr(opt, "token_eru_3d_anchor_clamp_value", 10.0)),
+        "token_eru_3d_anchor_injection_scale": float(getattr(opt, "token_eru_3d_anchor_injection_scale", 1.0)),
+        "token_eru_3d_anchor_detach_statistics": bool(getattr(opt, "token_eru_3d_anchor_detach_statistics", True)),
     }
 
 

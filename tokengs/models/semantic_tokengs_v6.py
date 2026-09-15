@@ -47,6 +47,7 @@ from tokengs.models.token_eru.historical_unit_infonce import (
     historical_soft_unit_infonce,
 )
 from tokengs.models.token_eru.metric_clustering import historical_metric_cluster
+from tokengs.models.token_eru.unit_3d_anchor import Unit3DAnchor
 
 
 class SemanticTokenGSv6(SemanticTokenGSv4):
@@ -79,6 +80,7 @@ class SemanticTokenGSv6(SemanticTokenGSv4):
         self.token_eru_dino_encoder = None
         self.token_eru_dino_fusion = None
         self.token_eru_metric_head = None
+        self.token_eru_3d_anchor = None
         self._token_eru_dino_metric_step = 500
         super().__init__(opt)
         num_groups = int(getattr(self.opt, "instance_group_num_groups", 64))
@@ -1314,6 +1316,26 @@ class SemanticTokenGSv6(SemanticTokenGSv4):
             f"decoder_dim={self.opt.enc_embed_dim}"
         )
         self._configure_token_eru_dino_metric()
+        self._configure_token_eru_3d_anchor()
+
+    def _configure_token_eru_3d_anchor(self) -> None:
+        enabled = bool(getattr(self.opt, "token_eru_3d_anchor_enabled", False))
+        if not enabled:
+            return
+        if self.token_eru_decoder is None or self.token_eru_unit_formation is None:
+            raise RuntimeError("3D anchor requires the TokenGS-ERU dual stream")
+        self.token_eru_3d_anchor = Unit3DAnchor(
+            unit_dim=int(getattr(self.opt, "token_eru_3d_anchor_unit_dim", 256)),
+            hidden_dim=int(getattr(self.opt, "token_eru_3d_anchor_hidden_dim", 256)),
+            num_frequencies=int(getattr(self.opt, "token_eru_3d_anchor_num_frequencies", 6)),
+            eps=float(getattr(self.opt, "token_eru_3d_anchor_eps", 1e-6)),
+            min_scale=float(getattr(self.opt, "token_eru_3d_anchor_min_scale", 1e-3)),
+            clamp_value=float(getattr(self.opt, "token_eru_3d_anchor_clamp_value", 10.0)),
+            injection_scale=float(getattr(self.opt, "token_eru_3d_anchor_injection_scale", 1.0)),
+            detach_statistics=bool(getattr(self.opt, "token_eru_3d_anchor_detach_statistics", True)),
+        )
+        self.token_eru_3d_anchor.requires_grad_(True)
+        print("[token-eru-3d-anchor] reconstruction-derived unit anchor constructed")
 
     def _configure_token_eru_dino_metric(self) -> None:
         enabled = bool(getattr(self.opt, "token_eru_dino_metric_enabled", False))
