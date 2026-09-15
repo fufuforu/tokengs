@@ -288,6 +288,18 @@ class Options:
     token_eru_3d_anchor_detach_statistics: bool = True
     token_eru_3d_anchor_lr: float = 1e-4
     token_eru_3d_anchor_weight_decay: float = 1e-6
+    # TokenGS-ERU-DINO QueryMetric-Coupling-v1.  The metric embedding is
+    # coupled to the existing native query logits only when explicitly
+    # enabled by the isolated treatment preset.
+    token_eru_query_metric_enabled: bool = False
+    token_eru_query_metric_embedding_dim: int = 128
+    token_eru_query_metric_query_dim: int = 256
+    token_eru_query_metric_num_groups: int = 100
+    token_eru_query_metric_initial_temperature: float = 10.0
+    token_eru_query_metric_max_gate: float = 0.25
+    token_eru_query_metric_gate_ramp_steps: int = 25
+    token_eru_query_metric_lr: float = 1e-4
+    token_eru_query_metric_weight_decay: float = 1e-6
     # Optional per-rank manifest written immediately before Accelerator
     # prepare() for diagnosing distributed model/optimizer mismatches.
     joint_formation_ddp_manifest_audit: bool = False
@@ -10074,6 +10086,41 @@ config_defaults[
     experiment_name=(
         "semantic_v6_absolute_units_true_shared_token_eru1_dino_metric_"
         "joint_formation_j2_local250_3d_anchor_v1_short200_ddp8"
+    ),
+)
+
+config_doc[
+    "semantic_v6_absolute_units_true_shared_token_eru1_dino_metric_joint_formation_j2_local250_query_metric_v1_short200_ddp8"
+] = "TokenGS-ERU-DINO-QueryMetric-Coupling-v1 treatment from J2 local250."
+config_defaults[
+    "semantic_v6_absolute_units_true_shared_token_eru1_dino_metric_joint_formation_j2_local250_query_metric_v1_short200_ddp8"
+] = _TOKEN_ERU_3D_ANCHOR_BASE.evolve(
+    token_eru_3d_anchor_enabled=False,
+    token_eru_query_metric_enabled=True,
+    token_eru_query_metric_embedding_dim=128,
+    token_eru_query_metric_query_dim=256,
+    token_eru_query_metric_num_groups=100,
+    token_eru_query_metric_initial_temperature=10.0,
+    token_eru_query_metric_max_gate=0.25,
+    token_eru_query_metric_gate_ramp_steps=25,
+    token_eru_query_metric_lr=1.0e-4,
+    token_eru_query_metric_weight_decay=1.0e-6,
+    token_eru_dino_metric_joint_formation_j2_parent_step=960,
+    token_eru_dino_metric_joint_formation_j2_name=(
+        "token_eru_query_metric_coupling_stage"
+    ),
+    abs_ckpt_every=200,
+    abs_ckpt_steps_extra=(25, 50, 100, 150, 200),
+    abs_ckpt_full_state=True,
+    abs_ckpt_full_state_steps=(100, 200),
+    eval_before_training=False,
+    workspace=(
+        "workspace/semantic_v6_absolute_units_true_shared_token_eru1_"
+        "dino_metric_joint_formation_j2_local250_query_metric_v1_short200_ddp8"
+    ),
+    experiment_name=(
+        "semantic_v6_absolute_units_true_shared_token_eru1_dino_metric_"
+        "joint_formation_j2_local250_query_metric_v1_short200_ddp8"
     ),
 )
 

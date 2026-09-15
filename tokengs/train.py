@@ -49,6 +49,14 @@ from tokengs.utils.gaussians import Gaussians
 warnings.filterwarnings("ignore")
 
 
+def _sha256_file(path: str) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(8 * 1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 def _load_cached_gsplat_extension() -> None:
     """Load the validated local gsplat extension before the first render."""
     so_path = os.environ.get("GSPLAT_PRECOMPILED_SO")
@@ -215,6 +223,7 @@ def load_model_checkpoint(opt, model, accelerator, epoch_start):
             "token_eru_dino_fusion.",
             "token_eru_metric_head.",
             "token_eru_3d_anchor.",
+            "token_eru_query_metric_coupling.",
         )
         active_expected = {
             key for key in expected
@@ -229,10 +238,18 @@ def load_model_checkpoint(opt, model, accelerator, epoch_start):
             or key.startswith(active_prefixes[2:])
         }
         anchor_prefix = "token_eru_3d_anchor."
+        qmc_prefix = "token_eru_query_metric_coupling."
         allowed_missing = {
             key for key in active_expected - active_checkpoint
-            if key.startswith(anchor_prefix)
-            and getattr(model, "token_eru_3d_anchor", None) is not None
+            if (
+                key.startswith(anchor_prefix)
+                and getattr(model, "token_eru_3d_anchor", None) is not None
+            )
+            or (
+                key.startswith(qmc_prefix)
+                and getattr(model, "token_eru_query_metric_coupling", None)
+                is not None
+            )
         }
         missing = sorted((active_expected - active_checkpoint) - allowed_missing)
         unexpected = sorted(active_checkpoint - active_expected)
@@ -1301,6 +1318,10 @@ def configure_joint_formation_trainability(model: torch.nn.Module, opt) -> dict[
         "token_eru_metric_head",
     )
     missing_modules = [name for name in required if getattr(model, name, None) is None]
+    if bool(getattr(opt, "token_eru_query_metric_enabled", False)) and getattr(
+        model, "token_eru_query_metric_coupling", None
+    ) is None:
+        missing_modules.append("token_eru_query_metric_coupling")
     if missing_modules:
         raise RuntimeError(f"JointFormation modules are missing: {missing_modules}")
 
@@ -1317,6 +1338,7 @@ def configure_joint_formation_trainability(model: torch.nn.Module, opt) -> dict[
         "instance_head": [],
         "metric_head": [],
         "3d_anchor": [],
+        "query_metric_coupling": [],
         "frozen_other": [],
     }
     named = list(model.named_parameters())
@@ -1360,6 +1382,8 @@ def configure_joint_formation_trainability(model: torch.nn.Module, opt) -> dict[
     assign_module(model.token_eru_metric_head, "metric_head")
     if getattr(model, "token_eru_3d_anchor", None) is not None:
         assign_module(model.token_eru_3d_anchor, "3d_anchor")
+    if getattr(model, "token_eru_query_metric_coupling", None) is not None:
+        assign_module(model.token_eru_query_metric_coupling, "query_metric_coupling")
 
     # AbsoluteUnitDecoder is one actual module, but its two public operations
     # have disjoint parameter submodules.  Keep the requested LR distinction
@@ -1434,6 +1458,9 @@ def _setup_token_eru_joint_formation_optimizer(opt, model, accelerator, epoch_st
             "instance_head": 1.0e-5,
             "metric_head": 3.0e-5,
             "3d_anchor": float(getattr(opt, "token_eru_3d_anchor_lr", 1.0e-4)),
+            "query_metric_coupling": float(
+                getattr(opt, "token_eru_query_metric_lr", 1.0e-4)
+            ),
         }
     else:
         lr_by_category = {
@@ -1447,6 +1474,9 @@ def _setup_token_eru_joint_formation_optimizer(opt, model, accelerator, epoch_st
             "instance_head": float(opt.token_eru_tsh_lr),
             "metric_head": 1.0e-4,
             "3d_anchor": float(getattr(opt, "token_eru_3d_anchor_lr", 1.0e-4)),
+            "query_metric_coupling": float(
+                getattr(opt, "token_eru_query_metric_lr", 1.0e-4)
+            ),
         }
     name_to_parameter = dict(model.named_parameters())
     groups = []
@@ -1462,10 +1492,11 @@ def _setup_token_eru_joint_formation_optimizer(opt, model, accelerator, epoch_st
         "instance_head",
         "metric_head",
         "3d_anchor",
+        "query_metric_coupling",
     ):
         entries = [name_to_parameter[name] for name in categories[category]]
         if not entries:
-            if category == "3d_anchor":
+            if category in ("3d_anchor", "query_metric_coupling"):
                 continue
             raise RuntimeError(f"JointFormation optimizer group is empty: {category}")
         if any(id(parameter) in seen for parameter in entries):
@@ -1476,6 +1507,8 @@ def _setup_token_eru_joint_formation_optimizer(opt, model, accelerator, epoch_st
         category_weight_decay = (
             float(getattr(opt, "token_eru_3d_anchor_weight_decay", 1e-6))
             if category == "3d_anchor"
+            else float(getattr(opt, "token_eru_query_metric_weight_decay", 1e-6))
+            if category == "query_metric_coupling"
             else float(opt.weight_decay)
         )
         for parameters, weight_decay in ((decay, category_weight_decay), (nodecay, 0.0)):
@@ -1495,8 +1528,15 @@ def _setup_token_eru_joint_formation_optimizer(opt, model, accelerator, epoch_st
     if _token_eru_j2_enabled(opt):
         trainable_count = sum(1 for _, parameter in model.named_parameters() if parameter.requires_grad)
         trainable_numel = sum(parameter.numel() for _, parameter in model.named_parameters() if parameter.requires_grad)
-        expected_count = 907 if getattr(model, "token_eru_3d_anchor", None) is not None else 903
-        expected_numel = 364_425_264 if getattr(model, "token_eru_3d_anchor", None) is not None else 364_349_232
+        if getattr(model, "token_eru_query_metric_coupling", None) is not None:
+            expected_count = 907
+            expected_numel = 364_382_513
+        elif getattr(model, "token_eru_3d_anchor", None) is not None:
+            expected_count = 907
+            expected_numel = 364_425_264
+        else:
+            expected_count = 903
+            expected_numel = 364_349_232
         if trainable_count != expected_count or trainable_numel != expected_numel:
             raise RuntimeError(
                 "Stage-J2/3DAnchor trainable parameter audit mismatch: "
@@ -2475,7 +2515,7 @@ def _token_eru_j2_metadata(opt, stage_step: int) -> dict:
     if not _token_eru_j2_enabled(opt):
         return {}
     parent_step = int(getattr(opt, "token_eru_dino_metric_joint_formation_j2_parent_step", 710))
-    return {
+    metadata = {
         "stage_name": str(getattr(
             opt, "token_eru_dino_metric_joint_formation_j2_name",
             "token_eru_dino_joint_formation_stage_j2",
@@ -2494,6 +2534,57 @@ def _token_eru_j2_metadata(opt, stage_step: int) -> dict:
         "metric_loss_weight": 1.0,
         "training_mode": "new_stage_j2_from_joint_formation_710",
     }
+    if bool(getattr(opt, "token_eru_query_metric_enabled", False)):
+        metadata.update(
+            {
+                "token_eru_query_metric_enabled": True,
+                "token_eru_query_metric_embedding_dim": int(
+                    getattr(opt, "token_eru_query_metric_embedding_dim", 128)
+                ),
+                "token_eru_query_metric_query_dim": int(
+                    getattr(opt, "token_eru_query_metric_query_dim", 256)
+                ),
+                "token_eru_query_metric_num_groups": int(
+                    getattr(opt, "token_eru_query_metric_num_groups", 100)
+                ),
+                "token_eru_query_metric_initial_temperature": float(
+                    getattr(opt, "token_eru_query_metric_initial_temperature", 10.0)
+                ),
+                "token_eru_query_metric_max_gate": float(
+                    getattr(opt, "token_eru_query_metric_max_gate", 0.25)
+                ),
+                "token_eru_query_metric_gate_ramp_steps": int(
+                    getattr(opt, "token_eru_query_metric_gate_ramp_steps", 25)
+                ),
+                "token_eru_query_metric_local_step": int(stage_step),
+                "token_eru_query_metric_gate": float(
+                    getattr(opt, "token_eru_query_metric_max_gate", 0.25)
+                )
+                * min(
+                    1.0,
+                    int(stage_step)
+                    / float(
+                        max(
+                            1,
+                            int(
+                                getattr(
+                                    opt,
+                                    "token_eru_query_metric_gate_ramp_steps",
+                                    25,
+                                )
+                            ),
+                        )
+                    ),
+                ),
+                "parent_checkpoint": os.path.abspath(str(getattr(opt, "resume", ""))),
+                "parent_checkpoint_sha256": _sha256_file(opt.resume),
+                "parent_effective_step": parent_step,
+                "stage_local_step": int(stage_step),
+                "effective_optimizer_step": parent_step + int(stage_step),
+                "training_mode": "QUERY_METRIC_COUPLING_FROM_J2_LOCAL250",
+            }
+        )
+    return metadata
 
 
 def write_token_eru_joint_parent_reference(opt, accelerator) -> None:
@@ -3785,6 +3876,8 @@ def train_epoch(opt, accelerator, model, optimizer, scheduler, train_dataloader,
             unwrapped_model.set_token_eru_step(effective_completed_step)
         if hasattr(unwrapped_model, "set_token_eru_dino_metric_step"):
             unwrapped_model.set_token_eru_dino_metric_step(effective_completed_step)
+        if hasattr(unwrapped_model, "set_token_eru_query_metric_step"):
+            unwrapped_model.set_token_eru_query_metric_step(completed_step)
         if getattr(opt, "model_type", None) == "globalsplat_instance_v2":
             schedule_step = (
                 completed_step
@@ -5484,6 +5577,19 @@ def main():
     # computed from the per-GPU iters_per_epoch, and prepare() would divide it again
     # by num_processes, causing the LR to decay to zero far too early.
     scheduler = setup_scheduler(opt, optimizer, iters_per_epoch, accelerator, epoch_start)
+
+    if (
+        bool(getattr(opt, "token_eru_query_metric_enabled", False))
+        and bool(getattr(opt, "tsh_ddp8", False))
+        and bool(getattr(opt, "abs_ckpt_full_state", False))
+        and epoch_start == 0
+        and not os.path.exists(
+            os.path.join(opt.workspace, "checkpoints", "model_step_000000.safetensors")
+        )
+    ):
+        save_token_eru_model_only_checkpoint_synchronized(
+            opt, accelerator, model, epoch=0, completed_step=0
+        )
 
     if (
         bool(getattr(opt, "token_eru_enabled", False))

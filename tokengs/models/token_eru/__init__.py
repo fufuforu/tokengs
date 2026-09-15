@@ -24,6 +24,7 @@ from .unit_3d_anchor import (
     normalize_unit_centers,
     reshape_child_gaussian_attributes,
 )
+from .query_metric_coupling import QueryMetricCoupling, QueryMetricCouplingOutput
 
 __all__ = [
     "TokenERUOutput",
@@ -45,4 +46,6 @@ __all__ = [
     "compute_opacity_weighted_unit_centers",
     "normalize_unit_centers",
     "reshape_child_gaussian_attributes",
+    "QueryMetricCoupling",
+    "QueryMetricCouplingOutput",
 ]

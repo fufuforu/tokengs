@@ -2371,6 +2371,7 @@ class SemanticTokenGSv4(PromptTokenGS):
         student_gaussians: torch.Tensor,
         model_input,
         training: bool,
+        unit_metric_embeddings: torch.Tensor | None = None,
     ) -> dict:
         """True-Shared instance head: consume q_abs directly, no dual units.
 
@@ -2467,6 +2468,41 @@ class SemanticTokenGSv4(PromptTokenGS):
             head_out = head(q_in, refine_gate=query_memory_gate)
         pi_unit = head_out["pi_unit"]  # [B,T,K,G+1]
         unit_logits = head_out["unit_logits"]  # [B,T,K,G+1]
+        qmc_output = None
+        if bool(getattr(self.opt, "token_eru_query_metric_enabled", False)):
+            if unit_metric_embeddings is None:
+                raise RuntimeError(
+                    "QMC is enabled but unit_metric_embeddings are missing"
+                )
+            coupling = getattr(self, "token_eru_query_metric_coupling", None)
+            if coupling is None:
+                raise RuntimeError("QMC is enabled but its coupling module is missing")
+            qmc_gate = float(
+                getattr(
+                    self,
+                    "_token_eru_query_metric_eval_gate_override",
+                    self.token_eru_query_metric_gate(
+                        int(getattr(self, "_token_eru_query_metric_local_step", 0)),
+                        self.opt,
+                    ),
+                )
+            )
+            base_unit_logits_4d = unit_logits.view(
+                unit_logits.shape[0],
+                int(q_abs.shape[1]),
+                int(q_abs.shape[2]),
+                unit_logits.shape[-1],
+            )
+            qmc_output = coupling(
+                unit_metric_embeddings,
+                head_out["refined_groups"],
+                base_unit_logits_4d,
+                gate=qmc_gate,
+            )
+            unit_logits = qmc_output.final_unit_logits.reshape_as(unit_logits)
+            pi_unit = F.softmax(
+                qmc_output.final_unit_logits.float(), dim=-1
+            ).view_as(pi_unit)
         refine_head = getattr(self, "tsh_slot_refine_head", None)
         if self.training:
             per_gs_gate_eff = float(
@@ -2608,10 +2644,36 @@ class SemanticTokenGSv4(PromptTokenGS):
                 (), device=rendered_probability.device
             ),
         }
+        if qmc_output is not None:
+            outputs.update(
+                {
+                    "query_metric_enabled": True,
+                    "query_metric_gate": qmc_output.gate.detach(),
+                    "query_metric_temperature": qmc_output.temperature.detach(),
+                    "query_metric_group_logits": qmc_output.metric_group_logits.detach(),
+                    "query_metric_centered_logits": qmc_output.centered_metric_group_logits.detach(),
+                    "query_metric_residual_logits": qmc_output.residual_logits.detach(),
+                    "query_metric_query_embeddings": qmc_output.query_metric_embeddings.detach(),
+                    "query_metric_residual_abs_mean": qmc_output.residual_logits.abs().mean().detach(),
+                    "query_metric_residual_abs_max": qmc_output.residual_logits.abs().max().detach(),
+                    "query_metric_final_vs_base_max_diff": (
+                        qmc_output.final_unit_logits
+                        - head_out["unit_logits"].view_as(qmc_output.final_unit_logits)
+                    ).abs().max().detach(),
+                }
+            )
+        else:
+            outputs["query_metric_enabled"] = False
         for key, value in head_out.items():
             if key.startswith(("unit_logits", "base_unit_logits", "residual_logits",
                                "assignment_temperature", "query_memory_refine_gate",
                                "void_share", "max_group_prob_share")):
+                # When QMC is enabled, ``unit_logits`` above is the final
+                # logits tensor used for pi_unit, child-Gaussian inheritance,
+                # and rendering.  Do not overwrite that diagnostic with the
+                # SharedUnitInstanceHead base logits here.
+                if qmc_output is not None and key == "unit_logits":
+                    continue
                 outputs[key] = value.detach()
         if training and "instance_label_output" in data:
             matching_mode = str(
@@ -3388,6 +3450,11 @@ class SemanticTokenGSv4(PromptTokenGS):
                 new_gaussians,
                 model_input,
                 training=self.training,
+                unit_metric_embeddings=(
+                    token_eru_dino_metric_outputs.get("unit_metric_embeddings")
+                    if token_eru_dino_metric_outputs
+                    else None
+                ),
             )
             if (
                 not self.training

@@ -48,6 +48,7 @@ from tokengs.models.token_eru.historical_unit_infonce import (
 )
 from tokengs.models.token_eru.metric_clustering import historical_metric_cluster
 from tokengs.models.token_eru.unit_3d_anchor import Unit3DAnchor
+from tokengs.models.token_eru.query_metric_coupling import QueryMetricCoupling
 
 
 class SemanticTokenGSv6(SemanticTokenGSv4):
@@ -81,7 +82,9 @@ class SemanticTokenGSv6(SemanticTokenGSv4):
         self.token_eru_dino_fusion = None
         self.token_eru_metric_head = None
         self.token_eru_3d_anchor = None
+        self.token_eru_query_metric_coupling = None
         self._token_eru_dino_metric_step = 500
+        self._token_eru_query_metric_local_step = 0
         super().__init__(opt)
         num_groups = int(getattr(self.opt, "instance_group_num_groups", 64))
         head_input_dim = int(self.opt.token_dim)
@@ -1317,6 +1320,7 @@ class SemanticTokenGSv6(SemanticTokenGSv4):
         )
         self._configure_token_eru_dino_metric()
         self._configure_token_eru_3d_anchor()
+        self._configure_token_eru_query_metric()
 
     def _configure_token_eru_3d_anchor(self) -> None:
         enabled = bool(getattr(self.opt, "token_eru_3d_anchor_enabled", False))
@@ -1336,6 +1340,60 @@ class SemanticTokenGSv6(SemanticTokenGSv4):
         )
         self.token_eru_3d_anchor.requires_grad_(True)
         print("[token-eru-3d-anchor] reconstruction-derived unit anchor constructed")
+
+    def _configure_token_eru_query_metric(self) -> None:
+        enabled = bool(getattr(self.opt, "token_eru_query_metric_enabled", False))
+        if not enabled:
+            return
+        required = {
+            "token_eru_enabled": bool(getattr(self.opt, "token_eru_enabled", False)),
+            "token_eru_dino_metric_enabled": bool(
+                getattr(self.opt, "token_eru_dino_metric_enabled", False)
+            ),
+            "tsh_instance_head": self.tsh_instance_head is not None,
+            "token_eru_metric_head": self.token_eru_metric_head is not None,
+            "token_eru_3d_anchor_enabled": not bool(
+                getattr(self.opt, "token_eru_3d_anchor_enabled", False)
+            ),
+            "token_eru_dino_eval_mode": str(
+                getattr(self.opt, "token_eru_dino_eval_mode", "query")
+            ) == "query",
+            "tsh_num_groups": int(getattr(self.opt, "tsh_num_groups", 100)) == 100,
+        }
+        failed = [name for name, ok in required.items() if not ok]
+        if failed:
+            raise RuntimeError(
+                "QMC requires the native ERU-DINO query path; failed="
+                + ",".join(failed)
+            )
+        cpu_rng = torch.get_rng_state()
+        cuda_rng = None
+        if torch.cuda.is_available() and torch.cuda.is_initialized():
+            cuda_rng = torch.cuda.get_rng_state_all()
+        python_rng = random.getstate()
+        try:
+            self.token_eru_query_metric_coupling = QueryMetricCoupling(
+                unit_embedding_dim=int(
+                    getattr(self.opt, "token_eru_query_metric_embedding_dim", 128)
+                ),
+                query_dim=int(
+                    getattr(self.opt, "token_eru_query_metric_query_dim", 256)
+                ),
+                num_groups=int(getattr(self.opt, "token_eru_query_metric_num_groups", 100)),
+                initial_temperature=float(
+                    getattr(self.opt, "token_eru_query_metric_initial_temperature", 10.0)
+                ),
+                max_gate=float(
+                    getattr(self.opt, "token_eru_query_metric_max_gate", 0.25)
+                ),
+            )
+        finally:
+            torch.set_rng_state(cpu_rng)
+            if cuda_rng is not None:
+                torch.cuda.set_rng_state_all(cuda_rng)
+            random.setstate(python_rng)
+        self.token_eru_query_metric_coupling.requires_grad_(True)
+        print("[token-eru-qmc] query-metric coupling constructed")
 
     def _configure_token_eru_dino_metric(self) -> None:
         enabled = bool(getattr(self.opt, "token_eru_dino_metric_enabled", False))
@@ -1447,10 +1505,39 @@ class SemanticTokenGSv6(SemanticTokenGSv4):
         )
         if self.token_eru_dino_encoder is not None:
             self.set_token_eru_dino_metric_step(completed_optimizer_step)
+        if (
+            self.token_eru_query_metric_coupling is not None
+            and bool(getattr(self.opt, "evaluating", False))
+        ):
+            self.set_token_eru_query_metric_step(completed_optimizer_step)
         return {
             "completed_optimizer_step": float(completed_optimizer_step),
             "reconstruction_to_understanding_gate": r2u,
             "understanding_to_reconstruction_gate": u2r,
+        }
+
+    @staticmethod
+    def token_eru_query_metric_gate(local_stage_step: int, opt) -> float:
+        if int(local_stage_step) < 0:
+            raise ValueError("QMC local stage step must be non-negative")
+        if int(local_stage_step) == 0:
+            return 0.0
+        ramp_steps = max(
+            1,
+            int(getattr(opt, "token_eru_query_metric_gate_ramp_steps", 25)),
+        )
+        return float(
+            getattr(opt, "token_eru_query_metric_max_gate", 0.25)
+        ) * min(1.0, int(local_stage_step) / float(ramp_steps))
+
+    def set_token_eru_query_metric_step(self, local_stage_step: int) -> dict[str, float]:
+        if int(local_stage_step) < 0:
+            raise ValueError("QMC local stage step must be non-negative")
+        self._token_eru_query_metric_local_step = int(local_stage_step)
+        gate = self.token_eru_query_metric_gate(local_stage_step, self.opt)
+        return {
+            "local_stage_step": float(local_stage_step),
+            "query_metric_gate": gate,
         }
 
     @staticmethod
