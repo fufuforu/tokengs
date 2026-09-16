@@ -89,6 +89,7 @@ class SemanticTokenGSv6(SemanticTokenGSv4):
         self._token_eru_early_query_local_step = 0
         self._token_eru_early_query_gate = 0.0
         self._token_eru_last_early_query_state = None
+        self._token_eru_eqc_eval_ablation = "full"
         super().__init__(opt)
         num_groups = int(getattr(self.opt, "instance_group_num_groups", 64))
         head_input_dim = int(self.opt.token_dim)
@@ -1598,6 +1599,30 @@ class SemanticTokenGSv6(SemanticTokenGSv4):
             "early_query_gate": float(self._token_eru_early_query_gate),
         }
 
+    def set_eqc_ablation(self, mode: str = "full") -> None:
+        """Set a non-persistent evaluation-only EQC diagnostic mode."""
+        valid = {
+            "full",
+            "no_final_query_override",
+            "no_u_write",
+            "no_query_update",
+            "off",
+            "shuffle_query",
+        }
+        mode = str(mode)
+        if mode not in valid:
+            raise ValueError(f"unknown EQC ablation mode: {mode}")
+        if self.training and mode != "full":
+            raise RuntimeError("EQC ablation modes are evaluation-only")
+        if not bool(getattr(self.opt, "token_eru_early_query_codecoder_enabled", False)):
+            if mode != "full":
+                raise RuntimeError("EQC ablation requires EQC to be enabled")
+            return
+        if self.token_eru_decoder is None or self.token_eru_decoder.early_query_adapter is None:
+            raise RuntimeError("EQC adapter is not constructed")
+        self.token_eru_decoder.early_query_eval_ablation = mode
+        self._token_eru_eqc_eval_ablation = mode
+
     @staticmethod
     def token_eru_dino_schedule(step: int, opt) -> tuple[float, float]:
         step = int(step)
@@ -1765,6 +1790,7 @@ class SemanticTokenGSv6(SemanticTokenGSv4):
         self._token_eru_last_early_query_state = None
         self._token_eru_last_early_query_state_delta_norm = 0.0
         self._token_eru_last_early_query_u_residual_norm = 0.0
+        self._token_eru_eqc_eval_permutation = None
         encoder_latent = self.forward_encoder(model_input.encoder)
         self._last_encoder_values = encoder_latent.values
         self._last_encoder_memory_meta = {
@@ -1799,7 +1825,21 @@ class SemanticTokenGSv6(SemanticTokenGSv4):
                 early_query_state=early_state,
                 early_query_gate=float(self._token_eru_early_query_gate),
             )
-            self._token_eru_last_early_query_state = early_state
+            ablation = str(getattr(self, "_token_eru_eqc_eval_ablation", "full"))
+            if ablation == "no_final_query_override" or ablation == "off":
+                self._token_eru_last_early_query_state = early_state_seed
+            elif ablation == "shuffle_query":
+                generator = torch.Generator(device="cpu")
+                generator.manual_seed(42)
+                permutation = torch.randperm(
+                    int(early_state.shape[1]), generator=generator
+                ).to(early_state.device)
+                self._token_eru_last_early_query_state = early_state.index_select(
+                    1, permutation
+                )
+                self._token_eru_eqc_eval_permutation = permutation.detach().cpu()
+            else:
+                self._token_eru_last_early_query_state = early_state
             self._token_eru_last_early_query_state_delta_norm = float(
                 (early_state - early_state_seed).detach().float().norm().item()
             )

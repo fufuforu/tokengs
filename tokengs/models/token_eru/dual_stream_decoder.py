@@ -58,6 +58,7 @@ class TokenGSEarlyDualStreamDecoder(nn.Module):
         self.understanding_to_reconstruction_gate = 0.0
         self.early_query_adapter = None
         self.early_query_layers = (2, 5, 8, 11)
+        self.early_query_eval_ablation = "full"
 
     @property
     def reconstruction_decoder(self) -> nn.Module:
@@ -122,6 +123,17 @@ class TokenGSEarlyDualStreamDecoder(nn.Module):
         u = query_tokens.clone()
         q = early_query_state
         early_u_residuals = []
+        ablation = str(getattr(self, "early_query_eval_ablation", "full"))
+        valid_ablations = {
+            "full",
+            "no_final_query_override",
+            "no_u_write",
+            "no_query_update",
+            "off",
+            "shuffle_query",
+        }
+        if ablation not in valid_ablations:
+            raise ValueError(f"unknown EQC eval ablation: {ablation}")
         if q is not None and self.early_query_adapter is None:
             raise RuntimeError("early_query_state requires an EQC adapter")
         if q is not None and tuple(q.shape) != (
@@ -149,10 +161,18 @@ class TokenGSEarlyDualStreamDecoder(nn.Module):
                 values=values,
                 **existing_decoder_inputs,
             )
-            if q is not None and index in self.early_query_layers:
+            if (
+                q is not None
+                and ablation != "off"
+                and index in self.early_query_layers
+            ):
                 u_before_early = u_hat
                 early_output = self.early_query_adapter(
-                    u_hat, q, early_query_gate
+                    u_hat,
+                    q,
+                    early_query_gate,
+                    query_update=ablation not in ("no_query_update",),
+                    u_write=ablation not in ("no_u_write",),
                 )
                 u_hat, q = (
                     early_output.understanding_hidden,

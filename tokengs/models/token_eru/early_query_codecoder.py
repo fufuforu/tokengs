@@ -116,6 +116,9 @@ class EarlyObjectQueryAdapter(nn.Module):
         understanding_hidden: torch.Tensor,
         query_state: torch.Tensor,
         gate: float | torch.Tensor,
+        *,
+        query_update: bool = True,
+        u_write: bool = True,
     ) -> EarlyQueryCoDecoderOutput:
         self._check_shape("understanding_hidden", understanding_hidden, (-1, 1024, 1024))
         self._check_shape("query_state", query_state, (-1, 100, 256))
@@ -127,24 +130,33 @@ class EarlyObjectQueryAdapter(nn.Module):
         if gate_value == 0.0:
             return EarlyQueryCoDecoderOutput(understanding_hidden, query_state)
 
+        if not isinstance(query_update, bool) or not isinstance(u_write, bool):
+            raise ValueError("query_update and u_write must be bool")
+
         u = understanding_hidden
         q = query_state
         u_attn = self.understanding_projection(self.understanding_norm(u))
         q_msg, _ = self.query_attention(
             self.query_norm(q), u_attn, u_attn, need_weights=False
         )
-        q_new = q + gate_value * self.query_output(q_msg)
-        q_new = q_new + gate_value * self.query_ffn(self.query_ffn_norm(q_new))
+        q_new = q
+        if query_update:
+            q_new = q_new + gate_value * self.query_output(q_msg)
+            q_new = q_new + gate_value * self.query_ffn(
+                self.query_ffn_norm(q_new)
+            )
 
         q_memory = self.query_to_understanding_norm(q_new)
         u_msg, _ = self.understanding_attention(
             u_attn, q_memory, q_memory, need_weights=False
         )
-        write_scale = self.understanding_write_scale * gate_value
-        u_new = u + write_scale * self.understanding_output(u_msg)
-        u_new = u_new + write_scale * self.understanding_ffn(
-            self.understanding_ffn_norm(u_new)
-        )
+        u_new = u
+        if u_write:
+            write_scale = self.understanding_write_scale * gate_value
+            u_new = u_new + write_scale * self.understanding_output(u_msg)
+            u_new = u_new + write_scale * self.understanding_ffn(
+                self.understanding_ffn_norm(u_new)
+            )
         return EarlyQueryCoDecoderOutput(u_new, q_new)
 
 

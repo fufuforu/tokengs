@@ -49,3 +49,37 @@ def test_invalid_shapes_and_gate_are_rejected():
         else:
             raise AssertionError("invalid gate was accepted")
 
+
+def test_eval_path_switches_query_and_u_writes_without_parameters():
+    torch.manual_seed(11)
+    module = EarlyObjectQueryAdapter()
+    # Make the diagnostic branches observable without changing the production
+    # zero-init contract: this is an isolated unit-test perturbation.
+    with torch.no_grad():
+        module.query_output.weight.fill_(0.01)
+        module.understanding_output.weight.fill_(0.01)
+        module.query_ffn[-1].weight.fill_(0.01)
+        module.understanding_ffn[-1].weight.fill_(0.01)
+    u = torch.randn(1, 1024, 1024)
+    q = torch.randn(1, 100, 256)
+    full = module(u, q, 1.0)
+    no_u = module(u, q, 1.0, u_write=False)
+    no_q = module(u, q, 1.0, query_update=False)
+    assert torch.equal(full.query_state, no_u.query_state)
+    assert torch.equal(no_u.understanding_hidden, u)
+    assert torch.equal(no_q.query_state, q)
+    assert not torch.equal(full.understanding_hidden, no_q.understanding_hidden)
+
+
+def test_eval_controls_are_not_state_dict_entries():
+    module = EarlyObjectQueryAdapter()
+    keys_before = tuple(module.state_dict())
+    module.eval()
+    _ = module(
+        torch.zeros(1, 1024, 1024),
+        torch.zeros(1, 100, 256),
+        0.0,
+        query_update=False,
+        u_write=False,
+    )
+    assert tuple(module.state_dict()) == keys_before
