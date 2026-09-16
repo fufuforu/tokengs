@@ -224,6 +224,7 @@ def load_model_checkpoint(opt, model, accelerator, epoch_start):
             "token_eru_metric_head.",
             "token_eru_3d_anchor.",
             "token_eru_query_metric_coupling.",
+            "token_eru_decoder.early_query_adapter.",
         )
         active_expected = {
             key for key in expected
@@ -239,6 +240,7 @@ def load_model_checkpoint(opt, model, accelerator, epoch_start):
         }
         anchor_prefix = "token_eru_3d_anchor."
         qmc_prefix = "token_eru_query_metric_coupling."
+        eqc_prefix = "token_eru_decoder.early_query_adapter."
         allowed_missing = {
             key for key in active_expected - active_checkpoint
             if (
@@ -248,6 +250,15 @@ def load_model_checkpoint(opt, model, accelerator, epoch_start):
             or (
                 key.startswith(qmc_prefix)
                 and getattr(model, "token_eru_query_metric_coupling", None)
+                is not None
+            )
+            or (
+                key.startswith(eqc_prefix)
+                and getattr(
+                    getattr(model, "token_eru_decoder", None),
+                    "early_query_adapter",
+                    None,
+                )
                 is not None
             )
         }
@@ -1322,6 +1333,10 @@ def configure_joint_formation_trainability(model: torch.nn.Module, opt) -> dict[
         model, "token_eru_query_metric_coupling", None
     ) is None:
         missing_modules.append("token_eru_query_metric_coupling")
+    if bool(getattr(opt, "token_eru_early_query_codecoder_enabled", False)) and getattr(
+        getattr(model, "token_eru_decoder", None), "early_query_adapter", None
+    ) is None:
+        missing_modules.append("token_eru_decoder.early_query_adapter")
     if missing_modules:
         raise RuntimeError(f"JointFormation modules are missing: {missing_modules}")
 
@@ -1339,6 +1354,7 @@ def configure_joint_formation_trainability(model: torch.nn.Module, opt) -> dict[
         "metric_head": [],
         "3d_anchor": [],
         "query_metric_coupling": [],
+        "early_query_codecoder": [],
         "frozen_other": [],
     }
     named = list(model.named_parameters())
@@ -1384,6 +1400,11 @@ def configure_joint_formation_trainability(model: torch.nn.Module, opt) -> dict[
         assign_module(model.token_eru_3d_anchor, "3d_anchor")
     if getattr(model, "token_eru_query_metric_coupling", None) is not None:
         assign_module(model.token_eru_query_metric_coupling, "query_metric_coupling")
+    if getattr(getattr(model, "token_eru_decoder", None), "early_query_adapter", None) is not None:
+        assign_module(
+            model.token_eru_decoder.early_query_adapter,
+            "early_query_codecoder",
+        )
 
     # AbsoluteUnitDecoder is one actual module, but its two public operations
     # have disjoint parameter submodules.  Keep the requested LR distinction
@@ -1461,6 +1482,9 @@ def _setup_token_eru_joint_formation_optimizer(opt, model, accelerator, epoch_st
             "query_metric_coupling": float(
                 getattr(opt, "token_eru_query_metric_lr", 1.0e-4)
             ),
+            "early_query_codecoder": float(
+                getattr(opt, "token_eru_early_query_codecoder_lr", 3.0e-5)
+            ),
         }
     else:
         lr_by_category = {
@@ -1476,6 +1500,9 @@ def _setup_token_eru_joint_formation_optimizer(opt, model, accelerator, epoch_st
             "3d_anchor": float(getattr(opt, "token_eru_3d_anchor_lr", 1.0e-4)),
             "query_metric_coupling": float(
                 getattr(opt, "token_eru_query_metric_lr", 1.0e-4)
+            ),
+            "early_query_codecoder": float(
+                getattr(opt, "token_eru_early_query_codecoder_lr", 3.0e-5)
             ),
         }
     name_to_parameter = dict(model.named_parameters())
@@ -1493,10 +1520,13 @@ def _setup_token_eru_joint_formation_optimizer(opt, model, accelerator, epoch_st
         "metric_head",
         "3d_anchor",
         "query_metric_coupling",
+        "early_query_codecoder",
     ):
         entries = [name_to_parameter[name] for name in categories[category]]
         if not entries:
-            if category in ("3d_anchor", "query_metric_coupling"):
+            if category in (
+                "3d_anchor", "query_metric_coupling", "early_query_codecoder"
+            ):
                 continue
             raise RuntimeError(f"JointFormation optimizer group is empty: {category}")
         if any(id(parameter) in seen for parameter in entries):
@@ -1509,6 +1539,10 @@ def _setup_token_eru_joint_formation_optimizer(opt, model, accelerator, epoch_st
             if category == "3d_anchor"
             else float(getattr(opt, "token_eru_query_metric_weight_decay", 1e-6))
             if category == "query_metric_coupling"
+            else float(
+                getattr(opt, "token_eru_early_query_codecoder_weight_decay", 1e-6)
+            )
+            if category == "early_query_codecoder"
             else float(opt.weight_decay)
         )
         for parameters, weight_decay in ((decay, category_weight_decay), (nodecay, 0.0)):
@@ -1534,10 +1568,15 @@ def _setup_token_eru_joint_formation_optimizer(opt, model, accelerator, epoch_st
         elif getattr(model, "token_eru_3d_anchor", None) is not None:
             expected_count = 907
             expected_numel = 364_425_264
+        elif getattr(getattr(model, "token_eru_decoder", None), "early_query_adapter", None) is not None:
+            expected_count = None
+            expected_numel = None
         else:
             expected_count = 903
             expected_numel = 364_349_232
-        if trainable_count != expected_count or trainable_numel != expected_numel:
+        if expected_count is not None and (
+            trainable_count != expected_count or trainable_numel != expected_numel
+        ):
             raise RuntimeError(
                 "Stage-J2/3DAnchor trainable parameter audit mismatch: "
                 f"count={trainable_count} expected={expected_count} "
@@ -2582,6 +2621,27 @@ def _token_eru_j2_metadata(opt, stage_step: int) -> dict:
                 "stage_local_step": int(stage_step),
                 "effective_optimizer_step": parent_step + int(stage_step),
                 "training_mode": "QUERY_METRIC_COUPLING_FROM_J2_LOCAL250",
+            }
+        )
+    if bool(getattr(opt, "token_eru_early_query_codecoder_enabled", False)):
+        metadata.update(
+            {
+                "eqc_enabled": bool(
+                    getattr(opt, "token_eru_early_query_codecoder_enabled", False)
+                ),
+                "eqc_layers": [2, 5, 8, 11],
+                "eqc_query_count": 100,
+                "eqc_query_dim": 256,
+                "eqc_gate": (
+                    min(1.0, int(stage_step) / 25.0)
+                    if bool(getattr(opt, "token_eru_early_query_codecoder_enabled", False))
+                    else 0.0
+                ),
+                "qmc_enabled": False,
+                "unit_3d_anchor_enabled": False,
+                "p_u_used": False,
+                "metric_cluster_formal": False,
+                "training_mode": "NEW_STAGE_EQC_FROM_J2_LOCAL250",
             }
         )
     return metadata
@@ -3878,6 +3938,8 @@ def train_epoch(opt, accelerator, model, optimizer, scheduler, train_dataloader,
             unwrapped_model.set_token_eru_dino_metric_step(effective_completed_step)
         if hasattr(unwrapped_model, "set_token_eru_query_metric_step"):
             unwrapped_model.set_token_eru_query_metric_step(completed_step)
+        if hasattr(unwrapped_model, "set_token_eru_early_query_step"):
+            unwrapped_model.set_token_eru_early_query_step(completed_step)
         if getattr(opt, "model_type", None) == "globalsplat_instance_v2":
             schedule_step = (
                 completed_step
@@ -5579,7 +5641,10 @@ def main():
     scheduler = setup_scheduler(opt, optimizer, iters_per_epoch, accelerator, epoch_start)
 
     if (
-        bool(getattr(opt, "token_eru_query_metric_enabled", False))
+        (
+            bool(getattr(opt, "token_eru_query_metric_enabled", False))
+            or bool(getattr(opt, "token_eru_early_query_codecoder_enabled", False))
+        )
         and bool(getattr(opt, "tsh_ddp8", False))
         and bool(getattr(opt, "abs_ckpt_full_state", False))
         and epoch_start == 0

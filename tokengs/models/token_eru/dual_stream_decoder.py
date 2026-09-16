@@ -56,6 +56,8 @@ class TokenGSEarlyDualStreamDecoder(nn.Module):
         )
         self.reconstruction_to_understanding_gate = 0.0
         self.understanding_to_reconstruction_gate = 0.0
+        self.early_query_adapter = None
+        self.early_query_layers = (2, 5, 8, 11)
 
     @property
     def reconstruction_decoder(self) -> nn.Module:
@@ -102,8 +104,10 @@ class TokenGSEarlyDualStreamDecoder(nn.Module):
         self,
         query_tokens: torch.Tensor,
         encoder_memory: object,
+        early_query_state: torch.Tensor | None = None,
+        early_query_gate: float = 0.0,
         **existing_decoder_inputs,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ):
         keys = getattr(encoder_memory, "keys", None)
         values = getattr(encoder_memory, "values", None)
         if keys is None or values is None:
@@ -116,12 +120,23 @@ class TokenGSEarlyDualStreamDecoder(nn.Module):
         # clone preserves the query index layout and autograd connection while
         # ensuring the two streams have independent subsequent activations.
         u = query_tokens.clone()
-        for r_block, u_block, r2u, u2r in zip(
+        q = early_query_state
+        early_u_residuals = []
+        if q is not None and self.early_query_adapter is None:
+            raise RuntimeError("early_query_state requires an EQC adapter")
+        if q is not None and tuple(q.shape) != (
+            query_tokens.shape[0], 100, 256
+        ):
+            raise ValueError(
+                "early_query_state must be [B,100,256], got "
+                f"{tuple(q.shape)}"
+            )
+        for index, (r_block, u_block, r2u, u2r) in enumerate(zip(
             self.reconstruction_decoder,
             self.understanding_decoder_blocks,
             self.reconstruction_to_understanding,
             self.understanding_to_reconstruction,
-        ):
+        )):
             r_hat = r_block(
                 gs_tokens=r,
                 keys=keys,
@@ -134,6 +149,22 @@ class TokenGSEarlyDualStreamDecoder(nn.Module):
                 values=values,
                 **existing_decoder_inputs,
             )
+            if q is not None and index in self.early_query_layers:
+                u_before_early = u_hat
+                early_output = self.early_query_adapter(
+                    u_hat, q, early_query_gate
+                )
+                u_hat, q = (
+                    early_output.understanding_hidden,
+                    early_output.query_state,
+                )
+                early_u_residuals.append((u_hat - u_before_early).detach().float().norm())
             r = r_hat + self.understanding_to_reconstruction_gate * u2r(u_hat)
             u = u_hat + self.reconstruction_to_understanding_gate * r2u(r_hat)
+        if early_query_state is not None:
+            if early_u_residuals:
+                self._last_early_query_u_residual_norm = torch.stack(early_u_residuals).norm()
+            else:
+                self._last_early_query_u_residual_norm = torch.zeros((), device=u.device)
+            return r, u, q
         return r, u

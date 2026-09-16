@@ -49,6 +49,7 @@ from tokengs.models.token_eru.historical_unit_infonce import (
 from tokengs.models.token_eru.metric_clustering import historical_metric_cluster
 from tokengs.models.token_eru.unit_3d_anchor import Unit3DAnchor
 from tokengs.models.token_eru.query_metric_coupling import QueryMetricCoupling
+from tokengs.models.token_eru.early_query_codecoder import EarlyObjectQueryAdapter
 
 
 class SemanticTokenGSv6(SemanticTokenGSv4):
@@ -85,6 +86,9 @@ class SemanticTokenGSv6(SemanticTokenGSv4):
         self.token_eru_query_metric_coupling = None
         self._token_eru_dino_metric_step = 500
         self._token_eru_query_metric_local_step = 0
+        self._token_eru_early_query_local_step = 0
+        self._token_eru_early_query_gate = 0.0
+        self._token_eru_last_early_query_state = None
         super().__init__(opt)
         num_groups = int(getattr(self.opt, "instance_group_num_groups", 64))
         head_input_dim = int(self.opt.token_dim)
@@ -1313,6 +1317,42 @@ class SemanticTokenGSv6(SemanticTokenGSv4):
             reconstruction_to_understanding=0.0,
             understanding_to_reconstruction=0.0,
         )
+        if bool(getattr(self.opt, "token_eru_early_query_codecoder_enabled", False)):
+            if int(self.opt.enc_embed_dim) != 1024:
+                raise RuntimeError("EQC requires enc_embed_dim=1024")
+            if int(getattr(self.opt, "tsh_num_groups", 100)) != 100:
+                raise RuntimeError("EQC requires tsh_num_groups=100")
+            if int(self.absolute_gs_head.feat_dim) != 256:
+                raise RuntimeError("EQC requires native TSH query dim=256")
+            cpu_rng = torch.get_rng_state()
+            cuda_rng = None
+            if torch.cuda.is_available() and torch.cuda.is_initialized():
+                cuda_rng = torch.cuda.get_rng_state_all()
+            python_rng = random.getstate()
+            try:
+                self.token_eru_decoder.early_query_adapter = EarlyObjectQueryAdapter(
+                    understanding_dim=1024,
+                    query_dim=256,
+                    attention_dim=256,
+                    num_heads=8,
+                    mlp_ratio=4.0,
+                    dropout=0.0,
+                    understanding_write_scale=0.25,
+                )
+            finally:
+                torch.set_rng_state(cpu_rng)
+                if cuda_rng is not None:
+                    torch.cuda.set_rng_state_all(cuda_rng)
+                random.setstate(python_rng)
+            self.token_eru_decoder.early_query_layers = tuple(
+                int(value)
+                for value in getattr(
+                    self.opt, "token_eru_early_query_codecoder_layers", (2, 5, 8, 11)
+                )
+            )
+            if self.token_eru_decoder.early_query_layers != (2, 5, 8, 11):
+                raise RuntimeError("EQC interaction layers must be (2,5,8,11)")
+            print("[token-eru-eqc] shared early query adapter constructed")
         print(
             "[token-eru] early dual stream constructed: "
             f"blocks={len(self.enc_dec_backbone.decoder_blocks)} "
@@ -1541,6 +1581,24 @@ class SemanticTokenGSv6(SemanticTokenGSv4):
         }
 
     @staticmethod
+    def token_eru_early_query_gate(local_stage_step: int, opt) -> float:
+        if int(local_stage_step) < 0:
+            raise ValueError("EQC local stage step must be non-negative")
+        return min(1.0, int(local_stage_step) / 25.0)
+
+    def set_token_eru_early_query_step(self, local_stage_step: int) -> dict[str, float]:
+        if int(local_stage_step) < 0:
+            raise ValueError("EQC local stage step must be non-negative")
+        self._token_eru_early_query_local_step = int(local_stage_step)
+        self._token_eru_early_query_gate = self.token_eru_early_query_gate(
+            local_stage_step, self.opt
+        )
+        return {
+            "local_stage_step": float(local_stage_step),
+            "early_query_gate": float(self._token_eru_early_query_gate),
+        }
+
+    @staticmethod
     def token_eru_dino_schedule(step: int, opt) -> tuple[float, float]:
         step = int(step)
         joint_formation = bool(
@@ -1704,6 +1762,9 @@ class SemanticTokenGSv6(SemanticTokenGSv4):
     def _forward_abs_hidden(self, model_input):
         if self.token_eru_decoder is None:
             return super()._forward_abs_hidden(model_input)
+        self._token_eru_last_early_query_state = None
+        self._token_eru_last_early_query_state_delta_norm = 0.0
+        self._token_eru_last_early_query_u_residual_norm = 0.0
         encoder_latent = self.forward_encoder(model_input.encoder)
         self._last_encoder_values = encoder_latent.values
         self._last_encoder_memory_meta = {
@@ -1721,9 +1782,34 @@ class SemanticTokenGSv6(SemanticTokenGSv4):
         gs_tokens = self._apply_time_embedding_to_gs_tokens(
             gs_tokens, model_input.decoder
         )
-        r_hidden, u_hidden = self.token_eru_decoder(
-            gs_tokens, encoder_latent
+        early_state = None
+        early_enabled = bool(
+            getattr(self.opt, "token_eru_early_query_codecoder_enabled", False)
         )
+        if early_enabled:
+            if self.tsh_instance_head is None:
+                raise RuntimeError("EQC requires the native TSH instance head")
+            early_state = self.tsh_instance_head.get_object_query_seed(
+                int(gs_tokens.shape[0])
+            )
+            early_state_seed = early_state
+            r_hidden, u_hidden, early_state = self.token_eru_decoder(
+                gs_tokens,
+                encoder_latent,
+                early_query_state=early_state,
+                early_query_gate=float(self._token_eru_early_query_gate),
+            )
+            self._token_eru_last_early_query_state = early_state
+            self._token_eru_last_early_query_state_delta_norm = float(
+                (early_state - early_state_seed).detach().float().norm().item()
+            )
+            self._token_eru_last_early_query_u_residual_norm = float(
+                getattr(self.token_eru_decoder, "_last_early_query_u_residual_norm", 0.0)
+            )
+        else:
+            r_hidden, u_hidden = self.token_eru_decoder(
+                gs_tokens, encoder_latent
+            )
         self._token_eru_last_reconstruction_tokens = r_hidden
         self._token_eru_last_understanding_tokens = u_hidden
         self._token_eru_understanding_units = self.token_eru_unit_formation.form_units(

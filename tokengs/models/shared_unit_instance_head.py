@@ -228,6 +228,7 @@ class SharedUnitInstanceHead(nn.Module):
         q_abs: torch.Tensor,
         refine_gate: float = 0.0,
         return_base_states: bool = False,
+        query_state_override: torch.Tensor | None = None,
     ) -> dict:
         """q_abs: [B, T, K, F]. Returns pi_unit and pi_gs plus stats."""
         batch_size, token_count, units_per_token, feat_dim = q_abs.shape
@@ -247,9 +248,16 @@ class SharedUnitInstanceHead(nn.Module):
         # Per-unit adapter: same tensor, no new clustering/unit formation.
         z = q + self.q_adapter(self.q_norm(q))
 
-        groups = self.group_tokens.unsqueeze(0).expand(
-            batch_size, -1, -1
-        )
+        if query_state_override is None:
+            groups = self.get_object_query_seed(batch_size)
+        else:
+            if tuple(query_state_override.shape) != (batch_size, self.num_groups, self.unit_dim):
+                raise ValueError(
+                    "query_state_override must be "
+                    f"[B,{self.num_groups},{self.unit_dim}], got "
+                    f"{tuple(query_state_override.shape)}"
+                )
+            groups = query_state_override
         for layer in self.layers:
             groups = layer(groups, z)
         groups = self.group_norm(groups)
@@ -344,3 +352,10 @@ class SharedUnitInstanceHead(nn.Module):
             "residual_logits": residual_logits,
             **{key: value for key, value in stats.items()},
         }
+
+    def get_object_query_seed(self, batch_size: int) -> torch.Tensor:
+        """Expand the native 100-query parameter without registering a copy."""
+        batch_size = int(batch_size)
+        if batch_size <= 0:
+            raise ValueError("batch_size must be positive")
+        return self.group_tokens.unsqueeze(0).expand(batch_size, -1, -1)

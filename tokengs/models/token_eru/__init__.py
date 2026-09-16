@@ -25,6 +25,7 @@ from .unit_3d_anchor import (
     reshape_child_gaussian_attributes,
 )
 from .query_metric_coupling import QueryMetricCoupling, QueryMetricCouplingOutput
+from .early_query_codecoder import EarlyObjectQueryAdapter, EarlyQueryCoDecoderOutput
 
 __all__ = [
     "TokenERUOutput",
@@ -48,4 +49,6 @@ __all__ = [
     "reshape_child_gaussian_attributes",
     "QueryMetricCoupling",
     "QueryMetricCouplingOutput",
+    "EarlyObjectQueryAdapter",
+    "EarlyQueryCoDecoderOutput",
 ]

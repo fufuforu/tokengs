@@ -300,6 +300,12 @@ class Options:
     token_eru_query_metric_gate_ramp_steps: int = 25
     token_eru_query_metric_lr: float = 1e-4
     token_eru_query_metric_weight_decay: float = 1e-6
+    # TokenGS-ERU-Early-Query-CoDecoder-v1.  The native TSH query seed is
+    # exchanged with U hidden tokens at four fixed decoder layers.
+    token_eru_early_query_codecoder_enabled: bool = False
+    token_eru_early_query_codecoder_layers: tuple[int, ...] = (2, 5, 8, 11)
+    token_eru_early_query_codecoder_lr: float = 3e-5
+    token_eru_early_query_codecoder_weight_decay: float = 1e-6
     # Optional per-rank manifest written immediately before Accelerator
     # prepare() for diagnosing distributed model/optimizer mismatches.
     joint_formation_ddp_manifest_audit: bool = False
@@ -10122,6 +10128,52 @@ config_defaults[
         "semantic_v6_absolute_units_true_shared_token_eru1_dino_metric_"
         "joint_formation_j2_local250_query_metric_v1_short200_ddp8"
     ),
+)
+
+# TokenGS-ERU-Early-Query-CoDecoder-v1.  E0 and E1 are matched stages from
+# the same J2 local250 parent; E1 only adds the shared four-layer early-query
+# adapter.  QMC and 3D Anchor remain explicitly disabled.
+_TOKEN_ERU_EQC_BASE = _TOKEN_ERU_3D_ANCHOR_BASE.evolve(
+    token_eru_query_metric_enabled=False,
+    token_eru_3d_anchor_enabled=False,
+    token_eru_early_query_codecoder_enabled=False,
+    token_eru_early_query_codecoder_layers=(2, 5, 8, 11),
+    token_eru_early_query_codecoder_lr=3.0e-5,
+    token_eru_early_query_codecoder_weight_decay=1.0e-6,
+    token_eru_dino_metric_joint_formation_j2=True,
+    token_eru_dino_metric_joint_formation_j2_parent_step=960,
+    token_eru_dino_metric_joint_formation_j2_name=(
+        "token_eru_early_query_codecoder_v1_stage"
+    ),
+    num_epochs=1,
+    max_iters_per_epoch=200,
+    num_workers=2,
+    tsh_ddp8=True,
+    abs_ckpt_every=200,
+    abs_ckpt_steps_extra=(50, 100, 150, 200),
+    abs_ckpt_full_state=True,
+    abs_ckpt_full_state_steps=(100, 200),
+    eval_before_training=False,
+    seed=42,
+)
+config_doc[
+    "semantic_v6_j2_local250_eqc_v1_control_short200_ddp8"
+] = "TokenGS-ERU-Early-Query-CoDecoder-v1 E0 matched control."
+config_defaults[
+    "semantic_v6_j2_local250_eqc_v1_control_short200_ddp8"
+] = _TOKEN_ERU_EQC_BASE.evolve(
+    workspace="workspace/semantic_v6_j2_local250_eqc_v1_control_short200_ddp8",
+    experiment_name="semantic_v6_j2_local250_eqc_v1_control_short200_ddp8",
+)
+config_doc[
+    "semantic_v6_j2_local250_eqc_v1_treatment_short200_ddp8"
+] = "TokenGS-ERU-Early-Query-CoDecoder-v1 E1 treatment."
+config_defaults[
+    "semantic_v6_j2_local250_eqc_v1_treatment_short200_ddp8"
+] = _TOKEN_ERU_EQC_BASE.evolve(
+    token_eru_early_query_codecoder_enabled=True,
+    workspace="workspace/semantic_v6_j2_local250_eqc_v1_treatment_short200_ddp8",
+    experiment_name="semantic_v6_j2_local250_eqc_v1_treatment_short200_ddp8",
 )
 
 AllConfigs = tyro.extras.subcommand_type_from_defaults(config_defaults, config_doc)

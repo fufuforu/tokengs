@@ -2393,7 +2393,14 @@ class SemanticTokenGSv4(PromptTokenGS):
             # GA-IDU uses frozen, batch-specific BaseTSH states as its only
             # group anchor.  The old 50-key head is called with gate zero;
             # no independent query table or old refiner is involved.
-            base_out = head(q_abs, refine_gate=0.0, return_base_states=True)
+            base_out = head(
+                q_abs,
+                refine_gate=0.0,
+                return_base_states=True,
+                query_state_override=getattr(
+                    self, "_token_eru_last_early_query_state", None
+                ),
+            )
             if self.training:
                 ga_gate = float(getattr(self, "ga_idu_gate_eff", 0.0))
             else:
@@ -2465,7 +2472,13 @@ class SemanticTokenGSv4(PromptTokenGS):
                 getattr(self, "tsh_query_memory_refine_eval_gate_override", 1.0)
             )
         if head_out is None:
-            head_out = head(q_in, refine_gate=query_memory_gate)
+            head_out = head(
+                q_in,
+                refine_gate=query_memory_gate,
+                query_state_override=getattr(
+                    self, "_token_eru_last_early_query_state", None
+                ),
+            )
         pi_unit = head_out["pi_unit"]  # [B,T,K,G+1]
         unit_logits = head_out["unit_logits"]  # [B,T,K,G+1]
         qmc_output = None
