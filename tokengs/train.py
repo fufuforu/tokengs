@@ -5494,6 +5494,40 @@ def main():
             find_unused_parameters=True
         )
 
+    # Bind each torchrun child to its local CUDA device before Accelerator
+    # initializes the NCCL process group.  Initializing the process group
+    # first leaves NCCL without a rank-to-device mapping and can deadlock on
+    # the first subsequent collective.  LOCAL_RANK is relative to
+    # CUDA_VISIBLE_DEVICES, so it must not be replaced by global RANK.
+    preinit_local_rank = None
+    if torch.cuda.is_available():
+        preinit_local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+        visible_device_count = torch.cuda.device_count()
+        if preinit_local_rank < 0 or preinit_local_rank >= visible_device_count:
+            raise RuntimeError(
+                "invalid LOCAL_RANK before Accelerator initialization: "
+                f"LOCAL_RANK={preinit_local_rank}, "
+                f"CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES', '')!r}, "
+                f"device_count={visible_device_count}"
+            )
+        torch.cuda.set_device(preinit_local_rank)
+
+        # Accelerate's default init_process_group call does not pass a
+        # device_id.  Bind the TokenERU torchrun process group explicitly so
+        # NCCL does not have to infer rank/device ownership during the first
+        # DDP verification collective.
+        if (
+            bool(getattr(opt, "token_eru_enabled", False))
+            and bool(getattr(opt, "tsh_ddp8", False))
+            and int(os.environ.get("LOCAL_RANK", "-1")) >= 0
+            and int(os.environ.get("WORLD_SIZE", "1")) > 1
+            and not torch.distributed.is_initialized()
+        ):
+            torch.distributed.init_process_group(
+                backend="nccl",
+                device_id=torch.device("cuda", preinit_local_rank),
+            )
+
     accelerator = Accelerator(
         mixed_precision=opt.mixed_precision,
         gradient_accumulation_steps=opt.gradient_accumulation_steps,
@@ -5506,6 +5540,11 @@ def main():
                 "LOCAL_RANK", getattr(accelerator, "local_process_index", 0)
             )
         )
+        if preinit_local_rank is not None and local_rank != preinit_local_rank:
+            raise RuntimeError(
+                "Accelerator local rank differs from pre-initialization CUDA "
+                f"binding: before={preinit_local_rank}, after={local_rank}"
+            )
         torch.cuda.set_device(local_rank)
         accelerator.print(
             f"[ddp-device] rank={getattr(accelerator, 'process_index', -1)} "

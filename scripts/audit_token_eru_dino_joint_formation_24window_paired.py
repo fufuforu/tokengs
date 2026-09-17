@@ -47,7 +47,11 @@ from tokengs.train import (  # noqa: E402
     configure_joint_formation_trainability,
     load_model_checkpoint,
 )
-from tokengs.utils.instance_ap import instance_ap, masks_from_group_probs  # noqa: E402
+from tokengs.utils.instance_ap import (  # noqa: E402
+    instance_ap,
+    make_target_view_image_id,
+    masks_from_group_probs,
+)
 from tokengs.utils.metrics import MetricsCalculator  # noqa: E402
 
 
@@ -377,7 +381,13 @@ def _build_model(config_name: str, output_dir: Path, checkpoint: Path | None = N
     return opt, accelerator, model
 
 
-def _native_window_metrics(out: dict[str, Any], batch: dict[str, Any], window_id: str) -> dict[str, Any]:
+def _native_window_metrics(
+    out: dict[str, Any],
+    batch: dict[str, Any],
+    scene_id: str,
+    context_frame_ids: list[int],
+    target_frame_ids: list[int],
+) -> dict[str, Any]:
     probability = out["rendered_instance_group_probability"][0].detach().float().cpu().numpy()[:, :, 0]
     labels = batch["instance_label_output"][0].detach().long().cpu().numpy()
     all_predictions: list[np.ndarray] = []
@@ -387,8 +397,20 @@ def _native_window_metrics(out: dict[str, Any], batch: dict[str, Any], window_id
     all_gt_ids: list[str] = []
     per_view = []
     for view in range(probability.shape[1]):
-        image_id = f"{window_id}:target:{view}"
-        bundle = _candidate_bundle(probability[:, view], labels[view], image_id)
+        image_id = make_target_view_image_id(
+            scene_id=scene_id,
+            context_frame_ids=context_frame_ids,
+            target_frame_ids=target_frame_ids,
+            target_view_index=view,
+        )
+        # The shared candidate diagnostic stores a numeric target_view_id by
+        # parsing its image-id suffix.  Keep that diagnostic field view-local
+        # while using the full per-target-view ID for all AP bookkeeping IDs
+        # below.
+        bundle = _candidate_bundle(
+            probability[:, view], labels[view], f"target_view:{view}"
+        )
+        bundle["image_id"] = image_id
         per_view.append({key: value for key, value in bundle.items() if key not in {"masks", "scores", "gt_masks"}})
         all_predictions.extend(bundle["masks"])
         all_scores.extend(bundle["scores"])
@@ -614,7 +636,13 @@ def _evaluate_model(
             with torch.autocast(device_type=accelerator.device.type, enabled=False):
                 out = model(batch, compute_quality_metrics=False)
         fp["input_fingerprint"] = _input_fingerprint(batch, fp["scene_id"])
-        native = _native_window_metrics(out, batch, f"{fp['scene_id']}:{fp['sample_id']}")
+        native = _native_window_metrics(
+            out,
+            batch,
+            fp["scene_id"],
+            fp["context_frame_ids"],
+            fp["target_frame_ids"],
+        )
         pooled_predictions.extend(native.pop("_predictions"))
         pooled_scores.extend(native.pop("_scores"))
         pooled_prediction_ids.extend(native.pop("_prediction_ids"))
@@ -778,6 +806,8 @@ def main() -> None:
         "max_predictions_per_image": 100,
         "min_mask_area": 1,
         "ap_interpolation": "101-point recall interpolation",
+        "instance_ap_image_identity": "per_target_view_v1",
+        "cross_target_view_matching": False,
     }
     protocol_path = output / "protocol_fingerprints.json"
     if protocol_path.is_file():

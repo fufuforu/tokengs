@@ -12,9 +12,44 @@ model.
 
 from __future__ import annotations
 
+import hashlib
+import json
 from typing import Hashable, Iterable, Sequence
 
 import numpy as np
+
+
+def make_target_view_image_id(
+    *,
+    scene_id: str,
+    context_frame_ids: Sequence[int],
+    target_frame_ids: Sequence[int],
+    target_view_index: int,
+) -> str:
+    """Return a stable image identity for one target camera view.
+
+    AP matching is image-local because masks from different cameras have
+    different pixel coordinate systems.  The full manifest window is hashed
+    so records from the same scene remain distinct, while the target-view
+    index and actual target frame identify the camera within that window.
+    """
+    context = [int(value) for value in context_frame_ids]
+    target = [int(value) for value in target_frame_ids]
+    view = int(target_view_index)
+    if view < 0 or view >= len(target):
+        raise ValueError(
+            f"target_view_index={view} is outside target frame list of length {len(target)}"
+        )
+    window_payload = {
+        "scene_id": str(scene_id),
+        "context_frame_ids": context,
+        "target_frame_ids": target,
+    }
+    encoded = json.dumps(
+        window_payload, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    window_hash = hashlib.sha256(encoded).hexdigest()[:16]
+    return f"{scene_id}:w{window_hash}:v{view}:f{target[view]}"
 
 
 def mask_iou(pred: np.ndarray, gt: np.ndarray) -> float:

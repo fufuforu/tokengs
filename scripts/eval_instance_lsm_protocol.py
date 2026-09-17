@@ -41,6 +41,7 @@ from tokengs.options import config_defaults
 from tokengs.utils.instance_ap import (
     gt_masks_from_instance_map,
     instance_ap,
+    make_target_view_image_id,
     masks_from_group_probs,
 )
 
@@ -938,6 +939,9 @@ def main() -> None:
     if args.max_predictions_per_image <= 0:
         raise ValueError("--max_predictions_per_image must be positive")
     manifest_audit = _audit_lsm_manifest(args.lsm_manifest)
+    manifest_entries = json.loads(
+        Path(args.lsm_manifest).read_text(encoding="utf-8")
+    )["scenes"]
     print(
         "[lsm-eval] audited InstOk3D split: "
         f"{manifest_audit['scene_count']} scenes, "
@@ -1357,6 +1361,7 @@ def main() -> None:
             )
             adaptive = False
         scene_name = data["scene_name"][0]
+        scene_manifest_entry = manifest_entries[str(scene_name)]
         batch_size, _, view_count, _, height, width = probability.shape
         pred_masks = []
         pred_scores = []
@@ -1369,11 +1374,16 @@ def main() -> None:
         audit_gt_masks = []
         for b in range(batch_size):
             for v in range(view_count):
-                # LSM / InstOk3D protocol: per-scene AP. All target views of
-                # a scene share one matching pool, so a predicted mask can
-                # match the same instance's mask in any test view and the
-                # per-scene Hungarian/confidence matching is scene-level.
-                image_id = f"{scene_name}:b{b}"
+                image_id = make_target_view_image_id(
+                    scene_id=scene_name,
+                    context_frame_ids=scene_manifest_entry[
+                        "context_raw_frame_ids"
+                    ],
+                    target_frame_ids=scene_manifest_entry[
+                        "test_raw_frame_ids"
+                    ],
+                    target_view_index=v,
+                )
                 probs = probability[b, :, v, 0].float().cpu().numpy()
                 if adaptive:
                     active = int(predicted_counts[b].item())
@@ -1540,6 +1550,8 @@ def main() -> None:
             "camera_source": "scannet_sens_rgbd_pose",
             "reference_camera_source": "scene_level_colmap",
             "matching": "confidence_ordered_greedy_same_image",
+            "instance_ap_image_identity": "per_target_view_v1",
+            "cross_target_view_matching": False,
             "ap_interpolation": "101_point",
             "ap_thresholds": [round(t / 100, 2) for t in range(50, 100, 5)],
             "ap25_threshold": 0.25,

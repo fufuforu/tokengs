@@ -3145,7 +3145,12 @@ class SemanticTokenGSv4(PromptTokenGS):
         )
         prompt_embedding = None
         positive_class_ids = None
-        if has_prompts:
+        # Absolute-unit TokenERU stages explicitly disable the legacy prompt
+        # semantic loss/path below.  Do not nevertheless encode a manifest
+        # image query here: that auxiliary embedding is not consumed by the
+        # RGB, native-instance, or DINO-metric losses, and would introduce an
+        # unrelated raw-RGB data contract into the absolute training path.
+        if has_prompts and not abs_mode:
             prompt_embedding = self._encode_prompt_batch(data)
             # Manifest class ids are 1..8; prototype indices are 0..7.
             positive_class_ids = data["prompt_class_id"].long() - 1

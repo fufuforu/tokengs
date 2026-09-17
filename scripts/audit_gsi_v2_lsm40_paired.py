@@ -38,6 +38,7 @@ from tokengs.options import config_defaults  # noqa: E402
 from tokengs.utils.instance_ap import (  # noqa: E402
     gt_masks_from_instance_map,
     instance_ap,
+    make_target_view_image_id,
     masks_from_group_probs,
 )
 from tokengs.utils.metrics import MetricsCalculator  # noqa: E402
@@ -297,6 +298,7 @@ def _reconstruction_metrics(
 
 def _instance_metrics(
     out: dict[str, torch.Tensor], data: dict[str, object], scene: str,
+    scene_entry: dict[str, object],
     *, max_predictions: int = 100, min_pixels: int = 1,
 ) -> dict[str, object]:
     probability = out["rendered_instance_group_probability"].detach().float().cpu()
@@ -306,11 +308,17 @@ def _instance_metrics(
     void_channel = probability.shape[1] - 1
     pred_masks, pred_scores, pred_ids = [], [], []
     gt_masks, gt_ids = [], []
+    per_target_view = []
     nonempty_query_ids = set()
     filtered_by_max = 0
     for batch_index in range(probability.shape[0]):
-        image_id = f"{scene}:b{batch_index}"
         for view in range(probability.shape[2]):
+            image_id = make_target_view_image_id(
+                scene_id=scene,
+                context_frame_ids=scene_entry["context_raw_frame_ids"],
+                target_frame_ids=scene_entry["test_raw_frame_ids"],
+                target_view_index=view,
+            )
             probs = probability[batch_index, :, view, 0].numpy()
             group_ids = np.argmax(probs, axis=0)
             nonempty_query_ids.update(int(x) for x in np.unique(group_ids) if int(x) != void_channel)
@@ -324,6 +332,33 @@ def _instance_metrics(
             gt = gt_masks_from_instance_map(labels[batch_index, view].numpy(), min_mask_area=min_pixels)
             gt_masks.extend(gt)
             gt_ids.extend([image_id] * len(gt))
+            view_ap = instance_ap(
+                masks,
+                scores,
+                gt,
+                thresholds=(0.25, 0.5, 0.75),
+                vectorized=True,
+                pred_image_ids=[image_id] * len(masks),
+                gt_image_ids=[image_id] * len(gt),
+            )
+            view_diag = _mask_diagnostics(
+                masks,
+                gt,
+                [image_id] * len(masks),
+                [image_id] * len(gt),
+            )
+            per_target_view.append({
+                "batch_index": int(batch_index),
+                "target_view_index": int(view),
+                "image_id": image_id,
+                "ap25": float(view_ap["ap_25"]),
+                "ap50": float(view_ap["ap_50"]),
+                "ap75": float(view_ap["ap_75"]),
+                "best_gt_iou": float(view_diag["mean_best_gt_iou"]),
+                "recall50": float(view_diag["recall_iou50"]),
+                "prediction_count": int(len(masks)),
+                "gt_count": int(len(gt)),
+            })
     results = instance_ap(
         pred_masks, pred_scores, gt_masks, thresholds=(0.25, 0.5, 0.75),
         vectorized=True, pred_image_ids=pred_ids, gt_image_ids=gt_ids,
@@ -344,6 +379,7 @@ def _instance_metrics(
             "pred_masks": pred_masks, "pred_scores": pred_scores,
             "pred_ids": pred_ids, "gt_masks": gt_masks, "gt_ids": gt_ids,
         },
+        "per_target_view": per_target_view,
         "mean_best_gt_iou": float(diag["mean_best_gt_iou"]),
         "recall_iou25": float(diag["recall_iou25"]),
         "recall_iou50": float(diag["recall_iou50"]),
@@ -417,7 +453,9 @@ def _evaluate_model(
             "input_fingerprint": fingerprint,
         }
         if is_instance:
-            instance = _instance_metrics(out, data, scene)
+            instance = _instance_metrics(
+                out, data, scene, manifest_entries[scene]
+            )
             pooled = instance.pop("pooled_inputs")
             pooled_pred_masks.extend(pooled["pred_masks"])
             pooled_pred_scores.extend(pooled["pred_scores"])
@@ -438,7 +476,12 @@ def _evaluate_model(
             all_finite = False
         per_scene[scene] = row
     expected_scenes = list(manifest_entries)
-    if seen != expected_scenes:
+    if max_scenes > 0:
+        if len(seen) != max_scenes:
+            raise RuntimeError(
+                f"LSM smoke scene count mismatch: expected {max_scenes}, got {seen}"
+            )
+    elif seen != expected_scenes:
         raise RuntimeError(f"LSM scene order/count mismatch: expected {expected_scenes}, got {seen}")
     result = {
         "label": label,
@@ -449,6 +492,11 @@ def _evaluate_model(
         "schedule": schedule,
         "reconstruction_loss_source": reconstruction_loss_source,
         "all_finite": bool(all_finite),
+        "instance_ap_image_identity": "per_target_view_v1",
+        "cross_target_view_matching": False,
+        "target_view_image_ids": sorted(
+            set(pooled_pred_ids).union(pooled_gt_ids)
+        ),
     }
     keys = ("psnr", "ssim", "lpips", "reconstruction_loss")
     result["mean"] = {key: float(np.mean([row[key] for row in per_scene.values()])) for key in keys}
